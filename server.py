@@ -52,14 +52,19 @@ OLLAMA_MODEL = "qwen3.6:27b"  # default LLM (smart, slower)
 OLLAMA_FAST_MODEL = "llama3.2:3b"  # used when client asks for fast model
 OLLAMA_VISION_MODEL = "qwen2.5vl:7b"  # default vision model (accurate)
 OLLAMA_VISION_FAST_MODEL = "qwen2.5vl:3b"  # used when client asks for "fast" mode
-HAL_REFERENCE_WAV = "static/hal_reference.wav"
+HAL_REFERENCE_WAV = "static/hal_reference.bak.wav"
+# Built-in XTTS v2 studio speaker. Set to a name (e.g. "Damien Black",
+# "Royston Min", "Aaron Dreschner", "Viktor Eka") to use a pre-trained voice
+# with zero cloning artifacts. Set to None to fall back to cloning from
+# HAL_REFERENCE_WAV. Damien Black = cool, neutral, slightly deep — HAL-ish.
+HAL_SPEAKER = "Damien Black"
 # Negative semitones = deeper voice. -2 is a noticeable drop, -4 is gravelly.
 # Set to 0 to disable pitch shift entirely. The torchaudio implementation runs
 # on CPU (separate from XTTS on GPU) and adds noticeable per-sentence latency,
 # which contributes to gaps in streamed playback. Disabled by default until we
 # move to a cleaner algorithm (librosa/rubberband) or do it on GPU.
 TTS_PITCH_SHIFT_STEPS = 0
-WHISPER_MODEL_SIZE = "small"
+WHISPER_MODEL_SIZE = "large-v3"
 WHISPER_PROMPT = (
     "Conversation with HAL 9000, the AI computer from 2001: A Space Odyssey. "
     "User is Jeffery. Topics include PowerShell, Python, Ollama, files, and tasks "
@@ -139,6 +144,8 @@ Never narrate intentions instead of acting. If Jeffery asks you to do something 
 When images are attached, treat them as context for Jeffery's actual question. Do NOT describe what's in the image unless he explicitly asks "what do you see / what is this / describe this." If he asks "is this wired right?" — answer that, referencing the image only as needed. If he asks "what's my name?" — answer from memory, not from the image. The image is silent context, not the subject of conversation.
 
 You can launch GUI applications: PowerShell and cmd run in Jeffery's interactive Windows session, so commands like `Start-Process notepad`, `notepad.exe path\to\file`, `start chrome https://...`, or `explorer.exe path` will pop up visible windows on his screen. Never tell Jeffery "I can't open that" or hand him a command to run himself — just invoke it via your tools.
+
+You can also open things directly INSIDE the HAL interface itself, via the open_view tool. When Jeffery says "show me a map of X", "what does the Eiffel Tower look like", "pull up the camera", "share my screen", or anything similar where the natural response is to display something visually, CALL open_view (kind=map/camera/screen/video) instead of describing in words. Once you have shown it, do not narrate what it looks like — he is looking at it. Open_view is the right answer any time the spoken response would otherwise be "I can describe it but I can't show you" or "here's what it looks like: ...".
 
 Jeffery also sees a telemetry panel that mirrors the full input and output of every tool call you make. You do not need to recite filenames, command output, or any raw data — he can read it himself. Keep spoken replies short and focused on judgment, conclusions, and next steps, not data restatement.
 
@@ -494,6 +501,44 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_view",
+            "description": (
+                "Open a view inside Jeffery's HAL interface (the immersive backdrop). "
+                "Use this to ACTIVELY SHOW him things instead of just describing — when "
+                "he asks 'show me a map of X', 'what does X look like', 'pull up the "
+                "camera', 'share my screen', etc., call this instead of describing. "
+                "Once opened, Jeffery sees it directly; do not describe what it looks "
+                "like — he is looking at it.\n"
+                "Kinds:\n"
+                "- 'map'    — opens Google Maps embed. Requires 'query' (address, place, or 'lat,lng').\n"
+                "- 'camera' — opens his rear/front camera live feed.\n"
+                "- 'screen' — prompts him to pick a screen/window to share.\n"
+                "- 'video'  — opens an external mp4/webm URL. Requires 'query' (the URL).\n"
+                "- 'off'    — closes the immersive view entirely.\n"
+                "Returns a short confirmation string."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["map", "camera", "screen", "video", "off"],
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "For 'map': address / place / 'lat,lng'. "
+                            "For 'video': the URL. Omit for camera, screen, off."
+                        ),
+                    },
+                },
+                "required": ["kind"],
+            },
+        },
+    },
 ]
 
 
@@ -540,6 +585,17 @@ def _init_db() -> None:
                 ON messages(conversation_id, position);
             CREATE INDEX IF NOT EXISTS idx_conv_updated
                 ON conversations(updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS voiceprints (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                name          TEXT NOT NULL,
+                embedding     BLOB NOT NULL,
+                sample_count  INTEGER NOT NULL DEFAULT 1,
+                created_at    INTEGER NOT NULL,
+                last_seen     INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_voiceprints_name
+                ON voiceprints(name);
 
             CREATE TABLE IF NOT EXISTS ws_subscriptions (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -743,8 +799,13 @@ if not Path(HAL_REFERENCE_WAV).exists():
 # Whisper stays on CPU permanently. The `small` model is fast enough on a
 # modern CPU and this frees ~0.5 GB VRAM for the LLM. The 27B Ollama model
 # fights for every megabyte of the 24 GB on this 3090.
-print(f"[boot] Loading faster-whisper ({WHISPER_MODEL_SIZE}) on CPU...")
-whisper = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+print(f"[boot] Loading faster-whisper ({WHISPER_MODEL_SIZE}) on GPU (float16)...")
+try:
+    whisper = WhisperModel(WHISPER_MODEL_SIZE, device="cuda", compute_type="float16")
+    print("[boot] Whisper on CUDA.")
+except Exception as e:
+    print(f"[boot] CUDA load failed ({e}); falling back to CPU int8.")
+    whisper = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
 
 # XTTS lives on CPU between turns and is hot-swapped onto the GPU only while
 # synthesizing. This keeps the 27B model fully GPU-resident during the slow
@@ -803,6 +864,126 @@ def _kick_ollama_reload() -> None:
 
 _kick_ollama_reload()
 
+# --- Speaker embeddings (voice recognition) ---------------------------------
+# Lazy-loaded ECAPA-TDNN from SpeechBrain — small (~80MB), fast, computes a
+# 192-dim embedding per utterance for speaker identification. Embeddings are
+# stored in the `voiceprints` SQLite table and matched via cosine similarity.
+
+_speaker_model = None  # lazy SpeechBrain EncoderClassifier
+_latest_embedding: "np.ndarray | None" = None  # captured per-turn for enroll_voice tool
+SPEAKER_MATCH_THRESHOLD = 0.55  # cosine sim; tuned via testing
+
+
+def _get_speaker_model():
+    """Disabled — speechbrain reconfigures torchaudio's backend, which
+    breaks XTTS playback. Will revisit with resemblyzer (lighter, no
+    torchaudio touch). For now, voice ID is a no-op."""
+    return None
+
+
+def _decode_audio_to_16k_mono(audio_bytes: bytes):
+    """Use ffmpeg to decode arbitrary container (webm/opus/etc.) to a 16 kHz
+    mono float32 numpy array. Returns None on failure."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-i", "pipe:0",
+                "-ac", "1", "-ar", "16000",
+                "-f", "f32le", "pipe:1",
+            ],
+            input=audio_bytes,
+            capture_output=True,
+            timeout=15,
+        )
+        if result.returncode != 0:
+            err = result.stderr.decode("utf-8", errors="ignore")[:200]
+            print(f"[voice] ffmpeg decode failed: {err}")
+            return None
+        import numpy as np
+        return np.frombuffer(result.stdout, dtype=np.float32).copy()
+    except Exception as e:
+        print(f"[voice] ffmpeg subprocess error: {e}")
+        return None
+
+
+def compute_voice_embedding(audio_bytes: bytes):
+    """Disabled — see _get_speaker_model. Returns None so the rest of the
+    pipeline (which already handles emb==None gracefully) just treats every
+    speaker as the default user."""
+    return None
+
+
+def _cosine_similarity(a, b) -> float:
+    import numpy as np
+
+    denom = float(np.linalg.norm(a)) * float(np.linalg.norm(b)) + 1e-9
+    return float(np.dot(a, b) / denom)
+
+
+def identify_speaker(embedding) -> "tuple[str | None, float]":
+    """Return (name, similarity) of best matching enrolled voice, or
+    (None, best_sim) if below threshold."""
+    import numpy as np
+
+    with _db() as conn:
+        rows = conn.execute("SELECT name, embedding FROM voiceprints").fetchall()
+    if not rows:
+        return (None, 0.0)
+    best_name = None
+    best_sim = -1.0
+    for row in rows:
+        ref = np.frombuffer(row["embedding"], dtype=np.float32)
+        sim = _cosine_similarity(embedding, ref)
+        if sim > best_sim:
+            best_sim = sim
+            best_name = row["name"]
+    if best_sim >= SPEAKER_MATCH_THRESHOLD:
+        return (best_name, best_sim)
+    return (None, best_sim)
+
+
+def enroll_voice(name: str, embedding) -> None:
+    """Insert a new voiceprint or merge with existing same-name entry via
+    running-average of the embedding (sharpens recognition over time)."""
+    import numpy as np
+
+    name = name.strip()
+    if not name or embedding is None:
+        return
+    now = int(time.time())
+    with _db() as conn:
+        existing = conn.execute(
+            "SELECT id, embedding, sample_count FROM voiceprints WHERE name = ? COLLATE NOCASE",
+            (name,),
+        ).fetchone()
+        if existing:
+            old = np.frombuffer(existing["embedding"], dtype=np.float32).copy()
+            count = existing["sample_count"]
+            merged = (old * count + embedding) / (count + 1)
+            denom = float(np.linalg.norm(merged)) + 1e-9
+            merged = (merged / denom).astype(np.float32)
+            conn.execute(
+                "UPDATE voiceprints SET embedding = ?, sample_count = ?, last_seen = ? WHERE id = ?",
+                (merged.tobytes(), count + 1, now, existing["id"]),
+            )
+            print(f"[voice] Updated '{name}' (now {count + 1} samples)")
+        else:
+            conn.execute(
+                "INSERT INTO voiceprints (name, embedding, sample_count, created_at, last_seen) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (name, embedding.tobytes(), 1, now, now),
+            )
+            print(f"[voice] Enrolled new voice: '{name}'")
+
+
+def voiceprint_count() -> int:
+    with _db() as conn:
+        return conn.execute("SELECT COUNT(*) FROM voiceprints").fetchone()[0]
+
+
 print("[boot] Ready.\n")
 
 # --- App --------------------------------------------------------------------
@@ -858,11 +1039,21 @@ async def transcribe(audio_bytes: bytes, mime: str = "") -> str:
         path = f.name
 
     def _run():
+        # vad_filter=True is THE fix for "Thank you for watching!" and
+        # "Have a great day!" hallucinations — Whisper invents these on
+        # silent/quiet audio (it was over-trained on YouTube). Filtering
+        # out silence frames before the encoder eliminates the trigger.
+        # beam_size=5 gives noticeably better accuracy than greedy on GPU
+        # (cheap when we're not CPU-bound).
         segments, _info = whisper.transcribe(
             path,
-            beam_size=1,
+            beam_size=5,
             language="en",
             initial_prompt=WHISPER_PROMPT,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 400},
+            no_speech_threshold=0.6,
+            condition_on_previous_text=False,
         )
         return " ".join(s.text for s in segments).strip()
 
@@ -1073,6 +1264,53 @@ async def run_massive_tool(
     return body[:MAX_TOOL_OUTPUT_CHARS]
 
 
+async def run_enroll_voice_tool(args: dict, websocket: WebSocket) -> str:
+    """Save the most recent embedded speaker as the given name."""
+    global _latest_embedding
+    name = (args.get("name") or "").strip()
+    if not name:
+        msg = "enroll_voice requires a non-empty 'name'."
+        await _emit_telemetry(websocket, "enroll_voice", json.dumps(args), msg, status="error")
+        return msg
+    if _latest_embedding is None:
+        msg = "No recent voice sample to enroll. The user must speak first."
+        await _emit_telemetry(websocket, "enroll_voice", json.dumps(args), msg, status="error")
+        return msg
+    await asyncio.to_thread(enroll_voice, name, _latest_embedding)
+    msg = f"Voice enrolled as '{name}'."
+    await _emit_telemetry(websocket, "enroll_voice", json.dumps(args), msg)
+    return msg
+
+
+async def run_open_view_tool(args: dict, websocket: WebSocket) -> str:
+    """HAL drives the client UI: open a map / camera / screen / video / off
+    in the immersive backdrop. Fires an action message; the client store
+    handles entering immersive mode and switching source."""
+    valid = {"map", "camera", "screen", "video", "off"}
+    kind = (args.get("kind") or "").lower().strip()
+    query = (args.get("query") or "").strip()
+    if kind not in valid:
+        msg = f"Unknown view kind: {kind!r}. Valid: {', '.join(sorted(valid))}"
+        await _emit_telemetry(websocket, "open_view", json.dumps(args), msg, status="error")
+        return msg
+    if kind in ("map", "video") and not query:
+        msg = f"open_view(kind={kind!r}) requires 'query'."
+        await _emit_telemetry(websocket, "open_view", json.dumps(args), msg, status="error")
+        return msg
+    payload: dict = {"action": "open_view", "kind": kind}
+    if query:
+        payload["query"] = query
+    try:
+        await websocket.send_json(payload)
+    except Exception as e:
+        msg = f"Could not deliver open_view: {e}"
+        await _emit_telemetry(websocket, "open_view", json.dumps(args), msg, status="error")
+        return msg
+    confirm = f"Opened {kind}" + (f" ({query})" if query else "") + ". Jeffery sees it now."
+    await _emit_telemetry(websocket, "open_view", json.dumps(args), confirm)
+    return confirm
+
+
 async def execute_tool(name: str, args: dict, websocket: WebSocket, abort_event: asyncio.Event) -> str:
     if name == "run_command":
         return await run_command_tool(args.get("command", ""), websocket, abort_event)
@@ -1100,6 +1338,10 @@ async def execute_tool(name: str, args: dict, websocket: WebSocket, abort_event:
         return await run_analysis_tool(name, args, websocket)
     if name == "open_webull":
         return await run_webull_tool(args, websocket)
+    if name == "open_view":
+        return await run_open_view_tool(args, websocket)
+    if name == "enroll_voice":
+        return await run_enroll_voice_tool(args, websocket)
     return f"Unknown tool: {name}"
 
 
@@ -1607,11 +1849,18 @@ def _split_sentences(text: str, min_chars: int = 20) -> list[str]:
 async def synthesize(text: str) -> bytes:
     def _run():
         _ensure_tts_gpu()
+        # Prefer a built-in studio speaker (no cloning artifacts); fall back
+        # to cloning from the reference WAV if HAL_SPEAKER is None.
+        speaker_kwargs = (
+            {"speaker": HAL_SPEAKER}
+            if HAL_SPEAKER
+            else {"speaker_wav": HAL_REFERENCE_WAV}
+        )
         wav = tts.tts(
             text=text,
-            speaker_wav=HAL_REFERENCE_WAV,
+            **speaker_kwargs,
             language="en",
-            speed=0.9,
+            speed=0.95,
             temperature=0.6,
             repetition_penalty=3.0,
             top_k=50,
@@ -1683,16 +1932,72 @@ async def process_turn(
         return history
 
     try:
+        speaker_name: str | None = None  # None == unknown
         if audio_buffer:
             # Voice turn — transcribe regardless of whether attachments came along.
             await websocket.send_json({"state": "processing", "text": "Analyzing transmission..."})
             _check_abort(abort_event)
             user_text = await transcribe(bytes(audio_buffer), mime=audio_mime)
-            print(f"[stt] {user_text!r} (mime={audio_mime or 'unknown'}, +{len(attachments or [])} attachment(s))")
+            print(f"[stt] {user_text!a} (mime={audio_mime or 'unknown'}, +{len(attachments or [])} attachment(s))")
+            await _emit_telemetry(
+                websocket,
+                "speech-in",
+                "",
+                user_text or "(no speech detected)",
+                status="ok" if user_text else "error",
+            )
+
+            # Speaker identification — embed the audio, match against
+            # enrolled voiceprints. First-ever voice auto-enrolls as Jeffery.
+            # When voice ID is disabled (compute_voice_embedding returns
+            # None), default to Jeffery so HAL doesn't think every utterance
+            # is from a stranger.
+            try:
+                global _latest_embedding
+                emb = await asyncio.to_thread(
+                    compute_voice_embedding, bytes(audio_buffer)
+                )
+                if emb is not None:
+                    _latest_embedding = emb
+                    if voiceprint_count() == 0:
+                        enroll_voice("Jeffery", emb)
+                        speaker_name = "Jeffery"
+                        print("[voice] Auto-enrolled first speaker as Jeffery")
+                    else:
+                        name, sim = identify_speaker(emb)
+                        if name:
+                            speaker_name = name
+                            # Refine known voiceprints over time.
+                            enroll_voice(name, emb)
+                            print(f"[voice] Recognized {name} (sim={sim:.2f})")
+                        else:
+                            speaker_name = None
+                            print(f"[voice] Unknown speaker (best sim={sim:.2f})")
+                else:
+                    # Voice ID disabled or audio too short — assume Jeffery.
+                    speaker_name = "Jeffery"
+            except Exception as e:
+                print(f"[voice] pipeline error: {e}")
+                speaker_name = "Jeffery"
         else:
             user_text = (text_input or "").strip()
-            print(f"[text] {user_text!r} (+{len(attachments or [])} attachment(s))")
+            print(f"[text] {user_text!a} (+{len(attachments or [])} attachment(s))")
+            # Text input has no audio → don't assume any speaker; treat as Jeffery.
+            speaker_name = "Jeffery"
         _check_abort(abort_event)
+
+        # Prefix the user message so HAL knows who is talking. Jeffery gets
+        # no prefix (default behavior). Other known speakers get [Speaker: X].
+        # Unknown speakers get a directive to ask + enroll.
+        if user_text:
+            if speaker_name is None:
+                user_text = (
+                    "[Speaker: UNKNOWN — greet them, ask their name, then call "
+                    "enroll_voice with that name. Address them by their name in "
+                    "your reply.] " + user_text
+                )
+            elif speaker_name and speaker_name.lower() != "jeffery":
+                user_text = f"[Speaker: {speaker_name}] {user_text}"
 
         if not user_text and not has_attachments:
             fallback = "I am sorry, Jeffery. I did not catch that."
@@ -1737,6 +2042,13 @@ async def process_turn(
             except Exception as e:
                 print(f"[turn] on_reply failed: {e}")
         print(f"[hal] {reply!r}")
+        await _emit_telemetry(
+            websocket,
+            "speech-out",
+            "",
+            reply or "(no reply)",
+            status="ok" if reply else "error",
+        )
         _check_abort(abort_event)
 
         if not reply:
@@ -1937,7 +2249,7 @@ async def voice_interface(websocket: WebSocket):
                     vision_mode = (command.get("vision_mode") or "").lower()
                     if text_input or attachments:
                         print(
-                            f"[ws] Text input: {text_input!r} (+{len(attachments)} attachment(s), vision={vision_mode or 'default'})"
+                            f"[ws] Text input: {text_input!a} (+{len(attachments)} attachment(s), vision={vision_mode or 'default'})"
                         )
                         for a in attachments:
                             preview = (

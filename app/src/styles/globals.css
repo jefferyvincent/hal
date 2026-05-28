@@ -1,0 +1,406 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* HAL 9000 — CRT chrome carried over from the legacy index.html, now scoped
+   via Tailwind layers. Only effects that don't translate well into utility
+   classes live here. */
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  html,
+  body {
+    background: theme("colors.hal.bg");
+    color: theme("colors.hal.text");
+    font-family: theme("fontFamily.mono");
+    overflow: hidden;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  /* In Tauri, the whole window is a drag region by default; we opt out for
+     interactive elements via data-tauri-drag-region="false". */
+
+  /* ---- HAL-themed scrollbars ---- Applied universally so every panel,
+     transcript, conversation list, telemetry feed, and thoughts feed all
+     share the same red-on-black aesthetic. Per-component scrollbar styling
+     in older panels still works but this is now the baseline. */
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  *::-webkit-scrollbar-track {
+    background: #0a0a0d;
+    border-left: 1px solid rgba(255, 30, 30, 0.12);
+  }
+  *::-webkit-scrollbar-thumb {
+    background: linear-gradient(180deg, #8a0000 0%, #ff1a1a 100%);
+    border-radius: 2px;
+    border: 1px solid #050507;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: linear-gradient(180deg, #ff1a1a 0%, #ff3838 100%);
+    box-shadow: 0 0 8px rgba(255, 30, 30, 0.6);
+  }
+  *::-webkit-scrollbar-corner {
+    background: #0a0a0d;
+  }
+  /* Firefox */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #8a0000 #0a0a0d;
+  }
+}
+
+@layer components {
+  /* CRT scanlines */
+  .crt-scanlines::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    background-image: linear-gradient(
+      to bottom,
+      transparent 0%,
+      rgba(255, 255, 255, 0.025) 50%,
+      transparent 100%
+    );
+    background-size: 100% 4px;
+    pointer-events: none;
+    z-index: 100;
+    mix-blend-mode: overlay;
+  }
+  /* Vignette */
+  .crt-vignette::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    background: radial-gradient(
+      ellipse at center,
+      transparent 30%,
+      rgba(0, 0, 0, 0.85) 100%
+    );
+    pointer-events: none;
+    z-index: 99;
+  }
+  /* Faint grid */
+  .crt-grid {
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(255, 30, 30, 0.04) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 30, 30, 0.04) 1px, transparent 1px);
+    background-size: 60px 60px;
+    z-index: 1;
+    opacity: 0.5;
+    pointer-events: none;
+  }
+
+  /* Hexagonal mounting plate behind the eye */
+  .hal-panel {
+    background: radial-gradient(
+      circle at 30% 30%,
+      #1a1a1f 0%,
+      #0a0a0d 60%,
+      #050507 100%
+    );
+    clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%);
+    box-shadow:
+      inset 0 0 100px rgba(0, 0, 0, 0.8),
+      0 0 40px rgba(0, 0, 0, 0.9);
+  }
+
+  /* The eye itself */
+  .hal-eye {
+    background: radial-gradient(
+      circle at 50% 50%,
+      #000 35%,
+      #1a0000 55%,
+      #000 75%
+    );
+    box-shadow:
+      inset 0 0 50px rgba(0, 0, 0, 1),
+      inset 0 0 80px rgba(80, 0, 0, 0.8),
+      0 0 0 8px #050507,
+      0 0 0 10px #1a1a1f,
+      0 0 0 12px #050507;
+    transition: box-shadow 0.6s ease;
+  }
+  .hal-eye-iris {
+    background: radial-gradient(
+      circle at 50% 50%,
+      #ff3838 0%,
+      #ff1a1a 30%,
+      #8a0000 60%,
+      rgba(80, 0, 0, 0.3) 80%,
+      transparent 100%
+    );
+    opacity: 0.7;
+    transition: all 0.6s ease;
+    filter: blur(2px);
+  }
+  .hal-eye-pupil {
+    background: radial-gradient(
+      circle at 40% 40%,
+      #ffd44a 0%,
+      #ffb300 40%,
+      #ff5500 80%,
+      #aa3300 100%
+    );
+    box-shadow:
+      0 0 20px #ffb300,
+      0 0 40px rgba(255, 180, 0, 0.4);
+    transition: all 0.4s ease;
+  }
+  .hal-eye-specular {
+    background: radial-gradient(
+      ellipse,
+      rgba(255, 255, 255, 0.18) 0%,
+      rgba(255, 255, 255, 0.05) 50%,
+      transparent 80%
+    );
+    pointer-events: none;
+    filter: blur(4px);
+  }
+
+  /* Digital-signal layer: dot-matrix noise pattern over the iris. */
+  .hal-eye-noise {
+    background-image:
+      radial-gradient(circle at center, rgba(255, 30, 30, 0.55) 0.6px, transparent 1px);
+    background-size: 5px 5px;
+    background-position: 0 0;
+    mix-blend-mode: screen;
+    opacity: 0.28;
+    animation: noise-pulse 4s ease-in-out infinite;
+    border-radius: 9999px;
+  }
+
+  /* Horizontal red scanline sweeping vertically. */
+  .hal-eye-scanline {
+    background: linear-gradient(
+      90deg,
+      transparent 0%,
+      rgba(255, 30, 30, 0.95) 50%,
+      transparent 100%
+    );
+    box-shadow:
+      0 0 8px rgba(255, 30, 30, 0.7),
+      0 0 18px rgba(255, 30, 30, 0.35);
+    filter: blur(0.5px);
+    animation: scanline-sweep 4s linear infinite;
+  }
+
+  /* Per-state speed / intensity adjustments */
+  body.idle .hal-eye-scanline {
+    animation-duration: 6s;
+    opacity: 0.6;
+  }
+  body.listening .hal-eye-scanline {
+    animation-duration: 2.5s;
+  }
+  body.processing .hal-eye-scanline {
+    animation-duration: 1.2s;
+  }
+  body.speaking .hal-eye-scanline {
+    animation-duration: 1s;
+    box-shadow:
+      0 0 12px rgba(255, 30, 30, 1),
+      0 0 28px rgba(255, 30, 30, 0.6);
+  }
+  body.speaking .hal-eye-noise {
+    opacity: 0.5;
+    animation-duration: 0.8s;
+  }
+
+  /* State-driven eye variants */
+  body.idle .hal-eye-iris {
+    opacity: 0.45;
+    animation: breathe 5s ease-in-out infinite;
+  }
+  body.idle .hal-eye-pupil {
+    box-shadow: 0 0 10px #ffb300;
+  }
+  body.listening .hal-eye-iris {
+    opacity: 1;
+    background: radial-gradient(
+      circle at 50% 50%,
+      #ff5050 0%,
+      #ff1a1a 30%,
+      #8a0000 60%,
+      rgba(120, 0, 0, 0.4) 80%,
+      transparent 100%
+    );
+    animation: listen-pulse 1.5s ease-in-out infinite;
+  }
+  body.listening .hal-eye {
+    box-shadow:
+      inset 0 0 50px rgba(0, 0, 0, 1),
+      inset 0 0 80px rgba(180, 0, 0, 0.7),
+      0 0 60px rgba(255, 30, 30, 0.3),
+      0 0 0 8px #050507,
+      0 0 0 10px #2a1a1a,
+      0 0 0 12px #050507;
+  }
+  body.processing .hal-eye-iris {
+    opacity: 1;
+    background: radial-gradient(
+      circle at 50% 50%,
+      #ffb000 0%,
+      #ff6600 30%,
+      #aa3300 60%,
+      transparent 100%
+    );
+    animation: processing-flicker 0.4s linear infinite;
+  }
+  body.processing .hal-eye-pupil {
+    animation: processing-pupil 0.6s ease-in-out infinite;
+  }
+  body.processing .hal-eye {
+    box-shadow:
+      inset 0 0 50px rgba(0, 0, 0, 1),
+      inset 0 0 80px rgba(160, 80, 0, 0.7),
+      0 0 50px rgba(255, 150, 0, 0.4),
+      0 0 0 8px #050507,
+      0 0 0 10px #2a2010,
+      0 0 0 12px #050507;
+  }
+  body.speaking .hal-eye-iris {
+    opacity: 1;
+    background: radial-gradient(
+      circle at 50% 50%,
+      #ff4040 0%,
+      #ff1a1a 40%,
+      #8a0000 70%,
+      transparent 100%
+    );
+    animation: speak-pulse 0.5s ease-in-out infinite;
+  }
+  body.speaking .hal-eye-pupil {
+    animation: speak-pupil 0.5s ease-in-out infinite;
+  }
+  body.speaking .hal-eye {
+    box-shadow:
+      inset 0 0 50px rgba(0, 0, 0, 1),
+      inset 0 0 100px rgba(220, 0, 0, 0.8),
+      0 0 80px rgba(255, 30, 30, 0.5),
+      0 0 0 8px #050507,
+      0 0 0 10px #3a1a1a,
+      0 0 0 12px #050507;
+  }
+
+  /* Fullscreen chat mode: hides the HAL eye, lets <main> reflow to top.
+     Transcript size is bumped via React state in Transcript.tsx (cleaner
+     than fighting Tailwind specificity). */
+  body.fullscreen-chat .hal-panel {
+    display: none;
+  }
+  body.fullscreen-chat main {
+    justify-content: flex-start;
+    padding-top: 70px;
+    gap: 14px;
+  }
+
+  /* Immersive: fade non-essential UI until interacted with. Each panel
+     opts in by adding the `immersive-fade` class. */
+  body.immersive .immersive-fade {
+    opacity: 0.08;
+    transition: opacity 0.9s ease;
+  }
+  body.immersive .immersive-fade:hover,
+  body.immersive .immersive-fade:focus-within {
+    opacity: 1;
+    transition: opacity 0.2s ease;
+  }
+
+}
+
+/* ---------------------------------------------------------------------------
+   Keyframes. These live as raw CSS (not Tailwind theme.extend.keyframes)
+   because Tailwind's JIT only emits @keyframes blocks when the matching
+   animate-* utility class is used in markup. We drive the eye state via
+   body.<mode> selectors above, so the utility never appears in source and
+   the keyframes never get compiled in. Defining them here guarantees they
+   ship.
+   --------------------------------------------------------------------------- */
+@keyframes breathe {
+  0%, 100% { transform: translate(-50%, -50%) scale(0.95); opacity: 0.35; }
+  50%      { transform: translate(-50%, -50%) scale(1.05); opacity: 0.55; }
+}
+@keyframes listen-pulse {
+  0%, 100% { transform: translate(-50%, -50%) scale(1); }
+  50%      { transform: translate(-50%, -50%) scale(1.04); }
+}
+@keyframes processing-flicker {
+  0%, 100% { opacity: 1;   transform: translate(-50%, -50%) scale(1); }
+  25%      { opacity: 0.7; transform: translate(-50%, -50%) scale(0.96); }
+  50%      { opacity: 1;   transform: translate(-50%, -50%) scale(1.02); }
+  75%      { opacity: 0.8; transform: translate(-50%, -50%) scale(0.98); }
+}
+@keyframes processing-pupil {
+  0%, 100% { transform: translate(-50%, -50%) scale(1); }
+  50%      { transform: translate(-50%, -50%) scale(1.4); }
+}
+@keyframes speak-pulse {
+  0%, 100% { transform: translate(-50%, -50%) scale(1);    opacity: 1; }
+  50%      { transform: translate(-50%, -50%) scale(1.08); opacity: 0.85; }
+}
+@keyframes speak-pupil {
+  0%, 100% { transform: translate(-50%, -50%) scale(1); }
+  50%      { transform: translate(-50%, -50%) scale(1.2); }
+}
+
+/* Digital-signal scanline sweeping top-to-bottom across the eye */
+@keyframes scanline-sweep {
+  0%   { top: -8px; opacity: 0; }
+  8%   { opacity: 1; }
+  92%  { opacity: 1; }
+  100% { top: calc(100% + 8px); opacity: 0; }
+}
+/* Subtle "carrier signal" pulse for the noise pattern */
+@keyframes noise-pulse {
+  0%, 100% { opacity: 0.22; }
+  50%      { opacity: 0.4; }
+}
+
+@layer components {
+
+  /* Markdown */
+  .md code {
+    background: rgba(255, 30, 30, 0.08);
+    border: 1px solid rgba(255, 30, 30, 0.2);
+    padding: 1px 4px;
+    border-radius: 2px;
+    font-size: 0.9em;
+  }
+  .md pre {
+    background: rgba(0, 0, 0, 0.5);
+    border-left: 2px solid theme("colors.hal.amber");
+    padding: 10px 12px;
+    overflow-x: auto;
+    font-size: 12px;
+    line-height: 1.45;
+    -webkit-user-select: text;
+    user-select: text;
+    position: relative;
+  }
+  .md pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    color: theme("colors.hal.text");
+  }
+  .md ul {
+    list-style: disc;
+    padding-left: 1.4em;
+  }
+  .md h1,
+  .md h2,
+  .md h3,
+  .md h4 {
+    color: theme("colors.hal.amber");
+    letter-spacing: 1px;
+    margin: 0.4em 0 0.2em;
+  }
+}
