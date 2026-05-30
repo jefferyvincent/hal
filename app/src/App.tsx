@@ -109,7 +109,11 @@ export default function App() {
       <ConversationsPanel />
       <TelemetryPanel />
 
-      <main className="relative z-[5] flex h-full w-full items-center justify-center pt-[70px] pb-[260px]">
+      <main
+        className={`relative z-[5] flex h-full w-full items-center justify-center pt-[70px] pb-[260px] ${
+          immersiveActive ? "pointer-events-none" : ""
+        }`}
+      >
         <Eye />
       </main>
       <Transcript />

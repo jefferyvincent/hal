@@ -43,6 +43,26 @@ export interface ServerEnvelope {
   action?: string;
   kind?: string;
   query?: string;
+  /** Candlestick chart payload (action="open_view", kind="chart"). */
+  chart?: ChartPayload;
+  /** Chart zoom command (action="chart_zoom"); times are unix seconds. */
+  zoom_from?: number;
+  zoom_to?: number;
+  zoom_reset?: boolean;
 }
 
-export type ImmersiveSource = "off" | "camera" | "screen" | "map" | "video";
+export type ImmersiveSource = "off" | "camera" | "screen" | "map" | "video" | "chart";
+
+/** Candlestick chart payload built server-side by charting.py. Times are
+ *  unix SECONDS (lightweight-charts UTCTimestamp). */
+export interface ChartPayload {
+  symbol: string;
+  timeframe: string;
+  bar_count: number;
+  candles: { time: number; open: number; high: number; low: number; close: number }[];
+  volume: { time: number; value: number; up: boolean }[];
+  supertrend_up: { time: number; value: number }[];
+  supertrend_down: { time: number; value: number }[];
+  markers: { time: number; side: "buy" | "sell" }[];
+  levels: { price: number; kind: "support" | "resistance"; label: string }[];
+}

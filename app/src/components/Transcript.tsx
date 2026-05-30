@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { useConnection } from "@/stores/connection";
 import { useUi } from "@/stores/ui";
+import { useImmersive } from "@/stores/immersive";
 import { renderMessage } from "@/lib/markdown";
 import { cn } from "@/lib/cn";
 
@@ -9,6 +10,7 @@ export default function Transcript() {
   const pendingHal = useConnection((s) => s.pendingHal);
   const fullscreen = useUi((s) => s.fullscreenChat);
   const chatOpen = useUi((s) => s.chatOpen);
+  const chartActive = useImmersive((s) => s.active && s.source === "chart");
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -46,6 +48,7 @@ export default function Transcript() {
         fullscreen
           ? "top-[80px] bottom-[240px]"
           : "bottom-[240px] max-h-[20vh]",
+        chartActive && "pointer-events-none",
       )}
       onClick={onCopy}
     >

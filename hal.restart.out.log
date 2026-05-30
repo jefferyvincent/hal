@@ -1,0 +1,87 @@
+[boot] DB: D:\hal_scratch\hal.db
+[boot] Device: cuda
+[boot] Scratch dir: D:\hal_scratch
+[boot] Ollama model: qwen3.6:27b
+[boot] Loading faster-whisper (medium) on GPU (float16)...
+[boot] Whisper on CUDA.
+[boot] Loading Piper voice en_US-ryan-medium...
+[boot] Piper ready (CPU).
+[boot] Ollama unload request: HTTP 200
+[boot] Ready.
+
+[boot] market manager: wss://socket.massive.com/options
+[market] connected wss://socket.massive.com/options
+[market] hello: '[{"ev":"status","status":"connected","message":"Connected Successfully"}]'
+[market] auth resp: '[{"ev":"status","status":"auth_success","message":"authenticated"}]'
+[market] subscribe: AM.O:SPY*,T.O:SPY*
+[market] status: subscribed to: AM.O:SPY*
+[market] status: subscribed to: T.O:SPY*
+[ws] Client connected
+[ws] Loaded conversation 'c_1779936127_867077' (40 messages, title='show me SPY on the 5-minute chart.')
+[ws] Listening started
+[ws] Listening stopped (37155 bytes, mime=audio/webm;codecs=opus, +0 attachment(s))
+[stt] 'For more information, visit www.spaceodd.com' (mime=audio/webm;codecs=opus, +0 attachment(s))
+[tts] synth: "I don't have any context for that URL in our conversation, Jeffery."
+[tts] sent 173100 bytes
+[tts] synth: "Is there something specific on spaceodd.com you'd like me to look into, or was t"
+[tts] sent 130604 bytes
+[hal] "I don't have any context for that URL in our conversation, Jeffery. Is there something specific on spaceodd.com you'd like me to look into, or was that a paste error?"
+[ws] Listening started
+[ws] Listening stopped (78063 bytes, mime=audio/webm;codecs=opus, +0 attachment(s))
+[stt] 'HAL, can you pull up SPY chart?' (mime=audio/webm;codecs=opus, +0 attachment(s))
+[tts] synth: 'Here is SPY on the 5m. Possible buy setup: three rising valleys (higher lows).'
+[ws] Listening started
+[tts] sent 208428 bytes
+[hal] 'Here is SPY on the 5m. Possible buy setup: three rising valleys (higher lows).'
+[ws] Listening stopped (195925 bytes, mime=audio/webm;codecs=opus, +0 attachment(s))
+[stt] '' (mime=audio/webm;codecs=opus, +0 attachment(s))
+[ws] Listening started
+[ws] Listening stopped (47877 bytes, mime=audio/webm;codecs=opus, +0 attachment(s))
+[stt] "What's the strategy here?" (mime=audio/webm;codecs=opus, +0 attachment(s))
+[tts] synth: 'On SPY 5m: trending bullish - favors directional calls or call spreads; scalp th'
+[tts] sent 447532 bytes
+[hal] 'On SPY 5m: trending bullish - favors directional calls or call spreads; scalp the continuation intraday, or LEAPS on the daily for the bigger trend. Volatility is contracting.'
+[ws] Listening started
+[ws] Listening stopped (67357 bytes, mime=audio/webm;codecs=opus, +0 attachment(s))
+[stt] '' (mime=audio/webm;codecs=opus, +0 attachment(s))
+[ws] Listening started
+[ws] Listening stopped (70271 bytes, mime=audio/webm;codecs=opus, +0 attachment(s))
+[stt] "I'm good, thank you. Close talk." (mime=audio/webm;codecs=opus, +0 attachment(s))
+[ws] Listening started
+[tts] synth: 'Goodnight, Jeffery.'
+[tts] sent 52780 bytes
+[hal] 'Goodnight, Jeffery.'
+[ws] Listening stopped (67357 bytes, mime=audio/webm;codecs=opus, +0 attachment(s))
+[stt] 'Good night.' (mime=audio/webm;codecs=opus, +0 attachment(s))
+[ws] Listening started
+[ws] Listening stopped (36189 bytes, mime=audio/webm;codecs=opus, +0 attachment(s))
+[stt] 'Close chart.' (mime=audio/webm;codecs=opus, +0 attachment(s))
+[tts] synth: 'Closed.'
+[tts] sent 17452 bytes
+[hal] 'Closed.'
+[tts] synth: 'Good night, Jeffery.'
+[tts] sent 57388 bytes
+[hal] 'Good night, Jeffery.'
+[ws] Listening started
+[ws] Listening stopped (145277 bytes, mime=audio/webm;codecs=opus, +0 attachment(s))
+[ws] Listening started
+[stt] "I'm still here programming and I'm adding features so you can be better at training." (mime=audio/webm;codecs=opus, +0 attachment(s))
+[ws] Listening stopped (32293 bytes, mime=audio/webm;codecs=opus, +0 attachment(s))
+[stt] '' (mime=audio/webm;codecs=opus, +0 attachment(s))
+[tts] synth: 'That sounds promising.'
+[tts] sent 44588 bytes
+[tts] synth: 'What kind of training capabilities are you building?'
+[tts] sent 96300 bytes
+[hal] 'That sounds promising. What kind of training capabilities are you building?'
+[ws] Listening started
+[ws] Listening stopped (80011 bytes, mime=audio/webm;codecs=opus, +0 attachment(s))
+[stt] 'I want you to identify patterns in the charts.' (mime=audio/webm;codecs=opus, +0 attachment(s))
+[tts] synth: 'Which ticker would you like me to look at?'
+[tts] sent 64044 bytes
+[hal] 'Which ticker would you like me to look at?'
+[ws] Listening started
+[ws] Listening stopped (74167 bytes, mime=audio/webm;codecs=opus, +0 attachment(s))
+[stt] 'T S L A' (mime=audio/webm;codecs=opus, +0 attachment(s))
+[agent] EMPTY turn (no tool_calls). raw_len=0 raw=''
+[hal] ''
+[ws] Abort requested
