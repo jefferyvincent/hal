@@ -5,7 +5,7 @@
 import { create } from "zustand";
 import { openRearCamera, openScreenShare } from "@/lib/vision";
 import { useConnection } from "@/stores/connection";
-import type { ImmersiveSource } from "@/types";
+import type { ImmersiveSource, ChartPayload } from "@/types";
 
 export interface Thought {
   id: number;
@@ -20,6 +20,8 @@ interface ImmersiveState {
   stream: MediaStream | null;
   videoUrl: string | null;
   mapQuery: string;
+  chart: ChartPayload | null;
+  chartZoom: { from?: number; to?: number; reset?: boolean; nonce: number } | null;
   thoughts: Thought[];
   /** Frame-capture callback registered by ImmersiveStage. Returns a base64
    *  JPEG of the current backdrop frame, or null if no frame is available
@@ -28,8 +30,12 @@ interface ImmersiveState {
   setFrameProvider: (fn: (() => string | null) | null) => void;
   enter: () => Promise<void>;
   exit: () => void;
-  setSource: (src: ImmersiveSource, payload?: { url?: string; query?: string }) => Promise<void>;
+  setSource: (
+    src: ImmersiveSource,
+    payload?: { url?: string; query?: string; chart?: ChartPayload },
+  ) => Promise<void>;
   setMapQuery: (q: string) => void;
+  setChartZoom: (z: { from?: number; to?: number; reset?: boolean }) => void;
   pushThought: (kind: Thought["kind"], text: string) => void;
   clearThoughts: () => void;
 }
@@ -53,6 +59,8 @@ export const useImmersive = create<ImmersiveState>((set, get) => ({
   stream: null,
   videoUrl: null,
   mapQuery: "New York, NY",
+  chart: null,
+  chartZoom: null,
   thoughts: [],
   frameProvider: null,
 
@@ -128,6 +136,14 @@ export const useImmersive = create<ImmersiveState>((set, get) => ({
         }
         set({ source: "video", videoUrl: url });
         get().pushThought("note", `Source: video · ${url}`);
+      } else if (src === "chart") {
+        const chart = payload?.chart ?? get().chart;
+        if (!chart) {
+          get().pushThought("note", "Chart source requires a payload.");
+          return;
+        }
+        set({ source: "chart", chart });
+        get().pushThought("note", `Source: chart · ${chart.symbol} ${chart.timeframe}`);
       }
     } catch (err) {
       get().pushThought("note", `Source error: ${(err as Error).message}`);
@@ -137,6 +153,10 @@ export const useImmersive = create<ImmersiveState>((set, get) => ({
 
   setMapQuery(q) {
     set({ mapQuery: q });
+  },
+
+  setChartZoom(z) {
+    set({ chartZoom: { ...z, nonce: Date.now() } });
   },
 
   pushThought(kind, text) {

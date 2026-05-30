@@ -157,10 +157,17 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
       if (msg.action === "open_view") {
         const kind = msg.kind ?? "";
         const query = msg.query ?? "";
+        const chart = msg.chart;
         (async () => {
           const immersive = useImmersive.getState();
           if (kind === "off") {
             immersive.exit();
+            return;
+          }
+          if (kind === "chart") {
+            // Set the chart source first so enter() doesn't flash the camera.
+            await immersive.setSource("chart", { chart });
+            if (!immersive.active) await immersive.enter();
             return;
           }
           if (!immersive.active) await immersive.enter();
@@ -174,6 +181,14 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
             immersive.pushThought("note", `open_view: unknown kind "${kind}"`);
           }
         })().catch((err) => console.warn("open_view:", err));
+        return;
+      }
+      if (msg.action === "chart_zoom") {
+        useImmersive.getState().setChartZoom({
+          from: msg.zoom_from,
+          to: msg.zoom_to,
+          reset: msg.zoom_reset,
+        });
         return;
       }
       if (msg.state === "listening") return;

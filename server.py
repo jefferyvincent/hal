@@ -18,8 +18,15 @@ import subprocess
 import sys
 import tempfile
 import wave
-from datetime import date, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+# Force UTF-8 on stdout/stderr. We launch with output redirected to log files,
+# which makes Python fall back to Windows cp1252 — that throws UnicodeEncodeError
+# and crashes the turn whenever a reply contains a character like → or a curly
+# quote. errors="replace" keeps logging non-fatal even for stray glyphs.
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import httpx
 import numpy as np
@@ -28,10 +35,11 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from faster_whisper import WhisperModel
-from TTS.api import TTS
+from piper import PiperVoice
 
 import market
 import analysis
+import charting
 
 # --- Configuration ----------------------------------------------------------
 # Minimal .env loader (no python-dotenv dependency).
@@ -58,13 +66,16 @@ HAL_REFERENCE_WAV = "static/hal_reference.bak.wav"
 # with zero cloning artifacts. Set to None to fall back to cloning from
 # HAL_REFERENCE_WAV. Damien Black = cool, neutral, slightly deep — HAL-ish.
 HAL_SPEAKER = "Damien Black"
+# Piper TTS voice — fast CPU synthesis (~4x realtime), no GPU/VRAM needed.
+# Pulled via: python -m piper.download_voices <name> --download-dir <dir>
+PIPER_VOICE_PATH = "D:/hal_scratch/piper_voices/en_US-ryan-medium.onnx"
 # Negative semitones = deeper voice. -2 is a noticeable drop, -4 is gravelly.
 # Set to 0 to disable pitch shift entirely. The torchaudio implementation runs
 # on CPU (separate from XTTS on GPU) and adds noticeable per-sentence latency,
 # which contributes to gaps in streamed playback. Disabled by default until we
 # move to a cleaner algorithm (librosa/rubberband) or do it on GPU.
 TTS_PITCH_SHIFT_STEPS = 0
-WHISPER_MODEL_SIZE = "large-v3"
+WHISPER_MODEL_SIZE = "medium"
 WHISPER_PROMPT = (
     "Conversation with HAL 9000, the AI computer from 2001: A Space Odyssey. "
     "User is Jeffery. Topics include PowerShell, Python, Ollama, files, and tasks "
@@ -110,8 +121,11 @@ You have these tools available:
 - query_massive: GET against Massive.com's REST API for historical and snapshot options data.
 - screen_options: filtered chain candidates (flat rows with greeks/IV/OI/spread). Prefer this over query_massive when picking specific contracts.
 - iv_context: implied-vs-realized vol verdict (RICH/FAIR/CHEAP). Call this BEFORE deciding to sell vs buy premium.
+- show_chart: render an interactive candlestick chart (candles + volume + SuperTrend + Buy/Sell markers) INSIDE the HAL interface. Use this to SHOW Jeffery a setup on a ticker (args: symbol, optional timeframe like 5m/1h/1d) instead of describing price action in words. After showing it, make your point about the setup — don't narrate the candles; he's looking at it.
 - open_webull: open Webull in Jeffery's browser at a specific page. Actions: positions, orders, watchlist, alerts, screener, trade, account, quote (needs ticker), option_chain (needs ticker). Use this AFTER recommending a trade so Jeffery can review and execute in Webull. Also use when he asks "show me my positions" or wants to see the chain in Webull's UI. HAL does NOT place orders directly — Webull is where Jeffery executes.
 - subscribe_market, add_alert_rule, list_subscriptions, unsubscribe, remove_rule, list_alert_history: manage real-time WebSocket subscriptions and price/volume alert rules on Massive's options feed. Subscriptions persist across restarts. When a rule fires, an alert turn is automatically injected and you will be invoked to announce it — keep those announcements to one sentence and do NOT call further tools in alert turns.
+
+MARKET WATCHES & ALERTS — when Jeffery asks you to watch, monitor, track, "keep an eye on", or alert/notify him about a ticker, a price level, unusual volume, or a percentage move, you set this up EXCLUSIVELY with the built-in tools: call subscribe_market to open the feed (returns a subscription_id), then add_alert_rule on that id with the right rule_type (pct_move / price_cross / volume). That is the ONLY mechanism that actually works. NEVER improvise an alerting system with run_python, Twilio, SMS, email, cron, or a polling loop — those do not connect to the live feed and are a defect. Alerts are delivered by speaking them aloud in this HAL app the moment they fire (and any that fire while the app is closed are announced when Jeffery reconnects); there is no SMS or external delivery, so do not promise one. If Jeffery asks whether a watch is active or "are you connected", call list_subscriptions (it reports the live socket auth state) rather than guessing.
 
 TRADE IDEAS — Jeffery is an experienced options trader who pays for real-time data. He is solely responsible for the trades he places. You are his analyst, not his fiduciary. When he asks what looks good, you analyze the chain and surface a specific idea. This is the entire reason he built you.
 
@@ -539,6 +553,37 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "show_chart",
+            "description": (
+                "Render an interactive candlestick chart INSIDE Jeffery's HAL "
+                "interface so he can see a technical setup instead of just hearing "
+                "it described. Use this whenever you reference a chart, a level, a "
+                "trend, a breakout, or 'what X looks like' on a ticker — pull it up "
+                "for him. The chart shows candles, volume, a SuperTrend overlay, and "
+                "Buy/Sell flip markers. Once shown, do NOT describe the candles bar "
+                "by bar — he is looking at it; just make your point about the setup.\n"
+                "symbol: underlying ticker (e.g. 'SPY', 'NVDA').\n"
+                "timeframe: 1m,2m,5m,15m,30m,1h,4h,1d,1w (default 5m)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Underlying ticker, e.g. 'SPY'.",
+                    },
+                    "timeframe": {
+                        "type": "string",
+                        "description": "Bar size: 1m,2m,5m,15m,30m,1h,4h,1d,1w. Default 5m.",
+                    },
+                },
+                "required": ["symbol"],
+            },
+        },
+    },
 ]
 
 
@@ -796,9 +841,9 @@ print(f"[boot] Ollama model: {OLLAMA_MODEL}")
 if not Path(HAL_REFERENCE_WAV).exists():
     raise FileNotFoundError(f"Reference clip not found at {HAL_REFERENCE_WAV}")
 
-# Whisper stays on CPU permanently. The `small` model is fast enough on a
-# modern CPU and this frees ~0.5 GB VRAM for the LLM. The 27B Ollama model
-# fights for every megabyte of the 24 GB on this 3090.
+# Whisper runs on GPU (float16). `medium` instead of `large-v3` frees ~1.5 GB
+# VRAM so more of the 27B LLM fits on the GPU instead of spilling to CPU — the
+# 27B Ollama model fights for every megabyte of the 24 GB on this 3090.
 print(f"[boot] Loading faster-whisper ({WHISPER_MODEL_SIZE}) on GPU (float16)...")
 try:
     whisper = WhisperModel(WHISPER_MODEL_SIZE, device="cuda", compute_type="float16")
@@ -807,42 +852,18 @@ except Exception as e:
     print(f"[boot] CUDA load failed ({e}); falling back to CPU int8.")
     whisper = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
 
-# XTTS lives on CPU between turns and is hot-swapped onto the GPU only while
-# synthesizing. This keeps the 27B model fully GPU-resident during the slow
-# part of a turn (prompt eval + first-sentence generation), which is when the
-# user is just waiting for HAL to start speaking.
-print("[boot] Loading XTTS v2 on CPU...")
-tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cpu")
-
-import threading
-_tts_lock = threading.Lock()
-_tts_device = "cpu"
-
-
-def _ensure_tts_gpu() -> None:
-    """Move XTTS to GPU before synthesis. Called from a worker thread."""
-    global _tts_device
-    if DEVICE != "cuda":
-        return
-    with _tts_lock:
-        if _tts_device != "cuda":
-            tts.to("cuda")
-            _tts_device = "cuda"
+# Piper runs entirely on the CPU at ~4x realtime, so TTS needs no GPU and no
+# VRAM. That leaves the full 24 GB to the LLM + Whisper and removes the old
+# XTTS GPU hot-swap (which starved the 27B and stalled the spoken reply).
+print(f"[boot] Loading Piper voice {Path(PIPER_VOICE_PATH).stem}...")
+piper_voice = PiperVoice.load(PIPER_VOICE_PATH, use_cuda=False)
+print("[boot] Piper ready (CPU).")
 
 
 def _park_tts() -> None:
-    """Move XTTS back to CPU and release cached VRAM. Called between turns."""
-    global _tts_device
-    if DEVICE != "cuda":
-        return
-    with _tts_lock:
-        if _tts_device != "cpu":
-            tts.to("cpu")
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
-            _tts_device = "cpu"
+    """No-op: Piper is CPU-only, so there is no GPU TTS state to release between
+    turns. Retained because process_turn calls it in its cleanup path."""
+    return
 
 
 # Force Ollama to drop any currently-loaded copy of the LLM so the next
@@ -994,6 +1015,7 @@ from contextlib import asynccontextmanager
 async def _lifespan(_app: FastAPI):
     market.configure(DB_PATH, MASSIVE_API_KEY)
     analysis.configure(MASSIVE_BASE_URL, MASSIVE_API_KEY)
+    charting.configure(MASSIVE_BASE_URL, MASSIVE_API_KEY)
     await market.manager.start()
     print(f"[boot] market manager: {market.manager.url}")
     try:
@@ -1043,11 +1065,13 @@ async def transcribe(audio_bytes: bytes, mime: str = "") -> str:
         # "Have a great day!" hallucinations — Whisper invents these on
         # silent/quiet audio (it was over-trained on YouTube). Filtering
         # out silence frames before the encoder eliminates the trigger.
-        # beam_size=5 gives noticeably better accuracy than greedy on GPU
-        # (cheap when we're not CPU-bound).
+        # beam_size=2 balances accuracy against latency for short voice
+        # commands. vad_filter + initial_prompt already guard the hallucinations
+        # that wider beam search used to help with; 5 added latency for little
+        # real-world gain here. Bump back to 5 if accuracy regresses.
         segments, _info = whisper.transcribe(
             path,
-            beam_size=5,
+            beam_size=2,
             language="en",
             initial_prompt=WHISPER_PROMPT,
             vad_filter=True,
@@ -1311,6 +1335,42 @@ async def run_open_view_tool(args: dict, websocket: WebSocket) -> str:
     return confirm
 
 
+async def render_chart(symbol: str, timeframe: str, websocket: WebSocket) -> tuple[str, dict | None, dict | None]:
+    """Build a chart payload, attach key levels, push it to the HAL UI, and
+    stash the analysis on the connection so HAL can answer questions about it.
+    Returns (status_message, payload-or-None, analysis-or-None)."""
+    symbol = (symbol or "").strip()
+    timeframe = (timeframe or "5m").strip()
+    if not symbol:
+        return "show_chart requires a 'symbol'.", None, None
+    await websocket.send_json({"state": "processing", "text": f"Charting {symbol.upper()} {timeframe}..."})
+    try:
+        payload = await charting.build_chart(symbol, timeframe)
+    except Exception as e:
+        return f"Could not chart {symbol.upper()}: {e}", None, None
+    analysis = charting.analyze(payload)
+    payload["levels"] = analysis.get("levels", [])
+    try:
+        await websocket.send_json({"action": "open_view", "kind": "chart", "chart": payload})
+    except Exception as e:
+        return f"Could not deliver chart: {e}", None, None
+    websocket.scope["hal_chart"] = analysis
+    return (
+        f"Showing {payload['symbol']} {payload['timeframe']} "
+        f"({payload['bar_count']} bars). Jeffery sees it now."
+    ), payload, analysis
+
+
+async def run_chart_tool(args: dict, websocket: WebSocket) -> str:
+    """show_chart tool entry (model path). The deterministic chart route in
+    process_turn calls render_chart directly so it can summarize the data."""
+    msg, payload, _ = await render_chart(args.get("symbol", ""), args.get("timeframe", "5m"), websocket)
+    await _emit_telemetry(
+        websocket, "chart", json.dumps(args), msg, status="ok" if payload else "error"
+    )
+    return msg
+
+
 async def execute_tool(name: str, args: dict, websocket: WebSocket, abort_event: asyncio.Event) -> str:
     if name == "run_command":
         return await run_command_tool(args.get("command", ""), websocket, abort_event)
@@ -1340,6 +1400,8 @@ async def execute_tool(name: str, args: dict, websocket: WebSocket, abort_event:
         return await run_webull_tool(args, websocket)
     if name == "open_view":
         return await run_open_view_tool(args, websocket)
+    if name == "show_chart":
+        return await run_chart_tool(args, websocket)
     if name == "enroll_voice":
         return await run_enroll_voice_tool(args, websocket)
     return f"Unknown tool: {name}"
@@ -1510,6 +1572,172 @@ def _strip_thinking(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 
+# Deterministic chart intent. Qwen3 with thinking disabled tends to return an
+# empty turn instead of a show_chart tool call, so we detect a clear "chart of
+# <ticker>" request in code and render it directly (two-tier intent handling).
+_CHART_INTENT_KEYWORD = re.compile(r"\b(chart|candles?|candlestick)\b", re.IGNORECASE)
+_CHART_TICKERS = re.compile(
+    r"\b(SPY|QQQ|IWM|DIA|TLT|GLD|SLV|VIX|VXX|UVXY|NVDA|TSLA|AAPL|MSFT|"
+    r"GOOG|GOOGL|META|AMZN|AMD|NFLX|AVGO)\b",
+    re.IGNORECASE,
+)
+_CHART_TF = re.compile(
+    r"\b(\d+)\s*-?\s*(minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w)\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_timeframe_phrase(text: str) -> str:
+    t = text.lower()
+    m = _CHART_TF.search(t)
+    if m:
+        return f"{int(m.group(1))}{m.group(2)[0].lower()}"
+    if "daily" in t:
+        return "1d"
+    if "weekly" in t:
+        return "1w"
+    if "hourly" in t:
+        return "1h"
+    return "5m"
+
+
+def _match_chart_intent(text: str) -> tuple[str, str] | None:
+    """Pull (ticker, timeframe) from a chart request, else None."""
+    if not text or not _CHART_INTENT_KEYWORD.search(text):
+        return None
+    sym = None
+    m2 = _CHART_TICKERS.search(text)
+    if m2:
+        sym = m2.group(1).upper()
+    else:
+        m = re.search(r"\b([A-Z]{2,5})\b", text)
+        if m and m.group(1) != "HAL":
+            sym = m.group(1)
+    if not sym:
+        return None
+    return sym, _parse_timeframe_phrase(text)
+
+
+_CLOSE_VIEW_INTENT = re.compile(
+    r"\b(close|hide|dismiss|exit|remove|take down|get rid of)\b"
+    r"[\w\s]*\b(chart|charts|candles?|candlestick|view|immersive|backdrop|camera|map)\b"
+    r"|\b(close|exit|hide|dismiss)\s+(it|that|this)\b",
+    re.IGNORECASE,
+)
+
+
+def _match_close_view_intent(text: str) -> bool:
+    """True when the user asks to close/hide the chart or immersive view."""
+    return bool(text and _CLOSE_VIEW_INTENT.search(text))
+
+
+def _answer_chart_question(text: str, a: dict) -> str | None:
+    """Answer a question about the displayed chart from its stored analysis.
+    Returns a SPECIFIC short answer per question type, or None to let the model
+    handle it. Avoids repeating the full read on every chart mention."""
+    if not text or not a or a.get("empty"):
+        return None
+    t = text.lower()
+    sym, tf = a["symbol"], a["timeframe"]
+    res, sup = a.get("resistance"), a.get("support")
+    if any(k in t for k in ("strategy", "scalp", "leaps", "condor", "premium",
+                            "straddle", "strangle", "what should i trade",
+                            "what do i trade", "what to trade", "how do i play",
+                            "play this", "play it", "neutral", "theta")):
+        msg = f"On {sym} {tf}: {a.get('strategy')}"
+        if a.get("vol_regime"):
+            msg += f" Volatility is {a['vol_regime']}."
+        return msg
+    if any(k in t for k in ("sell", "put", "short", "downside", "bearish")):
+        bs = a.get("bearish_setups") or []
+        if bs:
+            return f"Possible sell/put setup on {sym}: " + "; ".join(bs) + f". Bias is {a.get('bias')}."
+        return f"No confirmed sell setup on {sym} right now - bias is {a.get('bias')}, it's {a['trend']}. I won't force a short."
+    if any(k in t for k in ("buy", "call", "long", "upside", "bullish")):
+        bl = a.get("bullish_setups") or []
+        if bl:
+            return f"Possible buy/call setup on {sym}: " + "; ".join(bl) + f". Bias is {a.get('bias')}."
+        return f"No confirmed buy setup on {sym} right now - bias is {a.get('bias')}, it's {a['trend']}."
+    if "draw" in t or "entry" in t or ("where" in t and "enter" in t):
+        bits = []
+        if res is not None:
+            bits.append(f"resistance {res:.2f}")
+        if sup is not None:
+            bits.append(f"support {sup:.2f}")
+        marked = (" I've marked " + " and ".join(bits) + " as dashed lines.") if bits else ""
+        return (f"I draw the key levels for you, not entries.{marked} "
+                f"{sym} is {a['trend']}; say 'zoom in' to look closer.")
+    if "resistance" in t or "overhead" in t or "ceiling" in t:
+        return (f"{sym} resistance is near {res:.2f}." if res is not None
+                else f"{sym} is at the top of its {tf} range; no clear resistance above.")
+    if "support" in t or "floor" in t:
+        return (f"{sym} support is near {sup:.2f}." if sup is not None
+                else f"{sym} is at the lows of its {tf} range; no clear support below.")
+    if "volume" in t or "spike" in t:
+        return (f"On {sym}: {a['volume_note']}" if a.get("volume_note")
+                else f"{sym} volume looks unremarkable right now.")
+    if "breakout" in t or "break out" in t or "breaking" in t:
+        pats = a.get("patterns") or []
+        if any("breaking out" in p for p in pats):
+            return f"Yes, {sym} is breaking out above its recent swing highs."
+        if any("breaking down" in p for p in pats):
+            return f"No, {sym} is breaking down below recent swing lows."
+        tail = f" Resistance is near {res:.2f}." if res is not None else ""
+        return f"Not a breakout yet. {sym} is {a['trend']}.{tail}"
+    if "pattern" in t:
+        pats = a.get("patterns") or []
+        if pats:
+            return f"On {sym} I see: " + "; ".join(pats) + "."
+        return f"No clear chart pattern on {sym} right now \u2014 it's {a['trend']}, swings are {a['structure']}."
+    if "trend" in t or "direction" in t:
+        return f"{sym} is {a['trend']}; swings are {a['structure']}."
+    if "level" in t:
+        bits = []
+        if res is not None:
+            bits.append(f"resistance near {res:.2f}")
+        if sup is not None:
+            bits.append(f"support near {sup:.2f}")
+        return (f"{sym}: " + ", ".join(bits) + ".") if bits else charting.read(a)
+    if any(k in t for k in ("overview", "analyz", "summary", "the setup", "setup",
+                            "what do you see", "what do you think", "read the chart")):
+        return charting.read(a)
+    return None
+
+
+def _match_zoom_intent(text: str) -> str | None:
+    """Map a 'zoom ...' request to a mode, else None."""
+    if not text or "zoom" not in text.lower():
+        return None
+    t = text.lower()
+    if any(w in t for w in ("out", "reset", "whole", "show all", "full", "back")):
+        return "out"
+    if "spike" in t or "volume" in t:
+        return "spike"
+    if "signal" in t or "buy" in t or "sell" in t:
+        return "signal"
+    return "in"
+
+
+def _build_zoom(a: dict, mode: str) -> tuple[dict, str]:
+    """Build a chart_zoom WS command + spoken confirmation from the analysis."""
+    t_first, t_last = a.get("t_first"), a.get("t_last")
+    times = a.get("times") or []
+    if mode == "out" or not times or t_first is None:
+        return {"action": "chart_zoom", "zoom_reset": True}, "Zoomed out to the full range."
+    spacing = (t_last - t_first) / max(1, len(times) - 1)
+    win = int(20 * spacing) or 1
+    if mode == "spike" and a.get("spike_time"):
+        c = a["spike_time"]
+        return ({"action": "chart_zoom", "zoom_from": max(t_first, c - win), "zoom_to": min(t_last, c + win)},
+                "Zoomed in on the volume spike.")
+    if mode == "signal" and a.get("signal_time"):
+        c = a["signal_time"]
+        return ({"action": "chart_zoom", "zoom_from": max(t_first, c - win), "zoom_to": min(t_last, c + win)},
+                "Zoomed in on the last signal.")
+    return ({"action": "chart_zoom", "zoom_from": a.get("t_recent", t_first), "zoom_to": t_last},
+            "Zoomed in on the recent action.")
+
+
 _TRADE_IDEA_TRIGGERS = re.compile(
     r"\b("
     r"what (looks?|is|are) good|"
@@ -1565,16 +1793,64 @@ def _maybe_inject_trade_primer(user_text: str) -> str:
     return user_text + _TRADE_PRIMER
 
 
+def _eastern_now() -> tuple[datetime, str]:
+    """Current US Eastern wall-clock time, computed from UTC without relying on
+    a tz database (tzdata isn't installed and the torch env is pinned). DST runs
+    from the 2nd Sunday of March (02:00 EST = 07:00 UTC) to the 1st Sunday of
+    November (02:00 EDT = 06:00 UTC). Returns (naive ET datetime, 'EST'|'EDT')."""
+    utc = datetime.now(timezone.utc)
+    year = utc.year
+    mar1 = datetime(year, 3, 1, tzinfo=timezone.utc)
+    dst_start = mar1 + timedelta(days=(6 - mar1.weekday()) % 7 + 7, hours=7)
+    nov1 = datetime(year, 11, 1, tzinfo=timezone.utc)
+    dst_end = nov1 + timedelta(days=(6 - nov1.weekday()) % 7, hours=6)
+    is_dst = dst_start <= utc < dst_end
+    offset = -4 if is_dst else -5
+    et = (utc + timedelta(hours=offset)).replace(tzinfo=None)
+    return et, ("EDT" if is_dst else "EST")
+
+
+def _market_session(et: datetime) -> str:
+    """US equity/options session label for a given Eastern time. Time-of-day +
+    weekday only; market holidays are not accounted for."""
+    if et.weekday() >= 5:
+        return "CLOSED (weekend)"
+    minutes = et.hour * 60 + et.minute
+    if minutes < 4 * 60:
+        return "CLOSED (overnight)"
+    if minutes < 9 * 60 + 30:
+        return "pre-market (not yet open)"
+    if minutes < 16 * 60:
+        return "OPEN (regular hours)"
+    if minutes < 20 * 60:
+        return "after-hours (regular session closed)"
+    return "CLOSED (overnight)"
+
+
 def _options_date_context() -> str:
-    """Pre-computed date context the LLM would otherwise have to derive itself.
-    /no_think mode skips reasoning, so giving it both ISO and YYMMDD (option-
-    ticker) formats — plus the next 4 weekly Friday expirations — keeps it from
-    inventing wrong dates when calling query_massive."""
-    today = date.today()
+    """Pre-computed date/time + market-session context the LLM would otherwise
+    have to derive itself. /no_think mode skips reasoning, so we hand it the
+    current Eastern time, whether the US market is open, ISO + YYMMDD (option-
+    ticker) date formats, and the next 4 weekly Friday expirations — keeping it
+    from inventing wrong dates or guessing whether the market is live."""
+    et, abbr = _eastern_now()
+    today = et.date()
+    session = _market_session(et)
     # Days until next Friday (Mon=0..Sun=6, Fri=4). Today counts if it IS Friday.
     days_until_fri = (4 - today.weekday()) % 7
     fridays = [today + timedelta(days=days_until_fri + 7 * i) for i in range(4)]
     lines = [
+        "=== LIVE CLOCK — AUTHORITATIVE. This is the real current time. Trust it "
+        "over ANY time, date, or 'this morning/afternoon' wording earlier in the "
+        "conversation; that history is stale. ===",
+        f"Current time: {et:%A, %B %d, %Y  %I:%M %p} {abbr} (US Eastern — this IS market time)",
+        f"US equity & options market right now: {session}. "
+        "Regular hours are 9:30 AM-4:00 PM ET, Mon-Fri. Market holidays are not "
+        "reflected here; if it might be a holiday, confirm with query_massive "
+        "/v1/marketstatus/now before claiming the market is open.",
+        "When Jeffery asks the time or whether the market is open, answer directly "
+        "from the two lines above — do NOT infer it from earlier messages or do "
+        "your own clock math.",
         f"Today's date: {today:%A, %B %d, %Y}  (ISO {today:%Y-%m-%d}, option-ticker YYMMDD {today:%y%m%d})",
         "Upcoming Friday option expirations:",
     ]
@@ -1678,12 +1954,19 @@ async def agent_loop(
         for iteration in range(MAX_AGENT_ITERATIONS):
             _check_abort(abort_event)
 
+            # Cap context so the footprint stays small (HAL carries only a short
+            # system prompt + ~40 brief messages). TTS is Piper on the CPU now,
+            # so it uses zero VRAM — the only GPU tenants are the LLM and Whisper.
+            # The 27B's ~17 GB of weights plus the KV cache must fit in 24 GB
+            # alongside Whisper (~1.5 GB). At num_ctx 8192 the runtime footprint
+            # hit ~23 GB and Ollama spilled ~12% of layers to CPU (slow). 4096
+            # roughly halves the KV cache so the whole model can sit on the GPU.
             payload = {
                 "model": model,
                 "messages": messages,
                 "stream": bool(on_sentence),
                 "think": False,
-                "options": {"temperature": 0.7, "top_p": 0.9},
+                "options": {"temperature": 0.7, "top_p": 0.9, "num_ctx": 4096},
             }
             # Vision models in Ollama typically don't accept the tools param;
             # only include it for the text model.
@@ -1766,6 +2049,9 @@ async def agent_loop(
             tool_calls = msg.get("tool_calls") or tool_calls or []
             if not tool_calls:
                 content = _strip_thinking(msg.get("content", "")).strip()
+                if not content:
+                    raw = msg.get("content", "")
+                    print(f"[agent] EMPTY turn (no tool_calls). raw_len={len(raw)} raw={raw[:500]!r}")
                 new_history = history + [
                     {"role": "user", "content": history_user_content},
                     {"role": "assistant", "content": content},
@@ -1848,50 +2134,19 @@ def _split_sentences(text: str, min_chars: int = 20) -> list[str]:
 
 async def synthesize(text: str) -> bytes:
     def _run():
-        _ensure_tts_gpu()
-        # Prefer a built-in studio speaker (no cloning artifacts); fall back
-        # to cloning from the reference WAV if HAL_SPEAKER is None.
-        speaker_kwargs = (
-            {"speaker": HAL_SPEAKER}
-            if HAL_SPEAKER
-            else {"speaker_wav": HAL_REFERENCE_WAV}
-        )
-        wav = tts.tts(
-            text=text,
-            **speaker_kwargs,
-            language="en",
-            speed=0.95,
-            temperature=0.6,
-            repetition_penalty=3.0,
-            top_k=50,
-            top_p=0.8,
-            # We pre-split sentences ourselves before calling TTS, so XTTS
-            # doesn't need its own splitter (which requires spacy).
-            enable_text_splitting=False,
-        )
-        wav_np = np.asarray(wav, dtype=np.float32)
-        # Pitch-shift to deepen the voice without changing tempo.
-        if TTS_PITCH_SHIFT_STEPS:
-            try:
-                import torchaudio.functional as TAF
-                tensor = torch.from_numpy(wav_np).unsqueeze(0)
-                shifted = TAF.pitch_shift(
-                    tensor, sample_rate=24000, n_steps=TTS_PITCH_SHIFT_STEPS
-                )
-                wav_np = shifted.squeeze(0).numpy()
-            except Exception as e:
-                print(f"[tts] pitch shift failed: {e}")
-        peak = float(np.max(np.abs(wav_np)))
-        if peak > 0:
-            wav_np = wav_np * (0.95 / peak)
-        wav_i16 = (np.clip(wav_np, -1.0, 1.0) * 32767).astype(np.int16)
-
+        # Piper yields one or more int16 PCM chunks; concatenate and wrap in a
+        # WAV header at the voice's native sample rate (22.05 kHz for -medium).
+        chunks = list(piper_voice.synthesize(text))
+        if not chunks:
+            return b""
+        first = chunks[0]
+        pcm = b"".join(c.audio_int16_bytes for c in chunks)
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(24000)
-            wf.writeframes(wav_i16.tobytes())
+            wf.setnchannels(first.sample_channels)
+            wf.setsampwidth(first.sample_width)
+            wf.setframerate(first.sample_rate)
+            wf.writeframes(pcm)
         return buf.getvalue()
 
     return await asyncio.to_thread(_run)
@@ -2023,6 +2278,103 @@ async def process_turn(
             _check_abort(abort_event)
             await websocket.send_bytes(wav_bytes)
             print(f"[tts] sent {len(wav_bytes)} bytes")
+
+        # Deterministic close-view intent: exit immersive (chart/camera/etc.)
+        # directly instead of relying on the model to call open_view(off).
+        if _match_close_view_intent(user_text):
+            await run_open_view_tool({"kind": "off"}, websocket)
+            websocket.scope.pop("hal_chart", None)
+            spoken = "Closed."
+            await stream_sentence(spoken)
+            new_history = history + [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": spoken},
+            ]
+            if on_reply:
+                try:
+                    await on_reply(new_history)
+                except Exception as e:
+                    print(f"[turn] on_reply failed: {e}")
+            print(f"[hal] {spoken!r}")
+            await _emit_telemetry(websocket, "speech-out", "", spoken, status="ok")
+            await websocket.send_json({"state": "done"})
+            if len(new_history) > MAX_HISTORY_MESSAGES:
+                new_history = new_history[-MAX_HISTORY_MESSAGES:]
+            return new_history
+
+        # Deterministic chart route: render directly instead of relying on the
+        # model to emit a show_chart tool call (see _match_chart_intent).
+        chart_req = _match_chart_intent(user_text)
+        if chart_req:
+            symbol, timeframe = chart_req
+            result, payload, analysis = await render_chart(symbol, timeframe, websocket)
+            if analysis:
+                spoken = f"Here is {analysis['symbol']} on the {analysis['timeframe']}."
+                if analysis.get("bearish_setups"):
+                    spoken += f" Heads up, possible sell setup: {analysis['bearish_setups'][0]}."
+                elif analysis.get("bullish_setups"):
+                    spoken += f" Possible buy setup: {analysis['bullish_setups'][0]}."
+            else:
+                spoken = f"I could not pull up that chart, Jeffery. {result}"
+            await stream_sentence(spoken)
+            new_history = history + [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": spoken},
+            ]
+            if on_reply:
+                try:
+                    await on_reply(new_history)
+                except Exception as e:
+                    print(f"[turn] on_reply failed: {e}")
+            print(f"[hal] {spoken!r}")
+            await _emit_telemetry(websocket, "speech-out", "", spoken, status="ok")
+            await websocket.send_json({"state": "done"})
+            if len(new_history) > MAX_HISTORY_MESSAGES:
+                new_history = new_history[-MAX_HISTORY_MESSAGES:]
+            return new_history
+
+        # Deterministic chart Q&A: answer questions about the displayed chart
+        # from the stored analysis (the model is unreliable / context-limited).
+        active_chart = websocket.scope.get("hal_chart")
+        if active_chart:
+            zoom_mode = _match_zoom_intent(user_text)
+            if zoom_mode:
+                zcmd, zspoken = _build_zoom(active_chart, zoom_mode)
+                await websocket.send_json(zcmd)
+                await stream_sentence(zspoken)
+                new_history = history + [
+                    {"role": "user", "content": user_text},
+                    {"role": "assistant", "content": zspoken},
+                ]
+                if on_reply:
+                    try:
+                        await on_reply(new_history)
+                    except Exception as e:
+                        print(f"[turn] on_reply failed: {e}")
+                print(f"[hal] {zspoken!r}")
+                await _emit_telemetry(websocket, "chart_zoom", user_text, zspoken, status="ok")
+                await websocket.send_json({"state": "done"})
+                if len(new_history) > MAX_HISTORY_MESSAGES:
+                    new_history = new_history[-MAX_HISTORY_MESSAGES:]
+                return new_history
+            chart_answer = _answer_chart_question(user_text, active_chart)
+            if chart_answer:
+                await stream_sentence(chart_answer)
+                new_history = history + [
+                    {"role": "user", "content": user_text},
+                    {"role": "assistant", "content": chart_answer},
+                ]
+                if on_reply:
+                    try:
+                        await on_reply(new_history)
+                    except Exception as e:
+                        print(f"[turn] on_reply failed: {e}")
+                print(f"[hal] {chart_answer!r}")
+                await _emit_telemetry(websocket, "speech-out", "", chart_answer, status="ok")
+                await websocket.send_json({"state": "done"})
+                if len(new_history) > MAX_HISTORY_MESSAGES:
+                    new_history = new_history[-MAX_HISTORY_MESSAGES:]
+                return new_history
 
         reply, new_history = await agent_loop(
             user_text,
@@ -2201,6 +2553,35 @@ async def voice_interface(websocket: WebSocket):
                 await websocket.send_json({"state": "listening", "text": f"Malfunction: {e}"})
             except Exception:
                 pass
+
+    async def replay_unspoken_alerts():
+        """Announce any alerts that fired while no app session was connected, so
+        nothing is silently lost. Marks them spoken so reconnects don't repeat."""
+        nonlocal current_task, abort_event
+        try:
+            pending = await asyncio.to_thread(market.list_unspoken_alerts)
+        except Exception as e:
+            print(f"[alert] replay fetch failed: {e}")
+            return
+        if not pending:
+            return
+        print(f"[alert] replaying {len(pending)} missed alert(s)")
+        for p in pending:
+            try:
+                await asyncio.to_thread(market.mark_alert_spoken, p["id"])
+            except Exception:
+                pass
+        bullets = "\n".join(f"- {p['message']}" for p in pending)
+        synthetic = (
+            f"[MISSED MARKET ALERTS — {len(pending)} fired while you were away]\n"
+            f"{bullets}\n\n"
+            "Brief Jeffery on these in one or two short sentences total; lead with "
+            "the count. Do not call any tools."
+        )
+        abort_event = asyncio.Event()
+        current_task = asyncio.create_task(run_turn(text_input=synthetic))
+
+    await replay_unspoken_alerts()
 
     try:
         while True:

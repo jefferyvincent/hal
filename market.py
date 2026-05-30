@@ -164,6 +164,22 @@ def list_alert_events(limit: int = 20) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def list_unspoken_alerts(limit: int = 20) -> list[dict]:
+    """Alerts that fired but were never announced (no app session was connected
+    when they broadcast). Oldest first so a replay reads in chronological order."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT e.id, e.rule_id, e.fired_at, e.message, s.channel, s.symbol "
+            "FROM alert_events e "
+            "JOIN alert_rules r ON r.id = e.rule_id "
+            "JOIN ws_subscriptions s ON s.id = r.subscription_id "
+            "WHERE e.spoken = 0 "
+            "ORDER BY e.fired_at ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 # --- Rule evaluation -------------------------------------------------------
 
 VALID_CHANNELS = {"T", "Q", "A", "AM", "FMV"}
