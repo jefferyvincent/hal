@@ -85,3 +85,11 @@
 [agent] EMPTY turn (no tool_calls). raw_len=0 raw=''
 [hal] ''
 [ws] Abort requested
+[market] status: The server has forcefully disconnected.
+[market] connection lost: received 1012 (service restart); then sent 1012 (service restart); reconnecting in 1.0s
+[market] connected wss://socket.massive.com/options
+[market] hello: '[{"ev":"status","status":"connected","message":"Connected Successfully"}]'
+[market] auth resp: '[{"ev":"status","status":"auth_success","message":"authenticated"}]'
+[market] subscribe: AM.O:SPY*,T.O:SPY*
+[market] status: subscribed to: AM.O:SPY*
+[market] status: subscribed to: T.O:SPY*
