@@ -46,8 +46,8 @@ export default function Transcript() {
         // at bottom:150 with 80px height) or the InputBar (bottom:60).
         "immersive-fade fixed left-1/2 z-[5] flex w-[min(960px,92vw)] -translate-x-1/2 flex-col gap-2 overflow-y-auto px-6 text-[13px] leading-[1.55]",
         fullscreen
-          ? "top-[80px] bottom-[240px]"
-          : "bottom-[240px] max-h-[20vh]",
+          ? "top-[80px] bottom-[280px]"
+          : "bottom-[280px] max-h-[46vh]",
         chartActive && "pointer-events-none",
       )}
       onClick={onCopy}

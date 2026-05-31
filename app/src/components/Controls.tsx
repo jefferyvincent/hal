@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { useConnection } from "@/stores/connection";
 import { useImmersive } from "@/stores/immersive";
 import { useUi } from "@/stores/ui";
@@ -33,6 +33,47 @@ function AuxBtn({
 
 const ICON = "h-5 w-5";
 
+// Chevron handle that flanks the mic. Collapsed it points outward ("open me");
+// expanded it rotates 180° to point inward ("close me"). Both sides drive the
+// same toggle so the cluster reads as "< 0 >" when tucked away.
+function ChevronToggle({
+  side,
+  expanded,
+  onClick,
+}: {
+  side: "left" | "right";
+  expanded: boolean;
+  onClick: () => void;
+}) {
+  // Left handle defaults to pointing left; right handle to pointing right.
+  // Expanding flips each so the pair points back toward the mic.
+  const points = side === "left" ? "15 18 9 12 15 6" : "9 18 15 12 9 6";
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={expanded ? "Collapse controls" : "Show controls"}
+      aria-expanded={expanded}
+      className={cn(
+        "flex h-9 w-7 items-center justify-center rounded-full text-hal-red/70 transition-all",
+        "hover:text-hal-red-glow hover:drop-shadow-[0_0_8px_rgba(255,30,30,0.6)]",
+      )}
+    >
+      <svg
+        className={cn("h-4 w-4 transition-transform duration-500", expanded && "rotate-180")}
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <polyline points={points} />
+      </svg>
+    </button>
+  );
+}
+
 export default function Controls() {
   const mode = useConnection((s) => s.mode);
   const recording = useConnection((s) => s.recording);
@@ -40,8 +81,15 @@ export default function Controls() {
   const stopRecording = useConnection((s) => s.stopRecording);
   const abort = useConnection((s) => s.abort);
   const wipe = useConnection((s) => s.wipe);
+  const newConversation = useConnection((s) => s.newConversation);
   const fastMode = useConnection((s) => s.fastMode);
   const toggleFastMode = useConnection((s) => s.toggleFastMode);
+
+  // Controls rest in the compact "<0>" state — just the mic flanked by two
+  // chevrons. Tapping either chevron fans the aux clusters out left and right
+  // while the mic stays anchored dead-center.
+  const [expanded, setExpanded] = useState(false);
+  const toggle = () => setExpanded((v) => !v);
 
   const chatOpen = useUi((s) => s.chatOpen);
   const toggleChat = useUi((s) => s.toggleChatOpen);
@@ -63,8 +111,35 @@ export default function Controls() {
   };
 
   return (
-    <div className="immersive-fade fixed bottom-[150px] left-1/2 z-20 flex -translate-x-1/2 items-center gap-4">
-      {/* Left cluster: wipe, stop, fast/smart */}
+    <div className="immersive-fade fixed bottom-[190px] left-1/2 z-20 -translate-x-1/2">
+      <div className="relative flex items-center justify-center gap-4">
+      {/* Left cluster: new conversation, wipe, stop, fast/smart. Absolutely
+          anchored to the left of the chevron so the mic never shifts; fans out
+          on expand and tucks back behind the mic on collapse. */}
+      <div
+        className={cn(
+          "absolute right-full top-1/2 flex -translate-y-1/2 items-center gap-4 pr-4 transition-all duration-500 ease-out",
+          expanded
+            ? "translate-x-0 opacity-100"
+            : "pointer-events-none translate-x-10 opacity-0",
+        )}
+      >
+      <AuxBtn onClick={() => void newConversation()} title="New conversation">
+        <svg
+          className={ICON}
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" />
+          <line x1="12" y1="8" x2="12" y2="14" />
+          <line x1="9" y1="11" x2="15" y2="11" />
+        </svg>
+      </AuxBtn>
+
       <AuxBtn onClick={() => void wipe()} title="Wipe memory">
         <svg
           className={ICON}
@@ -124,7 +199,13 @@ export default function Controls() {
         </span>
       </button>
 
-      {/* Center: microphone (primary action). Quiet when idle, lights up
+      </div>
+
+      {/* Left chevron handle — the "<" of "<0>". */}
+      <ChevronToggle side="left" expanded={expanded} onClick={toggle} />
+
+      {/* Center: microphone (primary action) — the "0", always centered and
+          never moved by the reveal animation. Quiet when idle, lights up
           dramatically when actually recording. */}
       <button
         type="button"
@@ -156,7 +237,19 @@ export default function Controls() {
         </svg>
       </button>
 
-      {/* Right cluster: chat, [fullscreen — only when chat is on], immersive */}
+      {/* Right chevron handle — the ">" of "<0>". */}
+      <ChevronToggle side="right" expanded={expanded} onClick={toggle} />
+
+      {/* Right cluster: chat, [fullscreen — only when chat is on], immersive.
+          Absolutely anchored to the right of the chevron; mirrors the left. */}
+      <div
+        className={cn(
+          "absolute left-full top-1/2 flex -translate-y-1/2 items-center gap-4 pl-4 transition-all duration-500 ease-out",
+          expanded
+            ? "translate-x-0 opacity-100"
+            : "pointer-events-none -translate-x-10 opacity-0",
+        )}
+      >
       <AuxBtn
         onClick={toggleChat}
         active={chatOpen}
@@ -216,7 +309,9 @@ export default function Controls() {
           <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z" />
         </svg>
       </AuxBtn>
+      </div>
 
+      </div>
     </div>
   );
 }
