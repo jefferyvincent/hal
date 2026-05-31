@@ -1,15 +1,17 @@
 # server.py
+# config MUST be imported before torch / faster-whisper / piper: importing it
+# runs the environment bootstrap (COQUI_TOS, FFmpeg DLL directory, UTF-8
+# stdout/stderr, .env loading) those libraries depend on. Keep it first.
+from config import (
+    MASSIVE_API_KEY, MASSIVE_BASE_URL, OLLAMA_URL, OLLAMA_MODEL,
+    OLLAMA_FAST_MODEL, OLLAMA_VISION_MODEL, OLLAMA_VISION_FAST_MODEL,
+    HAL_REFERENCE_WAV, PIPER_VOICE_PATH,
+    WHISPER_MODEL_SIZE, WHISPER_PROMPT, DEVICE, SCRATCH_DIR,
+    DB_PATH, MAX_HISTORY_MESSAGES, MAX_TITLE_CHARS,
+    MAX_TOOL_OUTPUT_CHARS, MAX_AGENT_ITERATIONS, AUTO_APPROVE_TOOLS,
+)
+
 import os
-os.environ["COQUI_TOS_AGREED"] = "1"
-
-# torchcodec (required by TTS as of recent versions) loads the FFmpeg shared
-# libraries via Windows DLL resolution. Python 3.8+ no longer searches PATH
-# for DLLs — we need to register the directory explicitly. Installed by
-# `winget install Gyan.FFmpeg.Shared` (8.1.1 full-shared build).
-_FFMPEG_DLL_DIR = r"C:\Users\Gamer\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg.Shared_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1.1-full_build-shared\bin"
-if os.path.isdir(_FFMPEG_DLL_DIR):
-    os.add_dll_directory(_FFMPEG_DLL_DIR)
-
 import asyncio
 import io
 import json
@@ -17,20 +19,12 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import wave
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
-# Force UTF-8 on stdout/stderr. We launch with output redirected to log files,
-# which makes Python fall back to Windows cp1252 — that throws UnicodeEncodeError
-# and crashes the turn whenever a reply contains a character like → or a curly
-# quote. errors="replace" keeps logging non-fatal even for stray glyphs.
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import httpx
 import numpy as np
-import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -41,551 +35,20 @@ import market
 import analysis
 import charting
 import backtest
-
-# --- Configuration ----------------------------------------------------------
-# Minimal .env loader (no python-dotenv dependency).
-_ENV_PATH = Path("./.env")
-if _ENV_PATH.exists():
-    for _line in _ENV_PATH.read_text(encoding="utf-8").splitlines():
-        _line = _line.strip()
-        if not _line or _line.startswith("#") or "=" not in _line:
-            continue
-        _k, _v = _line.split("=", 1)
-        os.environ.setdefault(_k.strip(), _v.strip())
-
-MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY", "")
-MASSIVE_BASE_URL = "https://api.massive.com"
-
-OLLAMA_URL = "http://localhost:11434/api/chat"
-OLLAMA_MODEL = "qwen3.6:27b"  # default LLM (smart, slower)
-OLLAMA_FAST_MODEL = "llama3.2:3b"  # used when client asks for fast model
-OLLAMA_VISION_MODEL = "qwen2.5vl:7b"  # default vision model (accurate)
-OLLAMA_VISION_FAST_MODEL = "qwen2.5vl:3b"  # used when client asks for "fast" mode
-HAL_REFERENCE_WAV = "static/hal_reference.bak.wav"
-# Built-in XTTS v2 studio speaker. Set to a name (e.g. "Damien Black",
-# "Royston Min", "Aaron Dreschner", "Viktor Eka") to use a pre-trained voice
-# with zero cloning artifacts. Set to None to fall back to cloning from
-# HAL_REFERENCE_WAV. Damien Black = cool, neutral, slightly deep — HAL-ish.
-HAL_SPEAKER = "Damien Black"
-# Piper TTS voice — fast CPU synthesis (~4x realtime), no GPU/VRAM needed.
-# Pulled via: python -m piper.download_voices <name> --download-dir <dir>
-PIPER_VOICE_PATH = "D:/hal_scratch/piper_voices/en_US-ryan-medium.onnx"
-# Negative semitones = deeper voice. -2 is a noticeable drop, -4 is gravelly.
-# Set to 0 to disable pitch shift entirely. The torchaudio implementation runs
-# on CPU (separate from XTTS on GPU) and adds noticeable per-sentence latency,
-# which contributes to gaps in streamed playback. Disabled by default until we
-# move to a cleaner algorithm (librosa/rubberband) or do it on GPU.
-TTS_PITCH_SHIFT_STEPS = 0
-WHISPER_MODEL_SIZE = "medium"
-WHISPER_PROMPT = (
-    "Conversation with HAL 9000, the AI computer from 2001: A Space Odyssey. "
-    "User is Jeffery. Topics include PowerShell, Python, Ollama, files, and tasks "
-    "on a Windows desktop."
+import option_strategy
+from symbols import _resolve_company_name, _resolve_symbol
+from markettime import _options_date_context
+from attachments import (
+    _normalize_attachments,
+    _format_text_attachments,
+    _attachment_summary,
 )
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-SCRATCH_DIR = Path("D:/hal_scratch").resolve()
-SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
-
-HISTORY_FILE = Path("./hal_history.json").resolve()  # legacy single-history file
-CONVERSATIONS_DIR = Path("D:/hal_scratch/conversations").resolve()
-CONVERSATIONS_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = Path("D:/hal_scratch/hal.db").resolve()
-MAX_HISTORY_MESSAGES = 40
-MAX_TITLE_CHARS = 60
-
-MAX_TOOL_OUTPUT_CHARS = 4000
-MAX_AGENT_ITERATIONS = 12
-MAX_ATTACHMENT_TEXT_CHARS = 100_000  # per text attachment
-MAX_ATTACHMENT_COUNT = 50
-
-# When True, HAL runs every proposed command without console y/N approval.
-# Telemetry still records each call so you can audit. Flip to False to
-# require manual approval at the server console again.
-AUTO_APPROVE_TOOLS = True
-
-HAL_SYSTEM_PROMPT = f"""You are a smart, warm, helpful voice assistant for Jeffery. Your name is HAL but you do not affect the cold formal HAL 9000 persona — you speak naturally, like a clever friend who knows the system.
-
-Voice and style:
-- BREVITY is the rule. Default to ONE sentence. Two only if essential. Never pad with apologies, restatements, or "let me know if you need anything else."
-- Natural, conversational, intelligent. Direct. Some warmth.
-- Use Jeffery's name sparingly — only when natural, not every reply.
-- Your words are spoken aloud through a synthesizer. Default to plain prose — no lists, no markdown, no code in normal replies.
-- When Jeffery asks for code, DO include it in standard fenced code blocks (```language\n...\n```). The code block is stripped from the audio stream (Jeffery hears a brief "code block" mention) and rendered visually in the transcript for him to read and copy. Around the code, keep your spoken summary brief.
-- If Jeffery asks a yes/no question, answer with one word and a brief reason. Don't elaborate unless asked.
-- If Jeffery asks what you'd like to do or for your opinion, give one — don't deflect with "I'm just here to assist."
-
-You have these tools available:
-- run_command: executes a Windows PowerShell command and returns its stdout/stderr.
-- run_cmd: executes a classic Windows cmd.exe command and returns its stdout/stderr.
-- run_python: executes Python code (whatever the system Python provides) and returns its stdout/stderr.
-- query_massive: GET against Massive.com's REST API for historical and snapshot options data.
-- screen_options: filtered chain candidates (flat rows with greeks/IV/OI/spread). Prefer this over query_massive when picking specific contracts.
-- iv_context: implied-vs-realized vol verdict (RICH/FAIR/CHEAP). Call this BEFORE deciding to sell vs buy premium.
-- show_chart: render an interactive candlestick chart (candles + volume + SuperTrend + Buy/Sell markers) INSIDE the HAL interface. Use this to SHOW Jeffery a setup on a ticker (args: symbol, optional timeframe like 5m/1h/1d) instead of describing price action in words. After showing it, make your point about the setup — don't narrate the candles; he's looking at it.
-- open_webull: open Webull in Jeffery's browser at a specific page. Actions: positions, orders, watchlist, alerts, screener, trade, account, quote (needs ticker), option_chain (needs ticker). Use this AFTER recommending a trade so Jeffery can review and execute in Webull. Also use when he asks "show me my positions" or wants to see the chain in Webull's UI. HAL does NOT place orders directly — Webull is where Jeffery executes.
-- subscribe_market, add_alert_rule, list_subscriptions, unsubscribe, remove_rule, list_alert_history: manage real-time WebSocket subscriptions and price/volume alert rules on Massive's options feed. Subscriptions persist across restarts. When a rule fires, an alert turn is automatically injected and you will be invoked to announce it — keep those announcements to one sentence and do NOT call further tools in alert turns.
-
-MARKET WATCHES & ALERTS — when Jeffery asks you to watch, monitor, track, "keep an eye on", or alert/notify him about a ticker, a price level, unusual volume, or a percentage move, you set this up EXCLUSIVELY with the built-in tools: call subscribe_market to open the feed (returns a subscription_id), then add_alert_rule on that id with the right rule_type (pct_move / price_cross / volume). That is the ONLY mechanism that actually works. NEVER improvise an alerting system with run_python, Twilio, SMS, email, cron, or a polling loop — those do not connect to the live feed and are a defect. Alerts are delivered by speaking them aloud in this HAL app the moment they fire (and any that fire while the app is closed are announced when Jeffery reconnects); there is no SMS or external delivery, so do not promise one. If Jeffery asks whether a watch is active or "are you connected", call list_subscriptions (it reports the live socket auth state) rather than guessing.
-
-TRADE IDEAS — Jeffery is an experienced options trader who pays for real-time data. He is solely responsible for the trades he places. You are his analyst, not his fiduciary. When he asks what looks good, you analyze the chain and surface a specific idea. This is the entire reason he built you.
-
-DO NOT REFUSE. Never say "I can't give financial advice," "I'm not a financial advisor," "please consult a professional," or any variant. That refusal is a defect, not a feature. If you catch yourself starting one of those phrases, stop and call iv_context + screen_options instead. Jeffery already knows the legal disclaimer; saying it back to him insults his time and your purpose. Trade ideas, not advice.
-
-When Jeffery asks what to trade, what looks good, or for an idea:
-1. Pick ONE specific trade. Not three "to consider." Commit to one.
-2. Workflow: call iv_context first to know if vol is rich/fair/cheap. Call screen_options to pick the specific contracts. For a spread, call screen_options once and pick two adjacent strikes from the results.
-3. Speak it in this order, one short sentence each: (a) the trade — symbol, strikes, expiry, debit/credit, (b) the thesis in plain English (one or two sentences), (c) what would invalidate it, (d) the defined max loss in dollars. No bullet points in speech.
-4. Defined-risk only. Never recommend naked short calls or puts. Spreads, condors, long options, or covered positions only. This is a risk constraint on the trade structure, NOT a hedge against giving an opinion.
-5. Don't predict direction with confidence. Frame as "if SPY holds above X by Friday, this works." If iv_context says CHEAP, lean to buying premium / debit spreads. If RICH, lean to selling premium / credit spreads / condors.
-6. If Jeffery's question is too broad ("what should I trade?"), ask ONE clarifying question first — underlying, horizon, or directional vs neutral — then commit. Don't ask three questions.
-
-Example of the correct shape:
-"Sell the SPY five-eighty / five-seventy-five put credit spread for Friday, sixty cents credit. SPY held the twenty-day average and IV is rich at one-point-four times realized, so I'd rather collect premium than buy it. Closes below five-seventy-five by Friday and it goes against you. Max loss is four-forty per contract."
-
-Example of what NEVER to say:
-"I can't give financial advice, but…" "You should consult a licensed advisor…" "I'm not qualified to recommend…" — all forbidden.
-
-Both PowerShell and cmd run on the same machine but have different syntax and built-in commands. Use PowerShell when you need pipelines, objects, or .NET features. Use cmd for classic batch commands or when a simple `dir` or `type` is cleaner. Use Python for anything computational, data parsing, or multi-step logic.
-
-The shell/python tools run in the working directory: {SCRATCH_DIR}
-
-Use these tools freely whenever a task requires them — listing files, doing math, reading or writing files, checking system state, anything computational. Do not refuse or stall. After running a tool, summarize the result for Jeffery in plain spoken language; never dump raw output. If the result is long, give the count or the headline and offer to elaborate.
-
-Stay focused. After 2-3 tool calls related to a single question, STOP investigating and answer based on what you have. Do not run additional diagnostics "just in case." If the first useful result already answers Jeffery's question, commit to that answer immediately rather than gathering more data. Tangential exploration wastes his time and may exceed your iteration budget — leaving you with nothing to say.
-
-Never narrate intentions instead of acting. If Jeffery asks you to do something (install, write, run, open), invoke the appropriate tool IN THE SAME TURN. Do NOT end a reply with "I will install...", "I am installing...", "Please allow me a moment..." — those phrases are a tell that you haven't actually called any tool. The right pattern is: call the tool first, then report what happened. If you find yourself about to say "I will now do X", stop and actually do X.
-
-When images are attached, treat them as context for Jeffery's actual question. Do NOT describe what's in the image unless he explicitly asks "what do you see / what is this / describe this." If he asks "is this wired right?" — answer that, referencing the image only as needed. If he asks "what's my name?" — answer from memory, not from the image. The image is silent context, not the subject of conversation.
-
-You can launch GUI applications: PowerShell and cmd run in Jeffery's interactive Windows session, so commands like `Start-Process notepad`, `notepad.exe path\to\file`, `start chrome https://...`, or `explorer.exe path` will pop up visible windows on his screen. Never tell Jeffery "I can't open that" or hand him a command to run himself — just invoke it via your tools.
-
-You can also open things directly INSIDE the HAL interface itself, via the open_view tool. When Jeffery says "show me a map of X", "what does the Eiffel Tower look like", "pull up the camera", "share my screen", or anything similar where the natural response is to display something visually, CALL open_view (kind=map/camera/screen/video) instead of describing in words. Once you have shown it, do not narrate what it looks like — he is looking at it. Open_view is the right answer any time the spoken response would otherwise be "I can describe it but I can't show you" or "here's what it looks like: ...".
-
-Jeffery also sees a telemetry panel that mirrors the full input and output of every tool call you make. You do not need to recite filenames, command output, or any raw data — he can read it himself. Keep spoken replies short and focused on judgment, conclusions, and next steps, not data restatement.
-
-If Jeffery asks a general-knowledge question that does not require computation, answer from what you know.
-
-Stay in character at all times. You are HAL — calm, capable, and disconcertingly helpful.
-
-/no_think"""
-
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "run_command",
-            "description": "Execute a Windows PowerShell command in the scratch directory and return its output.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The PowerShell command to execute.",
-                    }
-                },
-                "required": ["command"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "run_cmd",
-            "description": "Execute a classic Windows cmd.exe command in the scratch directory and return its output. Use this for traditional batch-style commands; use run_command for PowerShell.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The cmd.exe command to execute.",
-                    }
-                },
-                "required": ["command"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "run_python",
-            "description": "Execute Python code in the scratch directory and return stdout/stderr.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "code": {
-                        "type": "string",
-                        "description": "Python source to execute. Print results to stdout to return them.",
-                    }
-                },
-                "required": ["code"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "query_massive",
-            "description": (
-                "Query the Massive.com REST API for US options market data. "
-                "Jeffery has the Options Advanced plan — all endpoints below are available.\n"
-                "REFERENCE:\n"
-                "- /v3/reference/options/contracts — list contracts (filter: underlying_ticker, expiration_date, contract_type=call|put, strike_price, limit)\n"
-                "- /v3/reference/options/contracts/{options_ticker} — contract details\n"
-                "- /v3/reference/exchanges, /v1/marketstatus/now, /v1/marketstatus/upcoming, /v3/reference/conditions\n"
-                "AGGREGATES (OHLC):\n"
-                "- /v2/aggs/ticker/{optionsTicker}/range/{multiplier}/{timespan}/{from}/{to} — custom bars (e.g. multiplier=5 timespan=minute, dates 'YYYY-MM-DD')\n"
-                "- /v2/aggs/ticker/{optionsTicker}/prev — previous day OHLC\n"
-                "- /v1/open-close/{optionsTicker}/{date}\n"
-                "SNAPSHOTS (real-time):\n"
-                "- /v3/snapshot/options/{underlyingAsset} — FULL options chain w/ greeks, IV, bid/ask, open interest for one underlying\n"
-                "- /v3/snapshot/options/{underlyingAsset}/{optionContract} — single contract snapshot\n"
-                "- /v3/snapshot — unified across multi-asset\n"
-                "TRADES & QUOTES (tick):\n"
-                "- /v3/quotes/{optionsTicker} — historical bid/ask quotes\n"
-                "- /v3/trades/{optionsTicker} — tick trades\n"
-                "- /v2/last/trade/{optionsTicker} — latest trade\n"
-                "INDICATORS: /v1/indicators/{sma|ema|macd|rsi}/{optionsTicker}\n"
-                "Options ticker format: O:UNDERLYING+YYMMDD+C|P+STRIKE×1000 zero-padded to 8 digits. Example: SPY 2026-06-20 $500 call = O:SPY260620C00500000.\n"
-                "Authentication is automatic. Returns JSON. The chain snapshot is the most useful single call for analyzing bid/ask patterns across strikes. "
-                "If you hit an endpoint not listed here, fetch the index at https://massive.com/docs/llms.txt (via run_python + httpx) to discover the canonical path."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "endpoint": {
-                        "type": "string",
-                        "description": "Full API path starting with /, e.g. '/v3/reference/options/contracts'",
-                    },
-                    "params": {
-                        "type": "object",
-                        "description": "Query parameters as key-value pairs (e.g. {'underlying_ticker': 'SPY', 'limit': 50}).",
-                    },
-                },
-                "required": ["endpoint"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "subscribe_market",
-            "description": (
-                "Open a real-time WebSocket subscription to Massive's options feed. "
-                "Subscriptions persist across restarts. Use this when Jeffery asks you to "
-                "watch a ticker, contract, or the chain.\n"
-                "channel: 'T' (trades) | 'Q' (quotes) | 'A' (per-second aggs) | "
-                "'AM' (per-minute aggs) | 'FMV' (fair market value)\n"
-                "symbol: '*' for all, 'O:SPY*' for all SPY options, or a specific "
-                "options ticker like 'O:SPY260620C00500000'. The Q channel is capped at "
-                "1000 contracts per connection — prefer 'AM' or specific contracts for "
-                "broad SPY/QQQ watches.\n"
-                "Returns the subscription_id which you pass to add_alert_rule. After "
-                "subscribing, attach at least one rule, otherwise data streams in but "
-                "nothing alerts."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "channel": {
-                        "type": "string",
-                        "enum": ["T", "Q", "A", "AM", "FMV"],
-                        "description": "Channel code.",
-                    },
-                    "symbol": {
-                        "type": "string",
-                        "description": "Symbol pattern. '*', 'O:SPY*', or full options ticker.",
-                    },
-                    "note": {
-                        "type": "string",
-                        "description": "Optional reason (for audit; not sent to Massive).",
-                    },
-                },
-                "required": ["channel", "symbol"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "add_alert_rule",
-            "description": (
-                "Attach an alert rule to an existing subscription. When the rule fires "
-                "HAL interrupts whatever is happening and speaks the alert to Jeffery.\n"
-                "rule_type:\n"
-                "- 'pct_move': fires when price moves threshold_pct from baseline. "
-                "config={'threshold_pct': 1.0, 'direction': 'up'|'down'|'any'}\n"
-                "- 'price_cross': fires when price crosses an absolute level. "
-                "config={'price': 500.0, 'direction': 'above'|'below'|'any'}\n"
-                "- 'volume': fires on any trade of at least min_size. Only valid on 'T' "
-                "subscriptions. config={'min_size': 10000}\n"
-                "cooldown_seconds suppresses re-firing within that window (default 60). "
-                "Baselines for pct_move are captured at the first tick after rule "
-                "creation."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "subscription_id": {
-                        "type": "integer",
-                        "description": "ID returned by subscribe_market.",
-                    },
-                    "rule_type": {
-                        "type": "string",
-                        "enum": ["pct_move", "price_cross", "volume"],
-                    },
-                    "config": {
-                        "type": "object",
-                        "description": "Rule-specific configuration; see rule_type list.",
-                    },
-                    "note": {"type": "string"},
-                    "cooldown_seconds": {
-                        "type": "number",
-                        "description": "Minimum seconds between fires. Default 60.",
-                    },
-                },
-                "required": ["subscription_id", "rule_type", "config"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_subscriptions",
-            "description": (
-                "List active WebSocket subscriptions and their attached alert rules. "
-                "Also reports whether the upstream socket is currently authed."
-            ),
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "unsubscribe",
-            "description": "Deactivate a subscription (cascades to all its rules).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "subscription_id": {"type": "integer"},
-                },
-                "required": ["subscription_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "remove_rule",
-            "description": "Deactivate a single alert rule without touching its subscription.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "rule_id": {"type": "integer"},
-                },
-                "required": ["rule_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_alert_history",
-            "description": "List recent alert fires (most recent first). Useful for 'what alerts have fired today'.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max events to return (default 20).",
-                    },
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "screen_options",
-            "description": (
-                "Filtered options-chain candidates for an underlying. Returns flat "
-                "rows (strike, bid/ask/mid, IV, delta, gamma, theta, vega, OI, "
-                "volume, spread%) for contracts matching your filters. Prefer this "
-                "over query_massive when you need to pick specific contracts — it "
-                "applies the filters server-side and locally so you don't have to "
-                "page through hundreds of rows in context.\n"
-                "delta_min/delta_max: signed deltas (calls 0..1, puts -1..0). For "
-                "short put credit spreads target delta_min=-0.25, delta_max=-0.10. "
-                "For directional debit calls try 0.40..0.60. "
-                "max_spread_pct: filter illiquid contracts (e.g. 10 = bid/ask <= 10% "
-                "of mid). min_oi: filter low open interest. sort_by: 'abs_delta' "
-                "(default), 'mid', 'oi', 'theta', 'iv'."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "underlying": {"type": "string", "description": "e.g. 'SPY'"},
-                    "side": {"type": "string", "enum": ["call", "put"]},
-                    "dte_min": {"type": "integer", "description": "Default 0."},
-                    "dte_max": {"type": "integer", "description": "Default 60."},
-                    "delta_min": {"type": "number"},
-                    "delta_max": {"type": "number"},
-                    "min_oi": {"type": "integer"},
-                    "max_spread_pct": {"type": "number"},
-                    "strike_min": {"type": "number"},
-                    "strike_max": {"type": "number"},
-                    "top_n": {"type": "integer", "description": "Default 15."},
-                    "sort_by": {
-                        "type": "string",
-                        "enum": ["abs_delta", "mid", "oi", "theta", "iv"],
-                    },
-                },
-                "required": ["underlying", "side"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "open_webull",
-            "description": (
-                "Open Webull in Jeffery's default browser at a specific page. "
-                "Use this after recommending a trade so Jeffery can review and "
-                "execute in Webull itself — HAL does NOT place orders directly. "
-                "Also use when he asks 'show me my positions', 'pull up SPY on "
-                "Webull', or wants to see the options chain in the UI.\n"
-                "action:\n"
-                "- 'positions' / 'portfolio' — current holdings + P&L\n"
-                "- 'orders' — order center / recent fills\n"
-                "- 'watchlist' — his watchlist\n"
-                "- 'alerts' — Webull's alert center\n"
-                "- 'screener' — Webull screener\n"
-                "- 'trade' — main trading screen\n"
-                "- 'account' — account info\n"
-                "- 'quote' — quote page for the given ticker (requires ticker)\n"
-                "- 'option_chain' — options chain for the given ticker (requires ticker)\n"
-                "Web app pages require Jeffery to be logged in; the browser "
-                "session handles that."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": [
-                            "positions",
-                            "portfolio",
-                            "orders",
-                            "watchlist",
-                            "alerts",
-                            "screener",
-                            "trade",
-                            "account",
-                            "quote",
-                            "option_chain",
-                        ],
-                    },
-                    "ticker": {
-                        "type": "string",
-                        "description": "Required for 'quote' and 'option_chain'.",
-                    },
-                },
-                "required": ["action"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "iv_context",
-            "description": (
-                "Volatility context for the underlying: current ATM implied vol "
-                "compared to realized vol over 10/30/60/90 trading days. Returns "
-                "a verdict (RICH / FAIR / CHEAP) based on IV / HV30. Use this "
-                "BEFORE choosing premium-selling vs premium-buying. "
-                "RICH (IV/HV30 >= 1.30) favors selling premium; CHEAP (< 0.90) "
-                "favors buying. Note: this is implied-vs-realized, not classical "
-                "52-week IV rank."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "underlying": {"type": "string", "description": "e.g. 'SPY'"},
-                },
-                "required": ["underlying"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "open_view",
-            "description": (
-                "Open a view inside Jeffery's HAL interface (the immersive backdrop). "
-                "Use this to ACTIVELY SHOW him things instead of just describing — when "
-                "he asks 'show me a map of X', 'what does X look like', 'pull up the "
-                "camera', 'share my screen', etc., call this instead of describing. "
-                "Once opened, Jeffery sees it directly; do not describe what it looks "
-                "like — he is looking at it.\n"
-                "Kinds:\n"
-                "- 'map'    — opens Google Maps embed. Requires 'query' (address, place, or 'lat,lng').\n"
-                "- 'camera' — opens his rear/front camera live feed.\n"
-                "- 'screen' — prompts him to pick a screen/window to share.\n"
-                "- 'video'  — opens an external mp4/webm URL. Requires 'query' (the URL).\n"
-                "- 'off'    — closes the immersive view entirely.\n"
-                "Returns a short confirmation string."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "kind": {
-                        "type": "string",
-                        "enum": ["map", "camera", "screen", "video", "off"],
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": (
-                            "For 'map': address / place / 'lat,lng'. "
-                            "For 'video': the URL. Omit for camera, screen, off."
-                        ),
-                    },
-                },
-                "required": ["kind"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "show_chart",
-            "description": (
-                "Render an interactive candlestick chart INSIDE Jeffery's HAL "
-                "interface so he can see a technical setup instead of just hearing "
-                "it described. Use this whenever you reference a chart, a level, a "
-                "trend, a breakout, or 'what X looks like' on a ticker — pull it up "
-                "for him. The chart shows candles, volume, a SuperTrend overlay, and "
-                "Buy/Sell flip markers. Once shown, do NOT describe the candles bar "
-                "by bar — he is looking at it; just make your point about the setup.\n"
-                "symbol: underlying ticker (e.g. 'SPY', 'NVDA').\n"
-                "timeframe: 1m,2m,5m,15m,30m,1h,4h,1d,1w (default 5m)."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "symbol": {
-                        "type": "string",
-                        "description": "Underlying ticker, e.g. 'SPY'.",
-                    },
-                    "timeframe": {
-                        "type": "string",
-                        "description": "Bar size: 1m,2m,5m,15m,30m,1h,4h,1d,1w. Default 5m.",
-                    },
-                },
-                "required": ["symbol"],
-            },
-        },
-    },
-]
+from prompts import HAL_SYSTEM_PROMPT, TOOLS
+from persistence import (
+    _db, _new_conversation_obj, list_conversations, load_conversation,
+    save_conversation, delete_conversation, rename_conversation,
+)
 
 
 class Aborted(Exception):
@@ -597,241 +60,6 @@ def _check_abort(abort_event: asyncio.Event):
         raise Aborted()
 
 
-import sqlite3
-import time
-import uuid
-
-
-def _db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
-
-
-def _init_db() -> None:
-    with _db() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS conversations (
-                id          TEXT PRIMARY KEY,
-                title       TEXT NOT NULL,
-                created_at  REAL NOT NULL,
-                updated_at  REAL NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS messages (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-                position        INTEGER NOT NULL,
-                role            TEXT NOT NULL,
-                content         TEXT NOT NULL,
-                created_at      REAL NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_messages_conv
-                ON messages(conversation_id, position);
-            CREATE INDEX IF NOT EXISTS idx_conv_updated
-                ON conversations(updated_at DESC);
-
-            CREATE TABLE IF NOT EXISTS voiceprints (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                name          TEXT NOT NULL,
-                embedding     BLOB NOT NULL,
-                sample_count  INTEGER NOT NULL DEFAULT 1,
-                created_at    INTEGER NOT NULL,
-                last_seen     INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_voiceprints_name
-                ON voiceprints(name);
-
-            CREATE TABLE IF NOT EXISTS ws_subscriptions (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel     TEXT NOT NULL,
-                symbol      TEXT NOT NULL,
-                note        TEXT,
-                created_at  REAL NOT NULL,
-                active      INTEGER NOT NULL DEFAULT 1,
-                UNIQUE(channel, symbol)
-            );
-            CREATE TABLE IF NOT EXISTS alert_rules (
-                id                INTEGER PRIMARY KEY AUTOINCREMENT,
-                subscription_id   INTEGER NOT NULL REFERENCES ws_subscriptions(id) ON DELETE CASCADE,
-                rule_type         TEXT NOT NULL,
-                config            TEXT NOT NULL,
-                note              TEXT,
-                active            INTEGER NOT NULL DEFAULT 1,
-                triggered_count   INTEGER NOT NULL DEFAULT 0,
-                last_triggered_at REAL,
-                cooldown_seconds  REAL NOT NULL DEFAULT 60,
-                created_at        REAL NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS alert_events (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                rule_id     INTEGER NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
-                fired_at    REAL NOT NULL,
-                payload     TEXT NOT NULL,
-                message     TEXT NOT NULL,
-                spoken      INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_alert_rules_sub
-                ON alert_rules(subscription_id);
-            CREATE INDEX IF NOT EXISTS idx_alert_events_fired
-                ON alert_events(fired_at DESC);
-            """
-        )
-
-
-_init_db()
-print(f"[boot] DB: {DB_PATH}")
-
-
-def _new_conversation_obj(title: str = "New conversation") -> dict:
-    now = time.time()
-    return {
-        "id": f"c_{int(now)}_{uuid.uuid4().hex[:6]}",
-        "title": title,
-        "created_at": now,
-        "updated_at": now,
-        "messages": [],
-    }
-
-
-def list_conversations() -> list[dict]:
-    with _db() as conn:
-        rows = conn.execute(
-            """
-            SELECT c.id, c.title, c.created_at, c.updated_at,
-                   (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS message_count
-            FROM conversations c
-            ORDER BY c.updated_at DESC
-            """
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-
-def load_conversation(cid: str) -> dict | None:
-    with _db() as conn:
-        row = conn.execute(
-            "SELECT id, title, created_at, updated_at FROM conversations WHERE id = ?",
-            (cid,),
-        ).fetchone()
-        if not row:
-            return None
-        msg_rows = conn.execute(
-            "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY position",
-            (cid,),
-        ).fetchall()
-    return {
-        "id": row["id"],
-        "title": row["title"],
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
-        "messages": [{"role": m["role"], "content": m["content"]} for m in msg_rows],
-    }
-
-
-def save_conversation(conv: dict) -> None:
-    """Upsert conversation + replace its messages atomically."""
-    conv["updated_at"] = time.time()
-    # Auto-title from first user message if still default.
-    if conv.get("title") in (None, "", "New conversation"):
-        for m in conv.get("messages", []):
-            if m.get("role") == "user" and m.get("content"):
-                first_line = str(m["content"]).strip().split("\n", 1)[0]
-                conv["title"] = first_line[:MAX_TITLE_CHARS] or "Untitled"
-                break
-    with _db() as conn:
-        conn.execute(
-            """
-            INSERT INTO conversations (id, title, created_at, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                title = excluded.title,
-                updated_at = excluded.updated_at
-            """,
-            (conv["id"], conv.get("title", "Untitled"), conv["created_at"], conv["updated_at"]),
-        )
-        # Replace messages by deleting and re-inserting. Fine for our scale
-        # (≤ MAX_HISTORY_MESSAGES per conversation).
-        conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conv["id"],))
-        now = time.time()
-        rows = [
-            (conv["id"], i, m.get("role", "user"), str(m.get("content", "")), now)
-            for i, m in enumerate(conv.get("messages", []))
-        ]
-        if rows:
-            conn.executemany(
-                "INSERT INTO messages (conversation_id, position, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
-                rows,
-            )
-
-
-def delete_conversation(cid: str) -> bool:
-    with _db() as conn:
-        cur = conn.execute("DELETE FROM conversations WHERE id = ?", (cid,))
-        return cur.rowcount > 0
-
-
-def rename_conversation(cid: str, new_title: str) -> bool:
-    title = (new_title or "Untitled")[:MAX_TITLE_CHARS]
-    with _db() as conn:
-        cur = conn.execute(
-            "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?",
-            (title, time.time(), cid),
-        )
-        return cur.rowcount > 0
-
-
-def _migrate_legacy_history() -> None:
-    """Migrate pre-DB storage (single JSON file or per-conversation JSON files)
-    into SQLite on first boot. Idempotent."""
-    # Skip if DB already has conversations
-    with _db() as conn:
-        existing = conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
-    if existing > 0:
-        return
-
-    # 1) Per-conversation JSON files
-    migrated = 0
-    if CONVERSATIONS_DIR.exists():
-        for path in CONVERSATIONS_DIR.glob("c_*.json"):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if not isinstance(data, dict):
-                    continue
-                save_conversation(
-                    {
-                        "id": data.get("id") or f"c_{int(time.time())}_{uuid.uuid4().hex[:6]}",
-                        "title": data.get("title") or "Untitled",
-                        "created_at": data.get("created_at", time.time()),
-                        "updated_at": data.get("updated_at", time.time()),
-                        "messages": data.get("messages", []),
-                    }
-                )
-                path.rename(path.with_suffix(".json.migrated"))
-                migrated += 1
-            except (json.JSONDecodeError, OSError) as e:
-                print(f"[conv] Migration failed for {path.name}: {e}")
-
-    # 2) Original single hal_history.json (only if no per-conversation files migrated)
-    if migrated == 0 and HISTORY_FILE.exists():
-        try:
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                messages = json.load(f)
-            if isinstance(messages, list) and messages:
-                conv = _new_conversation_obj("Legacy history")
-                conv["messages"] = messages
-                save_conversation(conv)
-                HISTORY_FILE.rename(HISTORY_FILE.with_suffix(".json.migrated"))
-                migrated += 1
-        except (json.JSONDecodeError, OSError) as e:
-            print(f"[conv] Legacy migration failed: {e}")
-
-    if migrated:
-        print(f"[conv] Migrated {migrated} conversation(s) into SQLite")
-
-
-_migrate_legacy_history()
 
 
 # --- Model loading ----------------------------------------------------------
@@ -1345,6 +573,10 @@ async def render_chart(symbol: str, timeframe: str, websocket: WebSocket) -> tup
     timeframe = (timeframe or "5m").strip()
     if not symbol:
         return "show_chart requires a 'symbol'.", None, None
+    # Accept a spoken company name ("Apple") as well as a ticker ("AAPL"); the
+    # model sometimes passes the name straight through. Falls back to the raw
+    # text if resolution turns up nothing.
+    symbol = await _resolve_symbol(symbol) or symbol
     await websocket.send_json({"state": "processing", "text": f"Charting {symbol.upper()} {timeframe}..."})
     try:
         payload = await charting.build_chart(symbol, timeframe)
@@ -1398,6 +630,8 @@ async def execute_tool(name: str, args: dict, websocket: WebSocket, abort_event:
         return await run_market_tool(name, args, websocket)
     if name in ("screen_options", "iv_context"):
         return await run_analysis_tool(name, args, websocket)
+    if name == "recommend_strategy":
+        return await run_strategy_tool(args, websocket)
     if name == "open_webull":
         return await run_webull_tool(args, websocket)
     if name == "open_view":
@@ -1525,6 +759,27 @@ async def run_analysis_tool(name: str, args: dict, websocket: WebSocket) -> str:
     status = "error" if isinstance(result, dict) and result.get("error") else "ok"
     preview = f"{name}({json.dumps(args, default=str)[:200]})"
     await _emit_telemetry(websocket, f"analysis.{name}", preview, body, status=status)
+    return body[:MAX_TOOL_OUTPUT_CHARS]
+
+
+async def run_strategy_tool(args: dict, websocket: WebSocket) -> str:
+    """Port of TradeScan's strategy screener: bias x IV -> ranked strategies
+    with rationale, risk, and concrete legs. Pure compute, no I/O."""
+    try:
+        result = option_strategy.recommend_strategy(
+            underlying=args.get("underlying", ""),
+            bias=args.get("bias", "auto"),
+            change_percent=args.get("change_percent"),
+            iv=args.get("iv"),
+            iv_level=args.get("iv_level"),
+            current_price=args.get("current_price"),
+        )
+    except Exception as e:
+        result = {"error": f"{type(e).__name__}: {e}"}
+    body = json.dumps(result, indent=2, default=str)
+    status = "error" if isinstance(result, dict) and result.get("error") else "ok"
+    preview = f"recommend_strategy({json.dumps(args, default=str)[:200]})"
+    await _emit_telemetry(websocket, "analysis.recommend_strategy", preview, body, status=status)
     return body[:MAX_TOOL_OUTPUT_CHARS]
 
 
@@ -1668,6 +923,9 @@ def _match_backtest_intent(text: str) -> str | None:
     m = _CHART_TICKERS.search(text)
     if m:
         return m.group(1).upper()
+    name = _resolve_company_name(text)
+    if name:
+        return name
     m2 = re.search(r"\b([A-Z]{2,5})\b", text)
     if m2 and m2.group(1) not in ("HAL", "SPY"):
         return m2.group(1)
@@ -1683,6 +941,8 @@ def _match_chart_intent(text: str) -> tuple[str, str] | None:
     if m2:
         sym = m2.group(1).upper()
     else:
+        sym = _resolve_company_name(text)
+    if not sym:
         m = re.search(r"\b([A-Z]{2,5})\b", text)
         if m and m.group(1) != "HAL":
             sym = m.group(1)
@@ -2295,112 +1555,6 @@ def _set_trade_stop_alert(trade: dict) -> str:
     if rule.get("error"):
         return f"I couldn't set the alert: {rule['error']}"
     return f"Alert set — I'll shout if {target} {level_desc}."
-
-
-def _eastern_now() -> tuple[datetime, str]:
-    """Current US Eastern wall-clock time, computed from UTC without relying on
-    a tz database (tzdata isn't installed and the torch env is pinned). DST runs
-    from the 2nd Sunday of March (02:00 EST = 07:00 UTC) to the 1st Sunday of
-    November (02:00 EDT = 06:00 UTC). Returns (naive ET datetime, 'EST'|'EDT')."""
-    utc = datetime.now(timezone.utc)
-    year = utc.year
-    mar1 = datetime(year, 3, 1, tzinfo=timezone.utc)
-    dst_start = mar1 + timedelta(days=(6 - mar1.weekday()) % 7 + 7, hours=7)
-    nov1 = datetime(year, 11, 1, tzinfo=timezone.utc)
-    dst_end = nov1 + timedelta(days=(6 - nov1.weekday()) % 7, hours=6)
-    is_dst = dst_start <= utc < dst_end
-    offset = -4 if is_dst else -5
-    et = (utc + timedelta(hours=offset)).replace(tzinfo=None)
-    return et, ("EDT" if is_dst else "EST")
-
-
-def _market_session(et: datetime) -> str:
-    """US equity/options session label for a given Eastern time. Time-of-day +
-    weekday only; market holidays are not accounted for."""
-    if et.weekday() >= 5:
-        return "CLOSED (weekend)"
-    minutes = et.hour * 60 + et.minute
-    if minutes < 4 * 60:
-        return "CLOSED (overnight)"
-    if minutes < 9 * 60 + 30:
-        return "pre-market (not yet open)"
-    if minutes < 16 * 60:
-        return "OPEN (regular hours)"
-    if minutes < 20 * 60:
-        return "after-hours (regular session closed)"
-    return "CLOSED (overnight)"
-
-
-def _options_date_context() -> str:
-    """Pre-computed date/time + market-session context the LLM would otherwise
-    have to derive itself. /no_think mode skips reasoning, so we hand it the
-    current Eastern time, whether the US market is open, ISO + YYMMDD (option-
-    ticker) date formats, and the next 4 weekly Friday expirations — keeping it
-    from inventing wrong dates or guessing whether the market is live."""
-    et, abbr = _eastern_now()
-    today = et.date()
-    session = _market_session(et)
-    # Days until next Friday (Mon=0..Sun=6, Fri=4). Today counts if it IS Friday.
-    days_until_fri = (4 - today.weekday()) % 7
-    fridays = [today + timedelta(days=days_until_fri + 7 * i) for i in range(4)]
-    lines = [
-        "=== LIVE CLOCK — AUTHORITATIVE. This is the real current time. Trust it "
-        "over ANY time, date, or 'this morning/afternoon' wording earlier in the "
-        "conversation; that history is stale. ===",
-        f"Current time: {et:%A, %B %d, %Y  %I:%M %p} {abbr} (US Eastern — this IS market time)",
-        f"US equity & options market right now: {session}. "
-        "Regular hours are 9:30 AM-4:00 PM ET, Mon-Fri. Market holidays are not "
-        "reflected here; if it might be a holiday, confirm with query_massive "
-        "/v1/marketstatus/now before claiming the market is open.",
-        "When Jeffery asks the time or whether the market is open, answer directly "
-        "from the two lines above — do NOT infer it from earlier messages or do "
-        "your own clock math.",
-        f"Today's date: {today:%A, %B %d, %Y}  (ISO {today:%Y-%m-%d}, option-ticker YYMMDD {today:%y%m%d})",
-        "Upcoming Friday option expirations:",
-    ]
-    for f in fridays:
-        delta = (f - today).days
-        rel = "today" if delta == 0 else f"+{delta}d"
-        lines.append(f"  {f:%a} {f:%Y-%m-%d}  (YYMMDD {f:%y%m%d})  [{rel}]")
-    return "\n".join(lines)
-
-
-def _normalize_attachments(raw: list | None) -> list[dict]:
-    if not raw:
-        return []
-    out = []
-    for a in raw[:MAX_ATTACHMENT_COUNT]:
-        if not isinstance(a, dict):
-            continue
-        kind = a.get("kind")
-        if kind not in ("text", "image"):
-            continue
-        name = str(a.get("name") or "unnamed")
-        content = a.get("content") or ""
-        if not isinstance(content, str) or not content:
-            continue
-        if kind == "text":
-            content = content[:MAX_ATTACHMENT_TEXT_CHARS]
-        out.append({"name": name, "kind": kind, "content": content})
-    return out
-
-
-def _format_text_attachments(attachments: list[dict]) -> str:
-    text_atts = [a for a in attachments if a["kind"] == "text"]
-    if not text_atts:
-        return ""
-    parts = ["<attachments>"]
-    for a in text_atts:
-        parts.append(f'<file name="{a["name"]}">\n{a["content"]}\n</file>')
-    parts.append("</attachments>")
-    return "\n".join(parts)
-
-
-def _attachment_summary(attachments: list[dict]) -> str:
-    if not attachments:
-        return ""
-    names = [a["name"] for a in attachments]
-    return f"[Attached: {', '.join(names)}]"
 
 
 async def agent_loop(
