@@ -40,6 +40,7 @@ from piper import PiperVoice
 import market
 import analysis
 import charting
+import backtest
 
 # --- Configuration ----------------------------------------------------------
 # Minimal .env loader (no python-dotenv dependency).
@@ -1016,6 +1017,7 @@ async def _lifespan(_app: FastAPI):
     market.configure(DB_PATH, MASSIVE_API_KEY)
     analysis.configure(MASSIVE_BASE_URL, MASSIVE_API_KEY)
     charting.configure(MASSIVE_BASE_URL, MASSIVE_API_KEY)
+    backtest.configure(MASSIVE_BASE_URL, MASSIVE_API_KEY)
     await market.manager.start()
     print(f"[boot] market manager: {market.manager.url}")
     try:
@@ -1601,6 +1603,77 @@ def _parse_timeframe_phrase(text: str) -> str:
     return "5m"
 
 
+_BACKTEST_INTENT = re.compile(r"\b(back\s?test|backtesting)\b", re.IGNORECASE)
+
+# Cash-settled index option ROOTS, by trading volume. When Jeffery names one
+# of these explicitly we backtest the actual index option (not an ETF proxy).
+# NOTE: these are index roots, not ETFs — Massive may need an 'I:' prefix for
+# the underlying spot/aggregates; verify live and adjust if a root returns no
+# data (the ETF proxy aliases below are the reliable fallback).
+_INDEX_OPTION_ROOTS = re.compile(
+    r"\b(SPX|VIX|XSP|NDX|RUT|DJX)\b", re.IGNORECASE,
+)
+
+# Index name -> liquid US-listed option proxy. Lets "backtest the Dow",
+# "backtest the Nasdaq", etc. resolve to a tradeable, backtestable symbol.
+# Order matters: check longer/more-specific phrases first (nasdaq 100 before
+# nasdaq). Foreign/total-market indexes (FTSE, DAX, Nikkei, MSCI, Wilshire)
+# are intentionally excluded — no liquid US options for the backtester.
+_INDEX_ALIASES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\b(volatility index|the vix)\b", re.IGNORECASE), "VIX"),
+    (re.compile(r"\b(mini[\s-]?spx)\b", re.IGNORECASE), "XSP"),
+    (re.compile(r"\b(nasdaq[\s-]?100)\b", re.IGNORECASE), "QQQ"),
+    (re.compile(r"\bnasdaq( composite)?|ixic|the\s+qs?\b", re.IGNORECASE), "QQQ"),
+    (re.compile(r"\b(dow( jones)?|djia|the dow)\b", re.IGNORECASE), "DIA"),
+    (re.compile(r"\b(russell( 2000)?|small[\s-]?caps?)\b", re.IGNORECASE), "IWM"),
+    (re.compile(r"\b(s&p ?100|sp100|oex)\b", re.IGNORECASE), "OEX"),
+    (re.compile(r"\b(s&p( ?500)?|sp ?500|the s and p)\b", re.IGNORECASE), "SPY"),
+]
+
+# Symbols that get the shorter "quick" 12-month backtest window. ETF proxies
+# and index roots are quick-scan; individual stocks use the full 24 months.
+_INDEX_QUICK_SYMBOLS = {
+    "SPY", "QQQ", "DIA", "IWM", "OEX",       # ETF proxies
+    "SPX", "VIX", "XSP", "NDX", "RUT", "DJX",  # cash-settled index roots
+}
+
+
+def _resolve_index_alias(text: str) -> str | None:
+    # Spelled-out names first, so multi-word phrases win over a bare root they
+    # contain (e.g. "mini SPX" -> XSP, not the "SPX" substring).
+    for pat, sym in _INDEX_ALIASES:
+        if pat.search(text):
+            return sym
+    # Then an explicit index-option root ("backtest SPX" -> SPX, not SPY).
+    m = _INDEX_OPTION_ROOTS.search(text)
+    if m:
+        return m.group(1).upper()
+    return None
+
+
+def _match_backtest_intent(text: str) -> str | None:
+    """Return the underlying ticker if this is a backtest request, else None.
+    Resolves index names (Dow/Nasdaq/Russell/...) to their option proxies, then
+    falls back to an explicit ticker, then SPY. Deterministic route because
+    Qwen3 blanks on new tools with think:False (see chart intent)."""
+    if not text or not _BACKTEST_INTENT.search(text):
+        return None
+    # "close the backtest" contains "backtest" — never treat a close request as
+    # a new backtest (the close route handles it).
+    if _match_close_view_intent(text):
+        return None
+    alias = _resolve_index_alias(text)
+    if alias:
+        return alias
+    m = _CHART_TICKERS.search(text)
+    if m:
+        return m.group(1).upper()
+    m2 = re.search(r"\b([A-Z]{2,5})\b", text)
+    if m2 and m2.group(1) not in ("HAL", "SPY"):
+        return m2.group(1)
+    return "SPY"
+
+
 def _match_chart_intent(text: str) -> tuple[str, str] | None:
     """Pull (ticker, timeframe) from a chart request, else None."""
     if not text or not _CHART_INTENT_KEYWORD.search(text):
@@ -1620,8 +1693,11 @@ def _match_chart_intent(text: str) -> tuple[str, str] | None:
 
 _CLOSE_VIEW_INTENT = re.compile(
     r"\b(close|hide|dismiss|exit|remove|take down|get rid of)\b"
-    r"[\w\s]*\b(chart|charts|candles?|candlestick|view|immersive|backdrop|camera|map)\b"
-    r"|\b(close|exit|hide|dismiss)\s+(it|that|this)\b",
+    r"[\w\s]*\b(chart|charts|candles?|candlestick|backtest|back ?test|equity|view|immersive|backdrop|camera|map)\b"
+    r"|\b(close|exit|hide|dismiss)\s+(it|that|this)\b"
+    # Whole-message bare close command (e.g. just "close", "go back"). Excludes
+    # "done"/"cancel" — those are trade-follow-up words (placed/decline).
+    r"|^\s*(close|exit|hide|dismiss|go back)[.!\s]*$",
     re.IGNORECASE,
 )
 
@@ -1629,6 +1705,52 @@ _CLOSE_VIEW_INTENT = re.compile(
 def _match_close_view_intent(text: str) -> bool:
     """True when the user asks to close/hide the chart or immersive view."""
     return bool(text and _CLOSE_VIEW_INTENT.search(text))
+
+
+# Plain-English explanation of each chart pattern HAL detects. Keyed by a
+# substring that appears in charting.py's pattern text. Used for "tell me more"
+# / "explain the pattern" so HAL teaches, not just names.
+_PATTERN_INFO: list[tuple[str, str]] = [
+    ("double top", "A double top is two peaks at about the same level with a dip between. It signals buyers failed twice at that ceiling — bearish once price breaks below the dip (the neckline). Target is roughly the height of the pattern projected down."),
+    ("double bottom", "A double bottom is two troughs at about the same level with a bounce between. Sellers failed twice at that floor — bullish once price breaks above the middle peak. Target is the pattern height projected up."),
+    ("head & shoulders top", "A head-and-shoulders top is three peaks, the middle (head) highest, shoulders lower and roughly even. It's a classic reversal: breaking the neckline under the shoulders signals a top is in. Target is head-to-neckline distance projected down."),
+    ("inverse head & shoulders", "An inverse head-and-shoulders is three troughs, the middle (head) lowest. It's a bullish reversal — breaking the neckline above the shoulders signals a bottom. Target is head-to-neckline distance projected up."),
+    ("descending triangle", "A descending triangle is a flat support line with lower highs pressing down on it. It usually resolves down when support cracks — bearish continuation. Target is the triangle height projected below support."),
+    ("ascending triangle", "An ascending triangle is a flat resistance line with higher lows pushing up into it. It usually resolves up when resistance breaks — bullish continuation. Target is the height projected above resistance."),
+    ("bull flag", "A bull flag is a sharp rally (the pole) then a tight, slightly-down drift (the flag). It's a continuation pattern — a break above the flag often resumes the up-move, targeting another pole's length."),
+    ("bear flag", "A bear flag is a sharp drop then a tight, slightly-up drift. Continuation — a break below the flag often resumes the down-move."),
+    ("trading range", "A trading range is flat support and flat resistance boxing price in. Neutral — favors fading the edges or selling premium (e.g. an iron condor) until one side breaks."),
+    ("triple", "Three roughly-equal peaks or troughs — like a double top/bottom but with a third test. The more times a level holds, the more significant the eventual break."),
+    ("three descending peaks", "Three successively lower highs — sellers stepping in earlier each time. Bearish structure; a break of the prior low confirms it."),
+    ("three rising valleys", "Three successively higher lows — buyers stepping in earlier each time. Bullish structure; a break of the prior high confirms it."),
+    ("consolidation", "Tight consolidation (coiling) is price compressing into a small range — energy building. Direction is unknown until it breaks, but the break is often sharp; a straddle or waiting for the break both fit."),
+    ("breaking out", "A breakout is price pushing above a prior swing high. It's bullish if it holds, but watch for a failed break (a quick reversal back inside the range)."),
+    ("breaking down", "A breakdown is price falling below a prior swing low. Bearish if it holds; watch for a failed break that snaps back up."),
+]
+
+
+def _pattern_detail(a: dict) -> str | None:
+    """Educational explanation of the pattern(s) on the chart, for 'tell me
+    more'. Returns None if there's no detected pattern to explain."""
+    pats = a.get("patterns") or []
+    sym = a.get("symbol", "this")
+    if not pats:
+        return (f"There's no clean, confirmed pattern on {sym} right now — it's "
+                f"{a.get('trend','range-bound')} with {a.get('structure','few defined swings')}. "
+                "I only flag patterns once they've actually triggered.")
+    explained: list[str] = []
+    for p in pats:
+        pl = p.lower()
+        for key, info in _PATTERN_INFO:
+            if key in pl:
+                explained.append(f"{p}. {info}")
+                break
+    if not explained:
+        return f"On {sym} I see: " + "; ".join(pats) + "."
+    head = explained[0]
+    bias = a.get("bias")
+    tail = f" Net read: bias is {bias}." if bias and bias != "neutral" else ""
+    return head + tail
 
 
 def _answer_chart_question(text: str, a: dict) -> str | None:
@@ -1640,6 +1762,42 @@ def _answer_chart_question(text: str, a: dict) -> str | None:
     t = text.lower()
     sym, tf = a["symbol"], a["timeframe"]
     res, sup = a.get("resistance"), a.get("support")
+    # "Tell me more" / "explain the pattern" / "identify it" -> teach the pattern.
+    if (any(k in t for k in ("tell me more", "explain", "what does that mean",
+                             "what does it mean", "more about", "more info",
+                             "elaborate", "why"))
+            or ("identif" in t and "pattern" in t)
+            or t.strip() in ("more", "more?", "identify pattern", "what pattern")):
+        detail = _pattern_detail(a)
+        if detail:
+            return detail
+    # "Anything I should be aware of / watch out for / risks / careful" -> a
+    # deterministic risk read from the stored analysis. Answered here so this
+    # open-ended phrasing never falls through to the slow/blank-prone model.
+    if any(k in t for k in ("aware", "watch out", "watch for", "look out",
+                            "careful", "risk", "heads up", "concern", "caution",
+                            "gotcha", "anything else")):
+        bits = []
+        if a.get("resistance") is not None:
+            bits.append(f"resistance to clear at {a['resistance']:.2f}")
+        if a.get("support") is not None:
+            bits.append(f"support to hold at {a['support']:.2f}")
+        risk = []
+        if a.get("vol_regime") == "expanding":
+            risk.append("volatility is expanding, so moves can overshoot")
+        elif a.get("vol_regime") == "contracting":
+            risk.append("volatility is contracting, so a sharp break may be coming")
+        if a.get("signal"):
+            risk.append(a["signal"].rstrip("."))
+        if a.get("volume_note"):
+            risk.append(a["volume_note"].rstrip("."))
+        parts = [f"On {sym} {tf}, it's {a['trend']}, bias {a.get('bias')}."]
+        if bits:
+            parts.append("Key levels: " + ", ".join(bits) + ".")
+        if risk:
+            parts.append("Watch: " + "; ".join(risk) + ".")
+        parts.append("And remember the strategy is a documented loser historically, so size small and confirm before risking real money.")
+        return " ".join(parts)
     if any(k in t for k in ("strategy", "scalp", "leaps", "condor", "premium",
                             "straddle", "strangle", "what should i trade",
                             "what do i trade", "what to trade", "how do i play",
@@ -1718,6 +1876,28 @@ def _match_zoom_intent(text: str) -> str | None:
     return "in"
 
 
+_CHART_TRADE_REQUEST = re.compile(
+    r"\b("
+    # verb + "trade": see/show/view/pull up/bring up/open/give/build/make/set up/size
+    r"(see|show|view|pull up|bring up|open|give|build|make|set ?up|size)"
+    r"( me)?( the| a| this)? trade"
+    r"|the trade setup|trade setup|put (on )?(the |a )?trade"
+    r"|what (position|trade) should i|what should i (put|play|do|trade) (here|on this|on it)"
+    # recommend / suggest / find a trade; "any trade(s)"; "what can I trade"
+    r"|(recommend|suggest|find|pick)( me)?( a| any| some)? trades?"
+    r"|any (good )?trades?|a trade idea|trade idea|what can i (trade|play|buy)"
+    r"|what trade can i (put|make|do|play)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _is_chart_trade_request(text: str) -> bool:
+    """True when, with a chart open, the user is asking HAL to turn it into an
+    actual sized trade (not just describe the chart)."""
+    return bool(text and _CHART_TRADE_REQUEST.search(text))
+
+
 def _build_zoom(a: dict, mode: str) -> tuple[dict, str]:
     """Build a chart_zoom WS command + spoken confirmation from the analysis."""
     t_first, t_last = a.get("t_first"), a.get("t_last")
@@ -1791,6 +1971,330 @@ def _maybe_inject_trade_primer(user_text: str) -> str:
     if not _TRADING_CONTEXT.search(user_text):
         return user_text
     return user_text + _TRADE_PRIMER
+
+
+def _format_risk_context(risk: dict | None) -> str:
+    """Render Jeffery's position-sizing settings (from the UI panel) as an
+    internal directive so HAL sizes the trade to his account and risk rules.
+    Returns '' when no usable account size is set."""
+    if not isinstance(risk, dict):
+        return ""
+    try:
+        acct = float(risk.get("accountSize") or 0)
+        max_risk = float(risk.get("maxRiskPct") or 0)
+        stop = float(risk.get("stopLossPct") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if acct <= 0 or max_risk <= 0:
+        return ""
+    budget = acct * max_risk / 100.0
+    lines = (
+        "\n\n[POSITION SIZING — Jeffery's account settings; use these, do not ask]\n"
+        f"Account size: ${acct:,.2f}. "
+        f"Max risk per trade: {max_risk:g}% = ${budget:,.2f}. "
+        f"Default stop loss: {stop:g}% of the premium paid.\n"
+        f"Size the trade so the worst case loses no more than ${budget:,.2f}. "
+    )
+    if stop > 0:
+        lines += (
+            "Use the contract's LIVE price from the options chain (screen_options "
+            "ask for a long buy, bid for a short/credit; mid if you must) as the "
+            "entry premium — never ask Jeffery for a price. "
+            "For a long single option, contracts = floor(risk budget / "
+            f"(entry premium x 100 x {stop:g}%)). "
+        )
+    lines += "State the recommended contract quantity and the resulting dollar risk."
+    return lines
+
+
+def _extract_trade_symbol(text: str) -> str | None:
+    """Pull the underlying ticker from a trade-idea question (for auto-backtest)."""
+    if not text:
+        return None
+    m = _CHART_TICKERS.search(text)
+    if m:
+        return m.group(1).upper()
+    m2 = re.search(r"\b([A-Z]{2,5})\b", text)
+    if m2 and m2.group(1) not in ("HAL", "IV", "DTE", "ATM", "OTM", "ITM"):
+        return m2.group(1)
+    return None
+
+
+def _format_trade_directive(broker: str | None) -> str:
+    """Slim output hint for the MODEL fallback path only (the deterministic
+    trade route builds the table itself). Kept short because this model blanks
+    on long directives under think:False."""
+    b = broker or "the broker"
+    return (
+        f"\n\n[FORMAT] End with a Markdown table: | Symbol | Side | Strike | Expiry | "
+        f"Entry | Qty | Max Risk | Breakeven |, then numbered steps to place it on {b}."
+    )
+
+
+def _match_trade_intent(text: str) -> str | None:
+    """Return the underlying ticker if this is a trade-idea question, else None.
+    Gates on the same trigger+context as the primer, but also requires a ticker
+    so we only fire the deterministic builder when we know what to trade."""
+    if not text:
+        return None
+    if not (_TRADE_IDEA_TRIGGERS.search(text) and _TRADING_CONTEXT.search(text)):
+        return None
+    return _extract_trade_symbol(text)
+
+
+def _size_contracts(account: float, max_risk_pct: float, stop_pct: float, entry: float) -> tuple[int, float]:
+    """(qty, dollar risk) for a long option, risk-sized so a stop-out loses no
+    more than max_risk_pct of the account. Mirrors the frontend sizePosition."""
+    if entry <= 0 or account <= 0 or max_risk_pct <= 0:
+        return 0, 0.0
+    budget = account * max_risk_pct / 100.0
+    per_contract_risk = entry * 100.0 * (stop_pct / 100.0 if stop_pct > 0 else 1.0)
+    if per_contract_risk <= 0:
+        return 0, 0.0
+    qty = int(budget // per_contract_risk)
+    return qty, round(qty * per_contract_risk, 2)
+
+
+async def build_trade_reco(symbol: str, risk: dict | None, websocket: WebSocket) -> tuple[str, str]:
+    """Deterministically build a long call/put recommendation: direction from
+    the daily chart bias, contract from a liquidity-screened ATM strike, size
+    from Jeffery's risk settings, plus an auto-backtest for the historical edge.
+
+    Returns (spoken_sentence, full_markdown). The markdown (summary + table +
+    broker steps) is what shows in chat; only the spoken sentence is read aloud.
+    Never raises — returns a graceful spoken message on any failure."""
+    sym = symbol.upper().strip()
+    risk = risk if isinstance(risk, dict) else {}
+    account = float(risk.get("accountSize") or 0)
+    max_risk_pct = float(risk.get("maxRiskPct") or 5)
+    stop_pct = float(risk.get("stopLossPct") or 20)
+    broker = risk.get("broker") or "your broker"
+
+    await websocket.send_json({"state": "processing", "text": f"Analyzing {sym}..."})
+    await _emit_telemetry(websocket, "trade.start", f"trade idea: {sym}",
+                          f"Building a sized long-option recommendation for {sym}.")
+
+    # Direction from the daily chart bias (reuses charting).
+    try:
+        chart_payload = await charting.build_chart(sym, "1d")
+        ca = charting.analyze(chart_payload)
+        bias = ca.get("bias", "neutral")
+    except Exception as e:
+        await _emit_telemetry(websocket, "trade.bias", sym, f"data error: {e}", status="error")
+        return (f"I could not pull {sym} data, Jeffery. {e}", "")
+    side = "call" if bias == "bullish" else "put" if bias == "bearish" else "call"
+    await _emit_telemetry(
+        websocket, "trade.bias", f"{sym} daily",
+        f"Daily bias: {bias} -> {side.upper()}. Structure: {ca.get('structure','?')}. "
+        f"Last {ca.get('last','?')}, trend {ca.get('trend','?')}.",
+    )
+
+    # IV richness (informational).
+    try:
+        ivc = await analysis.iv_context(sym)
+        verdict = ivc.get("verdict", "UNKNOWN")
+    except Exception:
+        verdict = "UNKNOWN"
+        ivc = {}
+    await _emit_telemetry(
+        websocket, "trade.iv", sym,
+        f"IV verdict: {verdict}. ATM IV {ivc.get('atm_iv','?')} vs HV30 "
+        f"{ivc.get('hv30','?')} (ratio {ivc.get('iv_over_hv30','?')}).",
+    )
+
+    # Spot from the daily chart close (chain underlying_price is usually null),
+    # needed BEFORE screening so we can bound strikes to the money.
+    spot = ca.get("last") or 0
+    # Screen ATM contracts ~1-2 weeks out. Bounding strikes to spot ±7% keeps
+    # the set near the money — without it, sort_by=oi surfaces deep-ITM high-OI
+    # strikes (e.g. a 600 call when SPY is ~695) with wide, unusable quotes.
+    strike_lo = round(spot * 0.93) if spot else None
+    strike_hi = round(spot * 1.07) if spot else None
+    try:
+        screen = await analysis.screen_options(
+            underlying=sym, side=side, dte_min=5, dte_max=14,
+            min_oi=100, sort_by="oi", top_n=40,
+            strike_min=strike_lo, strike_max=strike_hi,
+        )
+    except Exception as e:
+        return (f"I could not load the {sym} chain, Jeffery. {e}", "")
+    candidates = (screen or {}).get("candidates") or []
+    if not candidates:
+        await _emit_telemetry(websocket, "trade.chain", f"{sym} {side} {strike_lo}-{strike_hi}",
+                              "No liquid contracts near the money.", status="error")
+        return (f"No liquid {sym} {side} contracts near the money, Jeffery.", "")
+    spot = candidates[0].get("underlying_price") or spot
+    await _emit_telemetry(
+        websocket, "trade.chain", f"{sym} {side} strikes {strike_lo}-{strike_hi}, 5-14 DTE",
+        f"Screened {len(candidates)} liquid {side}s near spot ~{spot:g}.",
+    )
+    # Pick the nearest-to-the-money contract that actually has a usable quote,
+    # so we never size off a $0 entry.
+    def _quote(r: dict) -> float:
+        return r.get("ask") or r.get("mid") or r.get("bid") or 0
+    quoted = [r for r in candidates if _quote(r) > 0] or candidates
+    atm = min(quoted, key=lambda r: abs((r.get("strike") or 0) - spot)) if spot else quoted[0]
+    entry = _quote(atm)
+    strike = atm.get("strike") or 0
+    expiry = atm.get("expiration") or "?"
+    option_ticker = atm.get("ticker") or ""
+    await _emit_telemetry(
+        websocket, "trade.contract", f"ATM pick for {sym}",
+        f"Chose {strike:g} {side} exp {expiry} @ ${entry:.2f} "
+        f"(OI {atm.get('oi','?')}, spread {atm.get('spread_pct','?')}%).",
+    )
+
+    qty, dollar_risk = _size_contracts(account, max_risk_pct, stop_pct, entry)
+    breakeven = strike + entry if side == "call" else strike - entry
+    await _emit_telemetry(
+        websocket, "trade.sizing", f"acct ${account:,.0f}, {max_risk_pct:g}% risk, {stop_pct:g}% stop",
+        f"Budget ${account * max_risk_pct / 100:,.0f}; one contract risks "
+        f"${entry * 100 * (stop_pct/100 if stop_pct>0 else 1):,.0f} -> {qty} contract(s), "
+        f"${dollar_risk:,.0f} at risk.",
+    )
+    # Limit = entry + a 2% fill buffer above the ask; stop = premium level where
+    # the stop-loss triggers (entry - stop%). Both shown as price (+/- percent).
+    LIMIT_BUFFER_PCT = 2.0
+    limit_price = round(entry * (1 + LIMIT_BUFFER_PCT / 100.0), 2)
+    stop_price = round(entry * (1 - stop_pct / 100.0), 2) if stop_pct > 0 else 0.0
+    # Explain a zero quantity so the table is never silently confusing.
+    zero_note = ""
+    if qty == 0:
+        if account <= 0:
+            zero_note = "Set your account size in the Position panel so I can size this."
+        elif entry > 0:
+            budget = account * max_risk_pct / 100.0
+            per = entry * 100.0 * (stop_pct / 100.0 if stop_pct > 0 else 1.0)
+            zero_note = (
+                f"One contract risks ${per:,.0f} at your {stop_pct:g}% stop, over your "
+                f"${budget:,.0f} budget — too rich. Widen risk or pick a cheaper strike."
+            )
+
+    # Auto-backtest (cached per-symbol on the socket).
+    cache = websocket.scope.setdefault("hal_bt_cache", {})
+    bt = cache.get(sym)
+    if bt is None:
+        try:
+            bt = await backtest.run_backtest(sym, months=24)
+            cache[sym] = bt
+        except Exception:
+            bt = {}
+    m = (bt or {}).get("metrics") or {}
+    bt_line = ""
+    if m.get("trades"):
+        bt_line = (
+            f"Backtest (24mo, {bt.get('underlying', sym)}): {m['trades']} trades, "
+            f"{int(m['win_rate']*100)}% win rate, profit factor {m.get('profit_factor')}, "
+            f"max drawdown ${m['max_drawdown']:,.0f}."
+        )
+        await _emit_telemetry(websocket, "trade.backtest", f"{sym} 24mo", bt_line)
+    else:
+        await _emit_telemetry(websocket, "trade.backtest", f"{sym} 24mo",
+                              "No qualifying historical trades.", status="ok")
+
+    side_label = "Call" if side == "call" else "Put"
+    limit_cell = f"${limit_price:.2f} (+{LIMIT_BUFFER_PCT:g}%)"
+    stop_cell = f"${stop_price:.2f} (-{stop_pct:g}%)" if stop_pct > 0 else "—"
+    table = (
+        "| Symbol | Side | Strike | Expiry | Entry | Limit | Stop Loss | Qty | Max Risk | Breakeven |\n"
+        "|---|---|---|---|---|---|---|---|---|---|\n"
+        f"| {sym} | Long {side_label} | {strike:g} | {expiry} | ${entry:.2f} | {limit_cell} | "
+        f"{stop_cell} | {qty} | ${dollar_risk:,.0f} | {breakeven:.2f} |"
+    )
+    steps = (
+        f"**How to place it on {broker}:**\n"
+        f"1. Open {broker} and pull up the {sym} options chain.\n"
+        f"2. Select the {expiry} expiration.\n"
+        f"3. Choose the {strike:g} {side_label} (buy to open).\n"
+        f"4. Order type: Limit at ${limit_price:.2f} (about {LIMIT_BUFFER_PCT:g}% above the ask to fill).\n"
+        f"5. Quantity: {qty} contract{'s' if qty != 1 else ''}.\n"
+        f"6. Set a stop-loss to sell if the premium falls to ${stop_price:.2f} "
+        f"(your {stop_pct:g}% stop).\n"
+        f"7. Review — max risk about ${dollar_risk:,.0f} — then submit."
+    )
+
+    bias_phrase = {"bullish": "leaning bullish", "bearish": "leaning bearish",
+                   "neutral": "no clear direction, defaulting long-call"}[bias if bias in ("bullish", "bearish") else "neutral"]
+    iv_phrase = {"RICH": " IV is rich, so size down", "CHEAP": " IV is cheap, good for buying premium",
+                 "FAIR": "", "UNKNOWN": ""}.get(verdict, "")
+    if qty > 0:
+        spoken = (
+            f"{sym} is {bias_phrase}. I'd look at {qty} of the {strike:g} {side_label.lower()}s "
+            f"expiring {expiry}, a limit around ${limit_price:.2f}, stop at ${stop_price:.2f}, "
+            f"max risk ${dollar_risk:,.0f}.{iv_phrase} "
+            "Want me to set a stop alert on it, and tell me once you've placed it?"
+        )
+        # Stash the proposed trade so the next turn can act on a yes/placed reply.
+        websocket.scope["hal_pending_trade"] = {
+            "symbol": sym, "side": side, "strike": strike, "expiry": expiry,
+            "entry": entry, "limit_price": limit_price, "stop_price": stop_price,
+            "qty": qty, "dollar_risk": dollar_risk, "option_ticker": option_ticker,
+        }
+    else:
+        spoken = (
+            f"{sym} is {bias_phrase}, but I sized it to zero contracts. {zero_note} "
+            "See the trade table on screen."
+        )
+        websocket.scope.pop("hal_pending_trade", None)
+    summary = f"**{sym} trade idea** — {bias_phrase}{(', ' + verdict.lower() + ' IV') if verdict not in ('UNKNOWN','FAIR') else ''}."
+    full_md = f"{summary}\n\n{table}\n\n{steps}"
+    if zero_note:
+        full_md += f"\n\n⚠️ {zero_note}"
+    if bt_line:
+        full_md += f"\n\n_{bt_line}_"
+    return spoken, full_md
+
+
+_FOLLOWUP_ALERT = re.compile(
+    r"\b(set (the |an? )?alert|alert me|yes|yeah|yep|sure|ok|okay|please do|do it|go ahead)\b",
+    re.IGNORECASE,
+)
+_FOLLOWUP_PLACED = re.compile(
+    r"\b(placed|filled|i'?m in|bought|done|i put it on|entered|executed|took it|in the trade)\b",
+    re.IGNORECASE,
+)
+_FOLLOWUP_DECLINE = re.compile(
+    r"\b(no|nope|skip|cancel|never ?mind|forget it|don'?t)\b", re.IGNORECASE,
+)
+
+
+def _match_trade_followup(text: str) -> str | None:
+    """Classify a reply to HAL's post-trade question. 'placed' takes priority
+    (it implies yes), then decline, then alert/affirmative."""
+    if not text:
+        return None
+    if _FOLLOWUP_PLACED.search(text):
+        return "placed"
+    if _FOLLOWUP_DECLINE.search(text):
+        return "decline"
+    if _FOLLOWUP_ALERT.search(text):
+        return "alert"
+    return None
+
+
+def _set_trade_stop_alert(trade: dict) -> str:
+    """Create a real price-cross alert at the trade's stop level on the option
+    contract (falls back to the underlying). Returns a spoken confirmation."""
+    sym = trade.get("symbol", "?")
+    stop = trade.get("stop_price") or 0
+    opt = trade.get("option_ticker") or ""
+    # Prefer alerting on the option premium; fall back to the underlying.
+    if opt:
+        sub = market.tool_subscribe_market("T", opt, note=f"{sym} trade stop")
+        target, level_desc = opt, f"premium hits ${stop:.2f}"
+    else:
+        sub = market.tool_subscribe_market("T", f"O:{sym}*", note=f"{sym} trade stop")
+        target, level_desc = sym, f"${stop:.2f}"
+    if sub.get("error"):
+        return f"I couldn't open the feed for the alert: {sub['error']}"
+    rule = market.tool_add_alert_rule(
+        sub["subscription_id"], "price_cross",
+        {"price": stop, "direction": "below"},
+        note=f"{sym} stop", cooldown_seconds=300,
+    )
+    if rule.get("error"):
+        return f"I couldn't set the alert: {rule['error']}"
+    return f"Alert set — I'll shout if {target} {level_desc}."
 
 
 def _eastern_now() -> tuple[datetime, str]:
@@ -1915,6 +2419,18 @@ async def agent_loop(
     images = [a["content"] for a in attachments if a["kind"] == "image"]
 
     full_user_content = _maybe_inject_trade_primer(user_text)
+    # Fallback path only: matched trade-idea questions with a ticker are handled
+    # by the deterministic build_trade_reco route in process_turn (which never
+    # blanks). This injection is for trade-ish messages that slip through to the
+    # model — keep it light so the model doesn't blank under think:False.
+    if full_user_content != user_text:
+        risk = websocket.scope.get("hal_risk")
+        try:
+            full_user_content += _format_risk_context(risk)
+        except Exception:
+            pass
+        broker = risk.get("broker") if isinstance(risk, dict) else None
+        full_user_content += _format_trade_directive(broker)
     if text_context:
         full_user_content = f"{full_user_content}\n\n{text_context}".strip()
 
@@ -2052,6 +2568,10 @@ async def agent_loop(
                 if not content:
                     raw = msg.get("content", "")
                     print(f"[agent] EMPTY turn (no tool_calls). raw_len={len(raw)} raw={raw[:500]!r}")
+                    # Never go silent — an empty reply hangs the turn (no audio,
+                    # state never leaves 'speaking'). Speak a graceful fallback.
+                    content = ("I didn't catch a clear answer for that one, Jeffery. "
+                               "Try rephrasing, or ask me about the chart, a trade, or a backtest.")
                 new_history = history + [
                     {"role": "user", "content": history_user_content},
                     {"role": "assistant", "content": content},
@@ -2088,6 +2608,14 @@ def _strip_code_for_tts(text: str) -> str:
         r"```[a-zA-Z0-9_-]*\n?[\s\S]*?```",
         " ... code block follows on screen ... ",
         text,
+    )
+    # Collapse Markdown pipe-table rows (and their |---| separators) to a short
+    # spoken marker so HAL doesn't read "pipe Symbol pipe Side" aloud.
+    text = re.sub(
+        r"(?:^[ \t]*\|.*\n?)+",
+        " See the trade table on screen. ",
+        text,
+        flags=re.MULTILINE,
     )
     text = re.sub(r"`([^`\n]+)`", r"\1", text)
     return text
@@ -2302,6 +2830,81 @@ async def process_turn(
                 new_history = new_history[-MAX_HISTORY_MESSAGES:]
             return new_history
 
+        # Index comparison sweep: "backtest the indexes" / "compare the indexes"
+        # runs the set and shows a ranked table. Checked BEFORE the single-symbol
+        # route (which would otherwise catch the bare "backtest" and default SPY).
+        if (_BACKTEST_INTENT.search(user_text)
+                and not _match_close_view_intent(user_text)
+                and re.search(
+                    r"\b(inde(x|xes|ices)|all (the )?indexes|compare)\b",
+                    user_text, re.IGNORECASE)):
+            await websocket.send_json({"state": "processing",
+                                       "text": "Sweeping the indexes (this takes a bit)..."})
+            await _emit_telemetry(websocket, "backtest.sweep",
+                                  ", ".join(backtest.INDEX_SWEEP_SET),
+                                  "Running 12-month backtests across the index set.")
+            try:
+                sweep = await backtest.run_index_sweep(months=12)
+                spoken = backtest.sweep_summary(sweep)
+                table_md = backtest.sweep_table(sweep, months=12)
+            except Exception as e:
+                spoken = f"I could not complete the index sweep, Jeffery. {e}"
+                table_md = ""
+            await stream_sentence(spoken)
+            assistant_content = table_md or spoken
+            new_history = history + [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": assistant_content},
+            ]
+            if on_reply:
+                try:
+                    await on_reply(new_history)
+                except Exception as e:
+                    print(f"[turn] on_reply failed: {e}")
+            print(f"[hal] index sweep: {spoken!r}")
+            await _emit_telemetry(websocket, "backtest.sweep", "done", spoken, status="ok")
+            await websocket.send_json({"state": "done"})
+            if len(new_history) > MAX_HISTORY_MESSAGES:
+                new_history = new_history[-MAX_HISTORY_MESSAGES:]
+            return new_history
+
+        # Deterministic backtest route: run the strategy backtester directly
+        # and push an equity-curve view (see _match_backtest_intent).
+        bt_symbol = _match_backtest_intent(user_text)
+        if bt_symbol:
+            # Index proxies get the quick 12-month scan; other symbols 24mo.
+            bt_months = 12 if bt_symbol in _INDEX_QUICK_SYMBOLS else 24
+            await websocket.send_json({"state": "processing", "text": f"Backtesting {bt_symbol} ({bt_months}mo)..."})
+            try:
+                result = await backtest.run_backtest(bt_symbol, months=bt_months)
+                spoken = backtest.speak_summary(result)
+                await websocket.send_json({
+                    "action": "open_view", "kind": "backtest",
+                    "backtest": backtest.equity_payload(result),
+                })
+            except Exception as e:
+                import traceback
+                detail = str(e) or f"{type(e).__name__}"
+                print(f"[backtest] {bt_symbol} failed: {type(e).__name__}: {e}")
+                traceback.print_exc()
+                spoken = f"I could not complete that backtest, Jeffery. {detail}"
+            await stream_sentence(spoken)
+            new_history = history + [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": spoken},
+            ]
+            if on_reply:
+                try:
+                    await on_reply(new_history)
+                except Exception as e:
+                    print(f"[turn] on_reply failed: {e}")
+            print(f"[hal] {spoken!r}")
+            await _emit_telemetry(websocket, "backtest", bt_symbol, spoken, status="ok")
+            await websocket.send_json({"state": "done"})
+            if len(new_history) > MAX_HISTORY_MESSAGES:
+                new_history = new_history[-MAX_HISTORY_MESSAGES:]
+            return new_history
+
         # Deterministic chart route: render directly instead of relying on the
         # model to emit a show_chart tool call (see _match_chart_intent).
         chart_req = _match_chart_intent(user_text)
@@ -2333,6 +2936,80 @@ async def process_turn(
                 new_history = new_history[-MAX_HISTORY_MESSAGES:]
             return new_history
 
+        # Deterministic trade follow-up: if a trade was just proposed, handle a
+        # yes/placed/no reply directly (set the stop alert, log the fill, or
+        # drop it) instead of routing to the model.
+        pending = websocket.scope.get("hal_pending_trade")
+        if pending:
+            fu = _match_trade_followup(user_text)
+            if fu:
+                psym = pending.get("symbol", "the trade")
+                await _emit_telemetry(
+                    websocket, "trade.followup", f"reply classified: {fu}",
+                    f"Pending {psym} {pending.get('strike','?')} "
+                    f"{pending.get('side','?')} -> action: {fu}.",
+                )
+                if fu == "alert":
+                    spoken = _set_trade_stop_alert(pending)
+                elif fu == "placed":
+                    alert_msg = _set_trade_stop_alert(pending)
+                    spoken = f"Got it — logged you in {psym}. {alert_msg}"
+                    websocket.scope.pop("hal_pending_trade", None)
+                else:  # decline
+                    spoken = f"No problem, I'll leave {psym} alone."
+                    websocket.scope.pop("hal_pending_trade", None)
+                await stream_sentence(spoken)
+                new_history = history + [
+                    {"role": "user", "content": user_text},
+                    {"role": "assistant", "content": spoken},
+                ]
+                if on_reply:
+                    try:
+                        await on_reply(new_history)
+                    except Exception as e:
+                        print(f"[turn] on_reply failed: {e}")
+                print(f"[hal] trade follow-up ({fu}): {spoken!r}")
+                await _emit_telemetry(websocket, "trade_followup", fu, spoken, status="ok")
+                await websocket.send_json({"state": "done"})
+                if len(new_history) > MAX_HISTORY_MESSAGES:
+                    new_history = new_history[-MAX_HISTORY_MESSAGES:]
+                return new_history
+
+        # Deterministic trade route: build a sized long call/put + table in
+        # Python so HAL never blanks on a trade question (the model returns ''
+        # under think:False on heavy directives). See build_trade_reco.
+        trade_sym = _match_trade_intent(user_text)
+        if trade_sym:
+            spoken, full_md = await build_trade_reco(
+                trade_sym, websocket.scope.get("hal_risk"), websocket
+            )
+            # If a chart is open, close it so the trade-setup table is front and
+            # center in the transcript (the chart -> trade transition the user
+            # expects). Only fires when a chart is actually up.
+            if websocket.scope.get("hal_chart") is not None:
+                try:
+                    await run_open_view_tool({"kind": "off"}, websocket)
+                    websocket.scope.pop("hal_chart", None)
+                except Exception as e:
+                    print(f"[trade] view close failed: {e}")
+            await stream_sentence(spoken)
+            assistant_content = full_md or spoken
+            new_history = history + [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": assistant_content},
+            ]
+            if on_reply:
+                try:
+                    await on_reply(new_history)
+                except Exception as e:
+                    print(f"[turn] on_reply failed: {e}")
+            print(f"[hal] trade reco for {trade_sym}: {spoken!r}")
+            await _emit_telemetry(websocket, "trade", trade_sym, assistant_content, status="ok")
+            await websocket.send_json({"state": "done"})
+            if len(new_history) > MAX_HISTORY_MESSAGES:
+                new_history = new_history[-MAX_HISTORY_MESSAGES:]
+            return new_history
+
         # Deterministic chart Q&A: answer questions about the displayed chart
         # from the stored analysis (the model is unreliable / context-limited).
         active_chart = websocket.scope.get("hal_chart")
@@ -2357,6 +3034,40 @@ async def process_turn(
                 if len(new_history) > MAX_HISTORY_MESSAGES:
                     new_history = new_history[-MAX_HISTORY_MESSAGES:]
                 return new_history
+            # Actionable trade request while a chart is open -> build the real
+            # sized trade (which closes the chart and shows the table), using
+            # the chart's symbol. Broader than _match_trade_intent so phrases
+            # like "show me the trade" / "what position should I put here" work.
+            if _is_chart_trade_request(user_text):
+                csym = active_chart.get("symbol")
+                if csym:
+                    spoken, full_md = await build_trade_reco(
+                        csym, websocket.scope.get("hal_risk"), websocket
+                    )
+                    # Close the chart so the trade-setup table is front and
+                    # center in the transcript (the transition the user expects).
+                    try:
+                        await run_open_view_tool({"kind": "off"}, websocket)
+                        websocket.scope.pop("hal_chart", None)
+                    except Exception as e:
+                        print(f"[trade] view close failed: {e}")
+                    await stream_sentence(spoken)
+                    assistant_content = full_md or spoken
+                    new_history = history + [
+                        {"role": "user", "content": user_text},
+                        {"role": "assistant", "content": assistant_content},
+                    ]
+                    if on_reply:
+                        try:
+                            await on_reply(new_history)
+                        except Exception as e:
+                            print(f"[turn] on_reply failed: {e}")
+                    print(f"[hal] chart trade reco for {csym}: {spoken!r}")
+                    await _emit_telemetry(websocket, "trade", csym, assistant_content, status="ok")
+                    await websocket.send_json({"state": "done"})
+                    if len(new_history) > MAX_HISTORY_MESSAGES:
+                        new_history = new_history[-MAX_HISTORY_MESSAGES:]
+                    return new_history
             chart_answer = _answer_chart_question(user_text, active_chart)
             if chart_answer:
                 await stream_sentence(chart_answer)
@@ -2599,6 +3310,10 @@ async def voice_interface(websocket: WebSocket):
                     continue
 
                 cmd = command.get("command")
+                # Latest position-sizing settings ride along on text/stop
+                # commands; stash them so agent_loop can size trades.
+                if isinstance(command.get("risk"), dict):
+                    websocket.scope["hal_risk"] = command["risk"]
                 if cmd == "start":
                     is_listening = True
                     audio_buffer = bytearray()
