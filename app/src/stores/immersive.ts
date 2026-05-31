@@ -5,7 +5,7 @@
 import { create } from "zustand";
 import { openRearCamera, openScreenShare } from "@/lib/vision";
 import { useConnection } from "@/stores/connection";
-import type { ImmersiveSource, ChartPayload } from "@/types";
+import type { ImmersiveSource, ChartPayload, BacktestPayload } from "@/types";
 
 export interface Thought {
   id: number;
@@ -21,6 +21,7 @@ interface ImmersiveState {
   videoUrl: string | null;
   mapQuery: string;
   chart: ChartPayload | null;
+  backtest: BacktestPayload | null;
   chartZoom: { from?: number; to?: number; reset?: boolean; nonce: number } | null;
   thoughts: Thought[];
   /** Frame-capture callback registered by ImmersiveStage. Returns a base64
@@ -32,7 +33,7 @@ interface ImmersiveState {
   exit: () => void;
   setSource: (
     src: ImmersiveSource,
-    payload?: { url?: string; query?: string; chart?: ChartPayload },
+    payload?: { url?: string; query?: string; chart?: ChartPayload; backtest?: BacktestPayload },
   ) => Promise<void>;
   setMapQuery: (q: string) => void;
   setChartZoom: (z: { from?: number; to?: number; reset?: boolean }) => void;
@@ -60,6 +61,7 @@ export const useImmersive = create<ImmersiveState>((set, get) => ({
   videoUrl: null,
   mapQuery: "New York, NY",
   chart: null,
+  backtest: null,
   chartZoom: null,
   thoughts: [],
   frameProvider: null,
@@ -74,17 +76,8 @@ export const useImmersive = create<ImmersiveState>((set, get) => ({
     set({ active: true });
     get().pushThought("note", "Immersive mode engaged.");
     if (get().source === "off") await get().setSource("camera");
-    // Auto-start the mic so HAL is hands-free in immersive mode. The
-    // connection store's drain handler will keep restarting it after each
-    // reply (see maybeReturnToIdle in connection.ts).
-    try {
-      const conn = useConnection.getState();
-      if (!conn.recording && conn.mode !== "listening") {
-        await conn.startRecording();
-      }
-    } catch (err) {
-      get().pushThought("note", `Auto-mic failed: ${(err as Error).message}`);
-    }
+    // Push-to-talk: do NOT auto-start the mic on entering immersive. The user
+    // holds the mic button to talk in every mode — no surprise hot mic.
   },
 
   exit() {
@@ -144,6 +137,14 @@ export const useImmersive = create<ImmersiveState>((set, get) => ({
         }
         set({ source: "chart", chart });
         get().pushThought("note", `Source: chart · ${chart.symbol} ${chart.timeframe}`);
+      } else if (src === "backtest") {
+        const backtest = payload?.backtest ?? get().backtest;
+        if (!backtest) {
+          get().pushThought("note", "Backtest source requires a payload.");
+          return;
+        }
+        set({ source: "backtest", backtest });
+        get().pushThought("note", `Source: backtest · ${backtest.underlying}`);
       }
     } catch (err) {
       get().pushThought("note", `Source error: ${(err as Error).message}`);

@@ -9,6 +9,7 @@ import { pickSupportedMimeType } from "@/lib/vision";
 import { HalSocket, defaultWsUrl } from "@/lib/ws";
 import { useImmersive } from "@/stores/immersive";
 import { useUi } from "@/stores/ui";
+import { usePositionSizing } from "@/stores/positionSizing";
 import type {
   Attachment,
   ChatMessage,
@@ -40,7 +41,7 @@ interface ConnectionState {
 
 interface ConnectionActions {
   init: () => Promise<void>;
-  startRecording: () => Promise<void>;
+  startRecording: (pushToTalk?: boolean) => Promise<void>;
   stopRecording: () => void;
   abort: () => Promise<void>;
   wipe: () => Promise<void>;
@@ -64,6 +65,18 @@ const STATE_LABELS: Record<Mode, string[]> = {
 function pickLabel(mode: Mode): string {
   const opts = STATE_LABELS[mode];
   return opts[Math.floor(Math.random() * opts.length)];
+}
+
+// Current position-sizing settings, sent with each turn so HAL can size
+// trades to Jeffery's account and risk rules.
+function riskPayload() {
+  const s = usePositionSizing.getState();
+  return {
+    accountSize: s.accountSize,
+    maxRiskPct: s.maxRiskPct,
+    stopLossPct: s.stopLossPct,
+    broker: s.broker,
+  };
 }
 
 // Module-scoped infra. We keep this OUT of zustand state to avoid React
@@ -106,11 +119,11 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
     function maybeReturnToIdle() {
       if (!streamDone || audio.playing) return;
       setMode("idle", "DORMANT");
-      // In immersive mode, the mic loops: HAL just finished speaking, so
-      // open the ears again automatically. Tiny delay lets the UI settle
-      // before we flip back to "listening".
+      // Push-to-talk everywhere: HAL never re-opens the mic on its own. The
+      // user holds the mic button to talk and releases to send, in every mode
+      // (including immersive). No auto-listen loop — that felt unnatural.
       try {
-        if (useImmersive.getState().active && !get().recording) {
+        if (false) {
           window.setTimeout(() => {
             const stillImmersive = useImmersive.getState().active;
             const stillIdle = get().mode === "idle";
@@ -167,6 +180,11 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
           if (kind === "chart") {
             // Set the chart source first so enter() doesn't flash the camera.
             await immersive.setSource("chart", { chart });
+            if (!immersive.active) await immersive.enter();
+            return;
+          }
+          if (kind === "backtest") {
+            await immersive.setSource("backtest", { backtest: msg.backtest });
             if (!immersive.active) await immersive.enter();
             return;
           }
@@ -248,7 +266,7 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
         }
       },
 
-      async startRecording() {
+      async startRecording(pushToTalk = false) {
         if (get().mode === "listening") {
           // Already listening — caller is using button as a toggle.
           get().stopRecording();
@@ -322,6 +340,7 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
               // snaps don't. Match that.
               vision_mode: attachments.length > 0 ? "fast" : undefined,
               attachments: attachments.length > 0 ? attachments : undefined,
+              risk: riskPayload(),
             });
             try {
               micStream?.getTracks().forEach((t) => t.stop());
@@ -336,12 +355,17 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
           set({ recording: true });
           setMode("listening", "RECEIVING");
 
-          // VAD ends the recording automatically after a silence window.
-          vad = new Vad(() => get().stopRecording(), {
-            rmsThreshold: 0.018,
-            silenceMs: 1200,
-          });
-          vad.start(micStream);
+          // Push-to-talk: the user holds the button and releases to send, so
+          // we do NOT auto-end on silence (they may pause mid-thought). The
+          // button's onPointerUp calls stopRecording(). Click-toggle / immersive
+          // hands-free mode keeps the silence-based VAD cutoff.
+          if (!pushToTalk) {
+            vad = new Vad(() => get().stopRecording(), {
+              rmsThreshold: 0.018,
+              silenceMs: 1200,
+            });
+            vad.start(micStream);
+          }
         } catch (err) {
           console.error("startRecording:", err);
           setMode("idle", "ERROR", (err as Error).message);
@@ -394,6 +418,7 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
             content: a.content,
           })),
           model_mode: get().fastMode ? "fast" : undefined,
+          risk: riskPayload(),
         });
         get().appendOptimisticUser(
           trimmed ||

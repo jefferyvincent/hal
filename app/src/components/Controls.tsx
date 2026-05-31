@@ -52,9 +52,14 @@ export default function Controls() {
   const enterImmersive = useImmersive((s) => s.enter);
   const exitImmersive = useImmersive((s) => s.exit);
 
-  const onMicClick = () => {
+  // Push-to-talk: press and hold to talk, release to send. Pointer events
+  // cover mouse, touch, and pen. We start on press (push-to-talk mode = no
+  // silence auto-cutoff) and stop on release/leave.
+  const onMicDown = () => {
+    if (!recording) void startRecording(true);
+  };
+  const onMicUp = () => {
     if (recording) stopRecording();
-    else void startRecording();
   };
 
   return (
@@ -123,10 +128,13 @@ export default function Controls() {
           dramatically when actually recording. */}
       <button
         type="button"
-        title={recording ? "Stop listening" : "Talk to HAL"}
-        onClick={onMicClick}
+        title={recording ? "Release to send" : "Hold to talk"}
+        onPointerDown={onMicDown}
+        onPointerUp={onMicUp}
+        onPointerLeave={() => { if (recording) onMicUp(); }}
+        onContextMenu={(e) => e.preventDefault()}
         className={cn(
-          "flex h-20 w-20 items-center justify-center rounded-full border transition-all",
+          "touch-none select-none flex h-20 w-20 items-center justify-center rounded-full border transition-all",
           recording || mode === "listening"
             ? "animate-pulse border-2 border-hal-red bg-hal-red/40 text-white shadow-[0_0_40px_rgba(255,30,30,0.7)]"
             : "border-hal-red/35 bg-hal-red/[0.06] text-hal-text hover:border-hal-red hover:bg-hal-red/25 hover:text-white hover:shadow-[0_0_30px_rgba(255,30,30,0.45)]",

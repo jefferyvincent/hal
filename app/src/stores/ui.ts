@@ -3,10 +3,12 @@ import { create } from "zustand";
 interface UiState {
   conversationsOpen: boolean;
   telemetryHidden: boolean;
+  positionSizingOpen: boolean;
   chatOpen: boolean;
   fullscreenChat: boolean;
   toggleConversations: () => void;
   setTelemetryHidden: (hidden: boolean) => void;
+  togglePositionSizing: () => void;
   toggleChatOpen: () => void;
   setChatOpen: (open: boolean) => void;
   toggleFullscreenChat: () => void;
@@ -15,6 +17,7 @@ interface UiState {
 export const useUi = create<UiState>((set) => ({
   conversationsOpen: false,
   telemetryHidden: true,
+  positionSizingOpen: false,
   // Chat is hidden by default so the eye sits alone, uncluttered. The
   // Chat button in Controls toggles it on; closing also drops fullscreen.
   chatOpen: false,
@@ -25,11 +28,13 @@ export const useUi = create<UiState>((set) => ({
 
   setTelemetryHidden: (hidden) => set({ telemetryHidden: hidden }),
 
+  togglePositionSizing: () =>
+    set((s) => ({ positionSizingOpen: !s.positionSizingOpen })),
+
   toggleChatOpen: () =>
     set((s) => {
       const next = !s.chatOpen;
       if (!next) {
-        // Closing chat also exits fullscreen mode.
         document.body.classList.remove("fullscreen-chat");
         return { chatOpen: false, fullscreenChat: false };
       }

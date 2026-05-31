@@ -49,9 +49,11 @@ export interface ServerEnvelope {
   zoom_from?: number;
   zoom_to?: number;
   zoom_reset?: boolean;
+  /** Backtest equity-curve payload (action="open_view", kind="backtest"). */
+  backtest?: BacktestPayload;
 }
 
-export type ImmersiveSource = "off" | "camera" | "screen" | "map" | "video" | "chart";
+export type ImmersiveSource = "off" | "camera" | "screen" | "map" | "video" | "chart" | "backtest";
 
 /** Candlestick chart payload built server-side by charting.py. Times are
  *  unix SECONDS (lightweight-charts UTCTimestamp). */
@@ -65,4 +67,15 @@ export interface ChartPayload {
   supertrend_down: { time: number; value: number }[];
   markers: { time: number; side: "buy" | "sell" }[];
   levels: { price: number; kind: "support" | "resistance"; label: string }[];
+}
+
+/** Backtest equity-curve payload built server-side by backtest.py. Times
+ *  (t) are unix SECONDS. */
+export interface BacktestPayload {
+  kind: "backtest";
+  underlying: string;
+  strategy: string;
+  equity: { t: number; value: number }[];
+  metrics: Record<string, number | null>;
+  by_regime: Record<string, { trades: number; win_rate: number; avg_pnl: number }>;
 }

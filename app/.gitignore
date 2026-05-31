@@ -8,3 +8,9 @@ dist-ssr
 # Tauri
 src-tauri/target
 src-tauri/Cargo.lock
+
+# Vite transpiles the config to a temp .mjs on each start/build and is meant
+# to delete it; OneDrive file locks make that cleanup fail, orphaning these.
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+*.tsbuildinfo
