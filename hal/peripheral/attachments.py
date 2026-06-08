@@ -1,7 +1,7 @@
 """Normalize and format user-supplied attachments (text + images) for a turn."""
 from __future__ import annotations
 
-from config import MAX_ATTACHMENT_COUNT, MAX_ATTACHMENT_TEXT_CHARS
+from hal.brainstem.config import MAX_ATTACHMENT_COUNT, MAX_ATTACHMENT_TEXT_CHARS
 
 
 def _normalize_attachments(raw: list | None) -> list[dict]:

@@ -26,6 +26,13 @@ def _eastern_now() -> tuple[datetime, str]:
     return et, ("EDT" if is_dst else "EST")
 
 
+def is_regular_hours() -> bool:
+    """True during the US regular equity session (Mon-Fri 9:30-16:00 ET).
+    Used to gate the price-alert poller. Holidays are not accounted for."""
+    et, _ = _eastern_now()
+    return _market_session(et) == "OPEN (regular hours)"
+
+
 def _market_session(et: datetime) -> str:
     """US equity/options session label for a given Eastern time. Time-of-day +
     weekday only; market holidays are not accounted for."""

@@ -321,16 +321,19 @@ class ClientRegistry:
                 self._delivers.remove(deliver)
 
     async def broadcast(self, message: str, payload: dict) -> int:
+        # Single-user app: deliver ONLY to the most recently registered client
+        # (the live UI). Stale registrations linger briefly across reconnects,
+        # and delivering to all of them makes HAL speak the alert more than once.
         async with self._lock:
-            targets = list(self._delivers)
-        delivered = 0
-        for d in targets:
-            try:
-                await d(message, payload)
-                delivered += 1
-            except Exception as e:
-                print(f"[market] alert delivery failed: {e}")
-        return delivered
+            target = self._delivers[-1] if self._delivers else None
+        if target is None:
+            return 0
+        try:
+            await target(message, payload)
+            return 1
+        except Exception as e:
+            print(f"[market] alert delivery failed: {e}")
+            return 0
 
 
 clients = ClientRegistry()
@@ -535,6 +538,102 @@ class SubscriptionManager:
 
 
 manager = SubscriptionManager()
+
+
+# --- Yahoo price-alert poller ----------------------------------------------
+# The live WS feed (FEED_HOST/options) only ticks options contracts, so the
+# SubscriptionManager above never fires price_cross / pct_move rules on an
+# underlying stock. This poller fills that gap: every POLL_SECONDS during
+# regular hours it pulls each rule's symbol price from Yahoo and runs the very
+# same evaluate_rule + record_alert + clients.broadcast path the WS uses.
+
+class YahooAlertPoller:
+    def __init__(self, poll_seconds: float = 15.0) -> None:
+        self._task: Optional[asyncio.Task] = None
+        self._stop = asyncio.Event()
+        self._poll_seconds = poll_seconds
+        # Per-rule evaluation state (last_price / baseline / cooldown), kept
+        # across polls so price_cross can detect an actual crossing.
+        self._states: dict[int, RuleState] = {}
+
+    async def start(self) -> None:
+        if self._task and not self._task.done():
+            return
+        self._stop.clear()
+        self._task = asyncio.create_task(self._run(), name="yahoo-alert-poller")
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._task:
+            try:
+                await asyncio.wait_for(self._task, timeout=3)
+            except (asyncio.TimeoutError, Exception):
+                pass
+
+    async def _run(self) -> None:
+        from hal.cerebellum import markettime
+        print(f"[alert-poll] started ({self._poll_seconds:.0f}s, regular hours)")
+        while not self._stop.is_set():
+            try:
+                if markettime.is_regular_hours():
+                    await self._poll_once()
+            except Exception as e:
+                print(f"[alert-poll] error: {e}")
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=self._poll_seconds)
+            except asyncio.TimeoutError:
+                pass
+        print("[alert-poll] stopped")
+
+    async def _poll_once(self) -> None:
+        from hal.motor import charting
+        rules = list_rules_with_subs(active_only=True)
+        # Only price rules can be evaluated from a snapshot price; volume rules
+        # need per-trade size, which the poll can't provide.
+        rules = [r for r in rules if r["rule_type"] in ("pct_move", "price_cross")]
+        if not rules:
+            self._states.clear()
+            return
+        live_ids = {r["rule_id"] for r in rules}
+        self._states = {rid: s for rid, s in self._states.items() if rid in live_ids}
+
+        prices = await charting.current_prices([r["symbol"] for r in rules])
+        for r in rules:
+            sym = r["symbol"]
+            price = prices.get(sym)
+            if price is None:
+                continue
+            st = self._states.get(r["rule_id"])
+            if st is None:
+                st = RuleState(
+                    rule_id=r["rule_id"],
+                    sub_id=r["subscription_id"],
+                    channel=r["channel"],
+                    symbol_pattern=sym,
+                    rule_type=r["rule_type"],
+                    config=json.loads(r["config"]),
+                    cooldown_seconds=r["cooldown_seconds"],
+                )
+                self._states[r["rule_id"]] = st
+            else:
+                st.config = json.loads(r["config"])
+                st.cooldown_seconds = r["cooldown_seconds"]
+            # Synthetic trade message so _msg_price returns our polled price.
+            msg = {"ev": st.channel, "sym": sym, "p": price, "c": price, "src": "yahoo"}
+            try:
+                fired = evaluate_rule(st, msg)
+            except Exception as e:
+                print(f"[alert-poll] rule {st.rule_id} eval error: {e}")
+                continue
+            if fired:
+                event_id = record_alert(st.rule_id, msg, fired)
+                delivered = await clients.broadcast(fired, {"event_id": event_id, **msg})
+                if delivered > 0:
+                    mark_alert_spoken(event_id)
+                print(f"[alert-poll] fired (rule {st.rule_id}, delivered={delivered}): {fired}")
+
+
+alert_poller = YahooAlertPoller()
 
 
 # --- HAL-facing tool entry points -----------------------------------------

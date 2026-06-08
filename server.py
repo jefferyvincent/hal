@@ -2,13 +2,14 @@
 # config MUST be imported before torch / faster-whisper / piper: importing it
 # runs the environment bootstrap (COQUI_TOS, FFmpeg DLL directory, UTF-8
 # stdout/stderr, .env loading) those libraries depend on. Keep it first.
-from config import (
+from hal.brainstem.config import (
     MASSIVE_API_KEY, MASSIVE_BASE_URL, OLLAMA_URL, OLLAMA_MODEL,
     OLLAMA_FAST_MODEL, OLLAMA_VISION_MODEL, OLLAMA_VISION_FAST_MODEL,
     HAL_REFERENCE_WAV, PIPER_VOICE_PATH,
     WHISPER_MODEL_SIZE, WHISPER_PROMPT, DEVICE, SCRATCH_DIR,
     DB_PATH, MAX_HISTORY_MESSAGES, MAX_TITLE_CHARS,
     MAX_TOOL_OUTPUT_CHARS, MAX_AGENT_ITERATIONS, AUTO_APPROVE_TOOLS,
+    NEWS_POLL_SECONDS, NEWS_PRIMARY_FEED, CHART_DATA_SOURCE,
 )
 
 import os
@@ -21,31 +22,58 @@ import sys
 import tempfile
 import time
 import wave
+from datetime import date, timedelta
 from pathlib import Path
 
 import httpx
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from faster_whisper import WhisperModel
 from piper import PiperVoice
 
-import market
-import analysis
-import charting
-import backtest
-import option_strategy
-from symbols import _resolve_company_name, _resolve_symbol
-from markettime import _options_date_context
-from attachments import (
+from hal.sensory import market
+from hal.sensory import news
+from hal.sensory import watchlist
+from hal.cortex import analysis
+from hal.motor import charting
+from hal.cerebellum import backtest
+from hal.cerebellum import option_strategy
+from hal.peripheral import mcp_client
+from hal.cerebellum.symbols import _resolve_company_name, _resolve_symbol
+from hal.cerebellum.markettime import _options_date_context
+from hal.peripheral.attachments import (
     _normalize_attachments,
     _format_text_attachments,
     _attachment_summary,
 )
 
-from prompts import HAL_SYSTEM_PROMPT, TOOLS
-from persistence import (
+from hal.cortex.prompts import HAL_SYSTEM_PROMPT, TOOLS
+from hal.hippocampus import vault as _vault
+from hal.cortex import rag as _rag
+from hal.cortex import cag as _cag
+from hal.cortex.rules import check_trade as _check_trade
+
+# Tools actually advertised to the model. The market/analysis/chart tools
+# (subscribe_market, add_alert_rule, list/unsub/remove/list_alert_history,
+# screen_options, iv_context, recommend_strategy, show_chart) are driven by
+# deterministic routes in process_turn (and build_trade_reco/hold call the
+# analysis functions directly), so they don't need to ride in the model's tool
+# schema every turn — dropping them cuts ~2k prompt tokens, which lets a smaller
+# num_ctx hold real history while spilling fewer 27B layers to CPU (faster
+# replies). query_massive stays so the model can still pull any market data
+# ad-hoc. All handlers in execute_tool remain, so nothing breaks if a route adds
+# one back later.
+_MODEL_TOOL_NAMES = {
+    "run_command", "run_cmd", "run_python", "query_massive",
+    "open_webull", "open_view",
+    "journal_search", "vault_close_trade",
+}
+_MODEL_TOOLS = [
+    t for t in TOOLS if t.get("function", {}).get("name") in _MODEL_TOOL_NAMES
+]
+from hal.hippocampus.persistence import (
     _db, _new_conversation_obj, list_conversations, load_conversation,
     save_conversation, delete_conversation, rename_conversation,
 )
@@ -87,6 +115,23 @@ except Exception as e:
 print(f"[boot] Loading Piper voice {Path(PIPER_VOICE_PATH).stem}...")
 piper_voice = PiperVoice.load(PIPER_VOICE_PATH, use_cuda=False)
 print("[boot] Piper ready (CPU).")
+
+# Slow HAL's cadence slightly — he was reading too fast (length_scale > 1.0 is
+# slower). Built defensively: older Piper builds may lack SynthesisConfig or the
+# kwarg, in which case we fall back to default-speed synthesis.
+TTS_LENGTH_SCALE = 1.15
+try:
+    from piper import SynthesisConfig as _SynthesisConfig  # type: ignore
+except Exception:
+    try:
+        from piper.config import SynthesisConfig as _SynthesisConfig  # type: ignore
+    except Exception:
+        _SynthesisConfig = None
+try:
+    _SYN_CONFIG = _SynthesisConfig(length_scale=TTS_LENGTH_SCALE) if _SynthesisConfig else None
+except Exception:
+    _SYN_CONFIG = None
+print(f"[boot] Piper length_scale={TTS_LENGTH_SCALE if _SYN_CONFIG else 'default'}")
 
 
 def _park_tts() -> None:
@@ -244,14 +289,25 @@ from contextlib import asynccontextmanager
 async def _lifespan(_app: FastAPI):
     market.configure(DB_PATH, MASSIVE_API_KEY)
     analysis.configure(MASSIVE_BASE_URL, MASSIVE_API_KEY)
-    charting.configure(MASSIVE_BASE_URL, MASSIVE_API_KEY)
+    charting.configure(MASSIVE_BASE_URL, MASSIVE_API_KEY, CHART_DATA_SOURCE)
     backtest.configure(MASSIVE_BASE_URL, MASSIVE_API_KEY)
     await market.manager.start()
     print(f"[boot] market manager: {market.manager.url}")
+    await market.alert_poller.start()
+    news.configure(DB_PATH, NEWS_POLL_SECONDS, NEWS_PRIMARY_FEED)
+    watchlist.configure(MASSIVE_BASE_URL, MASSIVE_API_KEY)
+    await news.monitor.start()
+    await mcp_client.start()
+    # Start vault RAG watcher (incremental re-index on file changes)
+    _rag.start_watcher()
+    # Background initial ingest so search works immediately after boot
+    asyncio.get_event_loop().run_in_executor(None, _rag.ingest_vault)
     try:
         yield
     finally:
         await market.manager.stop()
+        await news.monitor.stop()
+        _rag.stop_watcher()
 
 
 app = FastAPI(lifespan=_lifespan)
@@ -272,6 +328,22 @@ async def serve_index():
     )
 
 
+@app.get("/oauth/callback")
+async def oauth_callback(code: str = "", state: str = "", error: str = ""):
+    """OAuth redirect target for MCP server logins. Hands the authorization
+    code back to the in-flight mcp_client.authorize() flow, keyed by state."""
+    if error:
+        body = f"<h2>Authorization failed</h2><p>{error}</p>"
+    elif code and mcp_client.resolve_oauth(state, code):
+        body = "<h2>HAL is authorized.</h2><p>You can close this tab.</p>"
+    else:
+        body = "<h2>No pending authorization.</h2><p>You can close this tab.</p>"
+    return HTMLResponse(
+        f"<html><body style='font-family:system-ui;background:#0a0a0d;"
+        f"color:#c8c8d0;padding:3rem'>{body}</body></html>"
+    )
+
+
 # --- Whisper STT ------------------------------------------------------------
 def _suffix_for_mime(mime: str) -> str:
     m = (mime or "").lower()
@@ -283,6 +355,34 @@ def _suffix_for_mime(mime: str) -> str:
         return ".wav"
     # Default to .webm — also fine if ffmpeg has to sniff.
     return ".webm"
+
+
+def _norm_transcript(s: str) -> str:
+    """Lowercase, drop punctuation, collapse whitespace — for matching against
+    the hallucination blocklist."""
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", (s or "").lower())).strip()
+
+
+# Phrases Whisper invents on silence/noise (YouTube-outro training artifacts).
+# When the WHOLE transcription is just one of these, treat it as silence so HAL
+# doesn't reply (and loop) on "thank you for watching" while the hands-free mic
+# is open in an immersive pane.
+_WHISPER_HALLUCINATIONS = {
+    _norm_transcript(p) for p in (
+        "you", "thank you", "thanks", "thank you very much", "thank you so much",
+        "thanks for watching", "thank you for watching", "thanks for watching everyone",
+        "thank you for watching everyone", "please subscribe", "like and subscribe",
+        "don't forget to subscribe", "subscribe to my channel",
+        "have a great day", "have a good day", "have a nice day", "have a good one",
+        "see you next time", "see you in the next video", "see you", "bye",
+        "bye bye", "goodbye", "okay", "ok", "uh", "um", "hmm", "the", "yeah",
+    )
+}
+
+
+def _is_whisper_hallucination(text: str) -> bool:
+    t = _norm_transcript(text)
+    return t == "" or t in _WHISPER_HALLUCINATIONS
 
 
 async def transcribe(audio_bytes: bytes, mime: str = "") -> str:
@@ -309,7 +409,14 @@ async def transcribe(audio_bytes: bytes, mime: str = "") -> str:
             no_speech_threshold=0.6,
             condition_on_previous_text=False,
         )
-        return " ".join(s.text for s in segments).strip()
+        result = " ".join(s.text for s in segments).strip()
+        # Drop whole-utterance Whisper hallucinations (silence artifacts) so they
+        # read as silence instead of triggering a spurious "you're welcome" reply.
+        if _is_whisper_hallucination(result):
+            if result:
+                print(f"[stt] dropped hallucination: {result!r}")
+            return ""
+        return result
 
     try:
         return await asyncio.to_thread(_run)
@@ -565,10 +672,128 @@ async def run_open_view_tool(args: dict, websocket: WebSocket) -> str:
     return confirm
 
 
-async def render_chart(symbol: str, timeframe: str, websocket: WebSocket) -> tuple[str, dict | None, dict | None]:
+async def _push_watch_snapshot(websocket: WebSocket) -> None:
+    """Send the full subscriptions + news-watch snapshot to the client so the
+    panel updates live. Shared by the ws handler and the news intent routes."""
+    try:
+        subs = await asyncio.to_thread(market.tool_list_subscriptions)
+        events = await asyncio.to_thread(market.list_alert_events, 20)
+        news_watches = await asyncio.to_thread(news.list_watches_db, True)
+        news_articles = await asyncio.to_thread(news.list_recent_articles, 20)
+        await websocket.send_json({
+            "subscriptions": subs.get("subscriptions", []),
+            "subscriptions_connected": bool(subs.get("connected")),
+            "subscriptions_url": subs.get("url", ""),
+            "alert_events": events,
+            "news_watches": news_watches,
+            "news_articles": news_articles,
+        })
+    except Exception as e:
+        print(f"[news] snapshot push failed: {e}")
+
+
+def _vault_write_trade_idea(kind: str, symbol: str, markdown: str,
+                            rules_passed: bool | None = None) -> None:
+    """Write a pinned trade idea / hold check as a vault note (fire-and-forget)."""
+    if not symbol or not markdown:
+        return
+    today = date.today().isoformat()
+    slug = f"{today}-{symbol.upper()}-{kind}"
+    rel = f"Trade-Ideas/{slug}.md"
+    # Extract strategy hint from markdown
+    strat_m = re.search(r"Long (Call|Put|call|put)", markdown)
+    strategy = f"long-{strat_m.group(1).lower()}" if strat_m else kind
+    # Extract entry price
+    entry_m = re.search(r"\|\s*\$([0-9.]+)\s*\|[^|]+\|[^|]+\|[^|]+\|[^|]+\|[^|]+\|", markdown)
+    entry_val = float(entry_m.group(1)) if entry_m else None
+    # Run rule check if rules_passed not already determined
+    if rules_passed is None:
+        try:
+            chk = _check_trade(symbol=symbol.upper(), strategy=strategy, side="long",
+                               reward_risk=None)
+            rules_passed = chk["passed"]
+        except Exception:
+            rules_passed = None
+    fm = {
+        "type": "trade",
+        "symbol": symbol.upper(),
+        "status": "open",
+        "side": "long" if kind == "trade" else "",
+        "strategy": strategy[:80],
+        "opened": today,
+        "closed": None,
+        "entry": entry_val,
+        "exit": None,
+        "pnl": None,
+        "r_multiple": None,
+        "rules_passed": rules_passed,
+        "tags": ["trade", kind],
+    }
+    try:
+        _vault.write_note(rel, fm, markdown)
+        _cag.invalidate()
+    except Exception as e:
+        print(f"[vault] write_note failed for {rel}: {e}")
+
+
+async def _push_trade_idea(websocket: WebSocket, kind: str, symbol: str,
+                           markdown: str) -> None:
+    """Pin a trade reco / hold read in the client's Trade Ideas pane so it
+    doesn't scroll away in the chat. kind: 'trade' | 'hold'. No-op without
+    markdown (the pane shows the table/read, not the bare spoken line)."""
+    if not markdown:
+        return
+    # Write to vault in a background thread (non-blocking, best-effort)
+    asyncio.get_event_loop().run_in_executor(
+        None, _vault_write_trade_idea, kind, symbol, markdown
+    )
+    try:
+        await websocket.send_json({"trade_idea": {
+            "id": f"{symbol or 'idea'}-{int(time.time() * 1000)}",
+            "kind": kind,
+            "symbol": symbol or "—",
+            "markdown": markdown,
+            "ts": time.time(),
+        }})
+    except Exception as e:
+        print(f"[trade_idea] push failed: {e}")
+
+
+# Markers that identify a free-form LLM reply as an actionable trade idea, so it
+# gets pinned in the Trade Ideas pane even when the question didn't hit the
+# deterministic trade route (e.g. "recommend any strategies on Google").
+_TRADE_IDEA_MARKERS = re.compile(
+    r"\b(debit spread|credit spread|put spread|call spread|iron condor|straddle|"
+    r"strangle|covered call|vertical|max loss|break\s?even)\b"
+    r"|\b\d{2,4}\s*/\s*\d{2,4}\b"
+    r"|\b(buy|sell)\b[^.\n]{0,40}\b(call|put)s?\b",
+    re.IGNORECASE)
+
+
+async def _push_idea_if_trade(websocket: WebSocket, user_text: str, reply: str) -> None:
+    """If an LLM reply reads like a trade recommendation, pin it in the Trade
+    Ideas pane (the deterministic routes already pin theirs)."""
+    if not reply or not _TRADE_IDEA_MARKERS.search(reply):
+        return
+    sym = (_resolve_company_name(user_text or "")
+           or _resolve_company_name(reply or ""))
+    if not sym:
+        m = _CHART_TICKERS.search(user_text or "") or _CHART_TICKERS.search(reply or "")
+        if m:
+            sym = m.group(1).upper()
+    if not sym:
+        m2 = re.search(r"\b([A-Z]{2,5})\b", reply or "")
+        sym = m2.group(1) if m2 else ""
+    await _push_trade_idea(websocket, "trade", sym, reply)
+
+
+async def render_chart(symbol: str, timeframe: str, websocket: WebSocket,
+                       refresh: bool = False) -> tuple[str, dict | None, dict | None]:
     """Build a chart payload, attach key levels, push it to the HAL UI, and
     stash the analysis on the connection so HAL can answer questions about it.
-    Returns (status_message, payload-or-None, analysis-or-None)."""
+    With refresh=True it's a silent live update: no "processing" state, a
+    chart_update action (not open_view, so the client doesn't re-enter or log a
+    thought), and no spoken status. Returns (status_message, payload, analysis)."""
     symbol = (symbol or "").strip()
     timeframe = (timeframe or "5m").strip()
     if not symbol:
@@ -577,18 +802,25 @@ async def render_chart(symbol: str, timeframe: str, websocket: WebSocket) -> tup
     # model sometimes passes the name straight through. Falls back to the raw
     # text if resolution turns up nothing.
     symbol = await _resolve_symbol(symbol) or symbol
-    await websocket.send_json({"state": "processing", "text": f"Charting {symbol.upper()} {timeframe}..."})
+    if not refresh:
+        await websocket.send_json({"state": "processing", "text": f"Charting {symbol.upper()} {timeframe}..."})
     try:
         payload = await charting.build_chart(symbol, timeframe)
     except Exception as e:
         return f"Could not chart {symbol.upper()}: {e}", None, None
     analysis = charting.analyze(payload)
     payload["levels"] = analysis.get("levels", [])
+    action = "chart_update" if refresh else "open_view"
+    envelope = {"action": action, "chart": payload}
+    if not refresh:
+        envelope["kind"] = "chart"
     try:
-        await websocket.send_json({"action": "open_view", "kind": "chart", "chart": payload})
+        await websocket.send_json(envelope)
     except Exception as e:
         return f"Could not deliver chart: {e}", None, None
     websocket.scope["hal_chart"] = analysis
+    # Remember what's showing so a chart_refresh command can re-render it.
+    websocket.scope["hal_chart_req"] = {"symbol": payload["symbol"], "timeframe": timeframe}
     return (
         f"Showing {payload['symbol']} {payload['timeframe']} "
         f"({payload['bar_count']} bars). Jeffery sees it now."
@@ -606,6 +838,14 @@ async def run_chart_tool(args: dict, websocket: WebSocket) -> str:
 
 
 async def execute_tool(name: str, args: dict, websocket: WebSocket, abort_event: asyncio.Event) -> str:
+    if name.startswith("mcp__"):
+        result = await mcp_client.call(name, args)
+        bad = result.startswith(("[tool error]", "MCP call failed", "No MCP", "Bad MCP"))
+        await _emit_telemetry(
+            websocket, name, json.dumps(args, default=str)[:300], result,
+            status="error" if bad else "ok",
+        )
+        return result[:MAX_TOOL_OUTPUT_CHARS]
     if name == "run_command":
         return await run_command_tool(args.get("command", ""), websocket, abort_event)
     if name == "run_cmd":
@@ -640,6 +880,48 @@ async def execute_tool(name: str, args: dict, websocket: WebSocket, abort_event:
         return await run_chart_tool(args, websocket)
     if name == "enroll_voice":
         return await run_enroll_voice_tool(args, websocket)
+    if name == "journal_search":
+        results = await _rag.journal_search(
+            query=args.get("query", ""),
+            symbol=args.get("symbol"),
+            type=args.get("type"),
+            status=args.get("status"),
+            k=int(args.get("k", 5)),
+        )
+        if not results:
+            return "No matching journal notes found."
+        lines = []
+        for r in results:
+            fm_line = (
+                f"[{r['rel_path']}] type={r['type']} symbol={r['symbol']} "
+                f"status={r['status']} strategy={r['strategy']} opened={r['opened']}"
+            )
+            lines.append(fm_line)
+            if r["text"]:
+                lines.append(r["text"][:300])
+            lines.append("")
+        return "\n".join(lines)[:MAX_TOOL_OUTPUT_CHARS]
+    if name == "vault_close_trade":
+        sym = (args.get("symbol") or "").upper()
+        if not sym:
+            return "symbol is required"
+        open_notes = _vault.list_notes("Trade-Ideas", type="trade", status="open", symbol=sym)
+        if not open_notes:
+            open_notes = _vault.list_notes("Journal", type="trade", status="open", symbol=sym)
+        if not open_notes:
+            return f"No open trade note found for {sym}."
+        # Most recent open note
+        note = sorted(open_notes, key=lambda n: n["frontmatter"].get("opened", ""), reverse=True)[0]
+        updates = {"status": "closed"}
+        for field in ("exit", "pnl", "r_multiple"):
+            if args.get(field) is not None:
+                updates[field] = args[field]
+        if "closed" not in updates:
+            updates["closed"] = date.today().isoformat()
+        _vault.update_frontmatter(note["rel_path"], updates)
+        _cag.invalidate()
+        pnl_str = f"P&L {args['pnl']:+.2f}" if args.get("pnl") is not None else ""
+        return f"Closed {sym} trade ({note['rel_path']}). {pnl_str}".strip()
     return f"Unknown tool: {name}"
 
 
@@ -967,6 +1249,233 @@ def _match_close_view_intent(text: str) -> bool:
     return bool(text and _CLOSE_VIEW_INTENT.search(text))
 
 
+# --- News-watch & watch-list-panel intents (handled before the LLM) --------
+# These run as deterministic routes (like the chart/backtest routes) because
+# the qwen3 model with think:False is unreliable at calling freshly-added tools
+# (see the charting feature). So news watching is intercepted in process_turn.
+
+# Short words that are <=5 letters and could be misread as a ticker inside a
+# news phrase — never treat these as the symbol.
+_NEWS_STOPWORDS = {
+    "NEWS", "FOR", "ON", "ABOUT", "OF", "THE", "HAL", "ADD", "MY", "TO", "AND",
+    "ME", "AM", "I", "ANY", "NEW", "STOP", "WATCH", "KEEP", "EYE", "AN", "A",
+    "IS", "IT", "OR", "GET", "RID", "NO", "PUT", "PUTS", "CALL", "CALLS", "ALERT",
+    "ALERTS", "LIST", "SHOW", "FROM", "TRACK", "FOLLOW", "PRESS", "WATCHING",
+    "WATCHES", "REMOVE", "UNWATCH", "DELETE", "CANCEL", "NOTIFY", "MONITOR",
+}
+_TICKER_TOKEN = re.compile(r"^[A-Z]{1,5}([.\-][A-Z]{1,2})?$")
+_NEWS_KEYWORD = re.compile(r"\bnews\b", re.IGNORECASE)
+_NEWS_ADD_VERB = re.compile(
+    r"\b(watch|monitor|track|follow|alert|notify|add|keep)\b", re.IGNORECASE)
+_NEWS_REMOVE_VERB = re.compile(
+    r"\b(stop|unwatch|remove|delete|cancel|quit|drop)\b", re.IGNORECASE)
+_NEWS_LIST_CUE = re.compile(
+    r"\b(what|which|list|am i|tell me|show me|any)\b", re.IGNORECASE)
+_NEWS_WATCHED_NOUN = re.compile(
+    r"\b(watch|watches|watching|watch ?list|watchlist)\b", re.IGNORECASE)
+# Watch-list PANEL show/hide (distinct from listing news): needs a watchlist /
+# watches noun plus an explicit show/hide/toggle verb.
+_WATCHLIST_NOUN = re.compile(r"\b(watch ?list|watchlist|watches)\b", re.IGNORECASE)
+_WATCHLIST_HIDE = re.compile(
+    r"\b(hide|close|dismiss|take down|get rid of)\b", re.IGNORECASE)
+_WATCHLIST_SHOW = re.compile(
+    r"\b(show|open|bring up|pull up|display|see|view|let me see)\b", re.IGNORECASE)
+
+
+def _extract_news_symbol(text: str) -> str | None:
+    """Pull a ticker out of a news phrase. Known company names first (so
+    'watch Nvidia news' works), then the token after for/on/about, then a
+    stopword-filtered bare ticker."""
+    if not text:
+        return None
+    hit = _resolve_company_name(text)
+    if hit:
+        return hit
+    m = re.search(r"\b(?:for|on|about|of)\s+([A-Za-z][A-Za-z.\-]{0,5})\b",
+                  text, re.IGNORECASE)
+    if m:
+        cand = m.group(1).upper()
+        if cand not in _NEWS_STOPWORDS and _TICKER_TOKEN.match(cand):
+            return cand
+    for mm in re.finditer(r"\b([A-Za-z]{1,5})\b", text):
+        cand = mm.group(1).upper()
+        if cand in _NEWS_STOPWORDS:
+            continue
+        if _TICKER_TOKEN.match(cand):
+            return cand
+    return None
+
+
+def _match_watchlist_view_intent(text: str) -> str | None:
+    """Show/hide/toggle the watch-list panel → 'show' | 'hide' | 'toggle'."""
+    if not text or not _WATCHLIST_NOUN.search(text):
+        return None
+    if _WATCHLIST_HIDE.search(text):
+        return "hide"
+    if re.search(r"\btoggle\b", text, re.IGNORECASE):
+        return "toggle"
+    if _WATCHLIST_SHOW.search(text):
+        return "show"
+    return None
+
+
+def _news_or_watchlist(text: str) -> bool:
+    """News-watch requests say either 'news' or 'watchlist'/'watches' — Jeffery
+    thinks of the panel as his watch list ('add SPY to the watchlist')."""
+    return bool(text and (_NEWS_KEYWORD.search(text) or _WATCHLIST_NOUN.search(text)))
+
+
+def _match_news_list_intent(text: str) -> bool:
+    """True for 'what news am I watching' / 'what's on my watchlist'."""
+    if not _news_or_watchlist(text):
+        return False
+    return bool(_NEWS_WATCHED_NOUN.search(text) and _NEWS_LIST_CUE.search(text))
+
+
+def _match_news_unwatch_intent(text: str) -> str | None:
+    """'stop watching news for NVDA' / 'remove SPY from the watchlist' → symbol.
+    Scoped to news/watchlist to avoid hijacking market-subscription phrasing."""
+    if not _news_or_watchlist(text):
+        return None
+    if not _NEWS_REMOVE_VERB.search(text):
+        return None
+    return _extract_news_symbol(text)
+
+
+def _match_news_watch_intent(text: str) -> str | None:
+    """'watch the news for NVDA' / 'add SPY to the watchlist' → symbol."""
+    if not _news_or_watchlist(text):
+        return None
+    if not _NEWS_ADD_VERB.search(text):
+        return None
+    return _extract_news_symbol(text)
+
+
+# --- Price-alert intents (deterministic, before the LLM) -------------------
+# Qwen3 with think:False won't reliably call add_alert_rule, so price alerts are
+# intercepted here like the chart/news routes. The alert itself fires from the
+# Yahoo poller in market.py (the live WS feed is options-only — it never ticks
+# underlying stocks, so WS-evaluated stock price rules would never fire).
+_ALERT_VERB = re.compile(
+    r"\b(set (?:an?|up) (?:price )?alert|alert me|alert|notify|ping me|warn me|"
+    r"let me know|tell me when)\b", re.IGNORECASE)
+_ALERT_PCT = re.compile(r"(\d+(?:\.\d+)?)\s*(?:%|percent)", re.IGNORECASE)
+_ALERT_ABOVE = re.compile(
+    r"\b(?:above|over|breaks?(?:\s+above)?|crosses?(?:\s+above)?|rises?\s+(?:to|above)|"
+    r"goes?\s+above|up\s+to|north\s+of)\s+\$?(\d+(?:\.\d+)?)", re.IGNORECASE)
+_ALERT_BELOW = re.compile(
+    r"\b(?:below|under|breaks?\s+below|crosses?\s+below|drops?\s+(?:to|below)|"
+    r"falls?\s+(?:to|below)|goes?\s+below|down\s+to|south\s+of)\s+\$?(\d+(?:\.\d+)?)",
+    re.IGNORECASE)
+_ALERT_BARE_PRICE = re.compile(
+    r"\b(?:hits?|reaches?|touches?|crosses?|at|to)\s+\$?(\d+(?:\.\d+)?)", re.IGNORECASE)
+_ALERT_ANY_PRICE = re.compile(r"\$?(\d+(?:\.\d+)?)")
+_ALERT_ONLY_PRICE = re.compile(r"^\s*\$?(\d+(?:\.\d+)?)\s*$")
+_DIR_ABOVE = re.compile(r"\b(above|over|higher|up|north)\b", re.IGNORECASE)
+_DIR_BELOW = re.compile(r"\b(below|under|lower|down|south)\b", re.IGNORECASE)
+
+# Tokens that are never a ticker inside an alert phrase.
+_ALERT_STOPWORDS = _NEWS_STOPWORDS | {
+    "WHEN", "WHENEVER", "IF", "ABOVE", "BELOW", "OVER", "UNDER", "HITS", "HIT",
+    "REACH", "REACHES", "TOUCH", "TOUCHES", "CROSS", "CROSSES", "BREAK", "BREAKS",
+    "SET", "UP", "DOWN", "TO", "AT", "GOES", "GO", "DROP", "DROPS", "FALL",
+    "FALLS", "RISE", "RISES", "PRICE", "DOLLAR", "DOLLARS", "PERCENT", "NORTH",
+    "SOUTH", "PING", "WARN", "LET", "KNOW", "TELL", "BY", "WHAT", "WHICH",
+}
+
+
+def _match_alert_intent(text: str) -> bool:
+    """True for a price-alert request (excludes news-watch phrasing, which the
+    news routes own)."""
+    if not text or not _ALERT_VERB.search(text):
+        return False
+    return not _news_or_watchlist(text)
+
+
+def _extract_alert_symbol(text: str) -> str | None:
+    """Ticker from an alert phrase: known company name → 'for/on TICKER' →
+    known ticker → stopword-filtered bare ticker."""
+    if not text:
+        return None
+    hit = _resolve_company_name(text)
+    if hit:
+        return hit
+    m = re.search(r"\b(?:for|on|about|of)\s+([A-Za-z][A-Za-z.\-]{0,5})\b",
+                  text, re.IGNORECASE)
+    if m:
+        cand = m.group(1).upper()
+        if cand not in _ALERT_STOPWORDS and _TICKER_TOKEN.match(cand):
+            return cand
+    mt = _CHART_TICKERS.search(text)
+    if mt:
+        return mt.group(1).upper()
+    for mm in re.finditer(r"\b([A-Za-z]{1,5})\b", text):
+        cand = mm.group(1).upper()
+        if cand in _ALERT_STOPWORDS:
+            continue
+        if _TICKER_TOKEN.match(cand):
+            return cand
+    return None
+
+
+def _parse_alert_condition(text: str) -> dict | None:
+    """Parse a price/percent condition out of an alert phrase. Returns a cond
+    dict (rule_type, price, pct, direction) or None if none is stated.
+    direction is None for a bare price (caller infers it from the live price)."""
+    m = _ALERT_PCT.search(text)
+    if m:
+        return {"rule_type": "pct_move", "price": None,
+                "pct": float(m.group(1)), "direction": "any"}
+    ma = _ALERT_ABOVE.search(text)
+    if ma:
+        return {"rule_type": "price_cross", "price": float(ma.group(1)),
+                "pct": None, "direction": "above"}
+    mb = _ALERT_BELOW.search(text)
+    if mb:
+        return {"rule_type": "price_cross", "price": float(mb.group(1)),
+                "pct": None, "direction": "below"}
+    mbare = _ALERT_BARE_PRICE.search(text) or _ALERT_ANY_PRICE.search(text)
+    if mbare:
+        return {"rule_type": "price_cross", "price": float(mbare.group(1)),
+                "pct": None, "direction": None}
+    return None
+
+
+def _parse_alert_reply(text: str) -> dict | None:
+    """Strict parse of a short follow-up answer to an alert prompt ('above 250',
+    '5 percent', '250'). Returns a cond dict or None (→ caller drops the pending
+    alert and routes the reply normally)."""
+    t = (text or "").strip()
+    if not t or len(t.split()) > 5:
+        return None
+    m = _ALERT_PCT.search(t)
+    if m:
+        return {"rule_type": "pct_move", "price": None,
+                "pct": float(m.group(1)), "direction": "any"}
+    ma = _ALERT_ABOVE.search(t)
+    if ma:
+        return {"rule_type": "price_cross", "price": float(ma.group(1)),
+                "pct": None, "direction": "above"}
+    mb = _ALERT_BELOW.search(t)
+    if mb:
+        return {"rule_type": "price_cross", "price": float(mb.group(1)),
+                "pct": None, "direction": "below"}
+    mo = _ALERT_ONLY_PRICE.match(t)
+    if mo:
+        return {"rule_type": "price_cross", "price": float(mo.group(1)),
+                "pct": None, "direction": None}
+    return None
+
+
+def _parse_direction(text: str) -> str | None:
+    """'above'/'below' from a short reply, else None."""
+    if _DIR_ABOVE.search(text or ""):
+        return "above"
+    if _DIR_BELOW.search(text or ""):
+        return "below"
+    return None
+
+
 # Plain-English explanation of each chart pattern HAL detects. Keyed by a
 # substring that appears in charting.py's pattern text. Used for "tell me more"
 # / "explain the pattern" so HAL teaches, not just names.
@@ -1187,7 +1696,15 @@ _TRADE_IDEA_TRIGGERS = re.compile(
     r"any (good )?(ideas?|trades?|setups?|plays?|recommendations?)|"
     r"good (options?|trade|setup|play|idea|spread|condor)|"
     r"what would you (trade|buy|sell|play|recommend|do)|"
-    r"pick (a|an|me|some)"
+    r"pick (a|an|me|some)|"
+    r"should i (buy|sell|trade|play|short|grab|get)|"
+    r"is \w+ a (buy|sell|short|long)|"
+    r"worth (buying|selling|playing|trading|a trade|a play)|"
+    r"(got|have|any)thing (good|for me)|"
+    r"(got|have) (anything|something)|"
+    r"anything (good )?(today|right now|out there)|"
+    r"what do you like|"
+    r"should i be (in|long|short)"
     r")\b",
     re.IGNORECASE,
 )
@@ -1199,7 +1716,7 @@ _TRADING_CONTEXT = re.compile(
     r"SPY|QQQ|IWM|DIA|TLT|GLD|SLV|VIX|VXX|UVXY|"
     r"NVDA|TSLA|AAPL|MSFT|GOOG|GOOGL|META|AMZN|AMD|NFLX|AVGO|"
     r"options?|calls?|puts?|spreads?|condor|iron condor|straddle|strangle|"
-    r"trade|trading|premium|credit|debit|"
+    r"trade|trading|premium|credit|debit|setups?|plays?|ideas?|"
     r"strike|delta|theta|vega|gamma|expir|chain|underlying"
     r")\b",
     re.IGNORECASE,
@@ -1302,6 +1819,344 @@ def _match_trade_intent(text: str) -> str | None:
     return _extract_trade_symbol(text)
 
 
+# --- "How long should I hold this option?" — deterministic position check ----
+# Qwen3 with think:False stalls on these (it narrated a fake 'run_market_data'
+# call and nothing ran). So a held-contract hold/exit question is intercepted
+# here, like the chart/trade routes.
+_HOLD_CUE = re.compile(
+    r"(how long.*\b(hold|keep)\b|"
+    r"when\b.{0,20}\b(sell|exit|close|get out|take profit|dump|offload|unload)\b|"
+    r"(should|do|can|would|when) i\b.{0,20}\b(sell|exit|close|hold|keep|get out|"
+    r"take profit|dump|offload|unload)\b|"
+    r"i should\b.{0,20}\b(sell|exit|close|hold|keep)\b|"
+    r"hold or sell|take profit|cut (it|this|the)|\bbail\b|roll (it|this))",
+    re.IGNORECASE)
+_OPT_TYPE = re.compile(r"\b(calls?|puts?)\b", re.IGNORECASE)
+_OPT_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+_OPT_EXP_ISO = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+_OPT_EXP_MONTH = re.compile(
+    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+(\d{1,2})"
+    r"(?:\w*)?(?:,?\s*(\d{4}))?", re.IGNORECASE)
+_OPT_EXP_NUM = re.compile(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b")
+_OPT_STRIKE_ATTACHED = re.compile(r"\b([A-Za-z]{1,5})\s*\$?(\d{2,5}(?:\.\d+)?)\b")
+_OPT_STRIKE_LABELED = re.compile(
+    r"\$?(\d{2,5}(?:\.\d+)?)\s*(?:strike|calls?|puts?)\b", re.IGNORECASE)
+_OPT_STRIKE_WORD = re.compile(r"\bstrike\s*\$?(\d{2,5}(?:\.\d+)?)", re.IGNORECASE)
+# Letter groups that look ticker-shaped but never are, inside an option phrase.
+_OPT_WORD_STOP = {
+    "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT",
+    "NOV", "DEC", "JUNE", "JULY", "MARCH", "APRIL", "STRIKE", "CALL", "PUT",
+    "CALLS", "PUTS", "HOLD", "KEEP", "SELL", "MY", "THE", "FOR", "IT", "A",
+}
+
+
+def _infer_option_year(month: int, day: int) -> int:
+    """Pick the next occurrence of month/day: this year, or next year if it has
+    already passed."""
+    today = date.today()
+    year = today.year
+    try:
+        if date(year, month, day) < today:
+            year += 1
+    except ValueError:
+        pass
+    return year
+
+
+def _parse_option_expiry(text: str) -> str | None:
+    """ISO expiry from 'June 26' / '6/26' / '2026-06-26' (year inferred)."""
+    m = _OPT_EXP_ISO.search(text)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    m = _OPT_EXP_MONTH.search(text)
+    if m:
+        mon = _OPT_MONTHS.get(m.group(1).lower()[:3])
+        day = int(m.group(2))
+        if mon and 1 <= day <= 31:
+            yr = int(m.group(3)) if m.group(3) else _infer_option_year(mon, day)
+            return f"{yr:04d}-{mon:02d}-{day:02d}"
+    m = _OPT_EXP_NUM.search(text)
+    if m:
+        mon, day = int(m.group(1)), int(m.group(2))
+        if 1 <= mon <= 12 and 1 <= day <= 31:
+            if m.group(3):
+                yr = int(m.group(3))
+                yr += 2000 if yr < 100 else 0
+            else:
+                yr = _infer_option_year(mon, day)
+            return f"{yr:04d}-{mon:02d}-{day:02d}"
+    return None
+
+
+def _parse_option_phrase(text: str) -> dict | None:
+    """Parse a held-option reference into {symbol, strike, type, expiry}; any
+    field may be None if not stated (caller asks for the missing piece)."""
+    if not text:
+        return None
+    typ = None
+    mt = _OPT_TYPE.search(text)
+    if mt:
+        typ = "call" if mt.group(1).lower().startswith("call") else "put"
+    sym = _resolve_company_name(text)
+    strike = None
+    if not sym:
+        for m in _OPT_STRIKE_ATTACHED.finditer(text):
+            cand = m.group(1).upper()
+            if cand not in _OPT_WORD_STOP and _TICKER_TOKEN.match(cand):
+                sym, strike = cand, float(m.group(2))
+                break
+    if not sym:
+        mtk = _CHART_TICKERS.search(text)
+        if mtk:
+            sym = mtk.group(1).upper()
+    if strike is None:
+        ms = _OPT_STRIKE_WORD.search(text) or _OPT_STRIKE_LABELED.search(text)
+        if ms:
+            strike = float(ms.group(1))
+    if strike is None:
+        ms = re.search(r"\$(\d{2,5}(?:\.\d+)?)", text)
+        if ms:
+            strike = float(ms.group(1))
+    return {
+        "symbol": sym,
+        "strike": strike,
+        "type": typ,
+        "expiry": _parse_option_expiry(text),
+    }
+
+
+def _match_hold_intent(text: str) -> dict | None:
+    """Parsed contract if this is a hold/exit question about an option Jeffery
+    holds, else None. Requires an option reference (call/put/strike) so a plain
+    'should I sell AAPL' falls through to the trade-idea route."""
+    if not text or not _HOLD_CUE.search(text):
+        return None
+    if not (_OPT_TYPE.search(text) or re.search(r"\bstrike\b", text, re.IGNORECASE)):
+        return None
+    return _parse_option_phrase(text)
+
+
+# Anaphoric exit question: "when should I sell THIS POSITION" with no contract
+# re-stated. Resolved against the last option discussed (hal_last_option).
+_EXIT_POSITION_REF = re.compile(
+    r"\b(this|that|my|the)\s+(position|trade|option|call|put|contract|holding|one)\b",
+    re.IGNORECASE)
+
+
+def _is_exit_question(text: str) -> bool:
+    """A hold/exit question that points at an existing position without naming the
+    contract, so it must be resolved from memory (hal_last_option)."""
+    if not text or not _HOLD_CUE.search(text):
+        return False
+    if _EXIT_POSITION_REF.search(text):
+        return True
+    return bool(re.search(
+        r"\b(sell|exit|close|dump|hold|get out|bail|take profit)\b.{0,20}\b(it|this)\b",
+        text, re.IGNORECASE))
+
+
+def _winner_exit_timing(bt: dict) -> tuple[int, str] | None:
+    """From backtest trades, the average days winners were held and their most
+    common exit reason — answers 'when did profitable trades get sold'."""
+    winners = [t for t in (bt.get("trades") or []) if (t.get("pnl") or 0) > 0]
+    days: list[int] = []
+    reasons: dict[str, int] = {}
+    for t in winners:
+        try:
+            entered = date.fromisoformat(t["date"])
+            exited = date.fromtimestamp(t["exit_t"] / 1000)
+            days.append((exited - entered).days)
+        except Exception:
+            pass
+        r = t.get("exit_reason")
+        if r:
+            reasons[r] = reasons.get(r, 0) + 1
+    if not days:
+        return None
+    avg_days = round(sum(days) / len(days))
+    top_reason = max(reasons, key=reasons.get) if reasons else "expiry"
+    return avg_days, top_reason
+
+
+async def build_hold_check(contract: dict, websocket: WebSocket) -> tuple[str, str]:
+    """Deterministic hold/exit read for an option Jeffery already owns. Weighs
+    time decay, the daily-chart trend, IV regime, and moneyness, backs it with a
+    strategy backtest (shown as an equity curve), then gives a direct hold-or-exit
+    call. Returns (spoken_sentence, markdown). Never raises."""
+    sym = contract["symbol"]
+    strike = float(contract["strike"])
+    side = contract["type"]
+    exp = contract["expiry"]
+    side_label = side.capitalize()
+    await websocket.send_json(
+        {"state": "processing", "text": f"Checking your {sym} {strike:g} {side_label}..."})
+    await _emit_telemetry(websocket, "hold.start", f"{sym} {strike:g} {side} {exp}",
+                          "Building a hold/exit read for a held option.")
+
+    # Daily bias + spot. Analyze the chart WITHOUT pushing the chart view — the
+    # backtest equity curve is the visual for this answer (Jeffery asked for
+    # clear backtesting on the exit question).
+    try:
+        _payload = await charting.build_chart(sym, "1d")
+        ca = charting.analyze(_payload)
+    except Exception as e:
+        ca = None
+        print(f"[hold] chart analyze failed for {sym}: {e}")
+    bias = (ca or {}).get("bias", "neutral")
+    spot = (ca or {}).get("last")
+
+    # IV regime.
+    try:
+        ivc = await analysis.iv_context(sym)
+        verdict = ivc.get("verdict", "UNKNOWN")
+    except Exception:
+        verdict = "UNKNOWN"
+
+    # The specific contract from the chain (exact strike, expiry within a window).
+    dte_target = (date.fromisoformat(exp) - date.today()).days if exp else None
+    lo = max(0, dte_target - 7) if dte_target is not None else 0
+    hi = (dte_target + 7) if dte_target is not None else 120
+    try:
+        screen = await analysis.screen_options(
+            underlying=sym, side=side, dte_min=lo, dte_max=hi,
+            strike_min=strike, strike_max=strike, top_n=60, sort_by="oi")
+    except Exception as e:
+        return (f"I couldn't load the {sym} chain, Jeffery. {e}", "")
+    cands = [c for c in ((screen or {}).get("candidates") or [])
+             if (c.get("strike") or 0) == strike]
+    if not cands:
+        return (f"I couldn't find a {sym} {strike:g} {side} near {exp} in the chain, "
+                f"Jeffery — double-check the strike or expiration.", "")
+    row = next((c for c in cands if c.get("expiration") == exp), None)
+    if row is None:
+        row = min(cands, key=lambda c: abs((c.get("dte") or 0) - (dte_target or 0)))
+        exp = row.get("expiration") or exp
+
+    dte = row.get("dte")
+    if dte is None:
+        dte = dte_target or 0
+    mid = row.get("mid") or row.get("ask") or row.get("bid") or 0
+    delta = row.get("delta")
+    theta = row.get("theta")
+    iv = row.get("iv")
+    spot = row.get("underlying_price") or spot or 0
+    breakeven = strike + mid if side == "call" else strike - mid
+    theta_day = (theta or 0) * 100.0
+    theta_pct = (abs(theta) / mid * 100.0) if (theta and mid) else None
+    in_money = (side == "call" and spot > strike) or (side == "put" and spot < strike)
+    moneyness = "in the money" if in_money else "out of the money"
+    otm_pct = (abs(spot - strike) / spot * 100.0) if spot else None
+
+    favor = (side == "call" and bias == "bullish") or (side == "put" and bias == "bearish")
+    against = (side == "call" and bias == "bearish") or (side == "put" and bias == "bullish")
+
+    exp_d = date.fromisoformat(exp) if exp else None
+    buffer_days = 14 if against else 10
+    exit_by = max(exp_d - timedelta(days=buffer_days), date.today()) if exp_d else None
+
+    await _emit_telemetry(
+        websocket, "hold.contract", f"{sym} {strike:g} {side} {exp}",
+        f"mid ${mid:.2f}, dte {dte}, delta {delta}, theta {theta}, IV {iv}; "
+        f"spot {spot:g}, bias {bias}, IV {verdict}.")
+
+    # Backtest the underlying's strategy so the exit guidance is data-backed,
+    # and show the equity curve — Jeffery asked for clear backtesting here.
+    await websocket.send_json({"state": "processing", "text": f"Backtesting {sym}..."})
+    bt_line = ""
+    bt_verdict = ""
+    bt_metrics: dict = {}
+    try:
+        bt = await backtest.run_backtest(sym, months=12)
+        await websocket.send_json({
+            "action": "open_view", "kind": "backtest",
+            "backtest": backtest.equity_payload(bt)})
+        bt_metrics = bt.get("metrics") or {}
+        if bt_metrics.get("trades"):
+            bt_line = (f"Backtest over the past year: {bt_metrics['trades']} trades, "
+                       f"{int(bt_metrics['win_rate'] * 100)}% win rate, profit factor "
+                       f"{bt_metrics.get('profit_factor')}.")
+            timing = _winner_exit_timing(bt)
+            if timing:
+                avg_days, reason = timing
+                reason_txt = {"take_profit": "taking the +50% gain",
+                              "stop_loss": "stopping out", "expiry": "expiry"}.get(
+                                  reason, reason)
+                bt_line += (f" Winners historically resolved in about {avg_days} "
+                            f"days, usually by {reason_txt}.")
+            bt_verdict = backtest.verdict(bt)
+        else:
+            bt_line = "Backtest: no qualifying trades in the past year to lean on."
+    except Exception as e:
+        print(f"[hold] backtest failed for {sym}: {e}")
+    await _emit_telemetry(websocket, "hold.backtest", sym, bt_line or "n/a")
+
+    # --- spoken read ---
+    parts = [
+        f"Your {sym} {strike:g} {side_label} expires {exp}, {dte} days out, worth "
+        f"about ${mid:.2f}. {sym} is at {spot:.2f}, {moneyness}"
+        + (f" by {otm_pct:.1f}%" if otm_pct is not None else "") + "."
+    ]
+    if dte > 21:
+        decay = "Time decay is still mild this far out"
+    elif dte > 10:
+        decay = "Time decay is picking up now"
+    else:
+        decay = "Time decay is steep this close to expiry"
+    if theta_day:
+        decay += f", bleeding about ${abs(theta_day):.0f} a day"
+    if theta_pct:
+        decay += f", roughly {theta_pct:.1f}% of its value daily"
+    parts.append(decay + ".")
+
+    if against and dte <= 21:
+        call = (f"The daily trend is against you and the clock's working against you — "
+                f"I'd exit soon")
+    elif favor:
+        call = ("The daily trend's in your favor, so hold — but plan to be out")
+    else:
+        call = ("The trend's neutral — give it some room, but plan to exit")
+    if exit_by:
+        call += f" by about {exit_by:%b %d}"
+    call += "."
+    iv_note = {
+        "RICH": " IV is rich, so a volatility drop would hurt the position.",
+        "CHEAP": " IV is cheap, which works in a long option's favor.",
+        "FAIR": " IV is fair.",
+    }.get(verdict, "")
+    parts.append(call + iv_note + f" Your breakeven is {breakeven:.2f}.")
+    if bt_line:
+        parts.append(bt_line)
+    spoken = " ".join(parts)
+
+    # --- chat markdown ---
+    full_md = (
+        f"**{sym} {strike:g} {side_label} — exp {exp}**\n\n"
+        f"- Underlying: {spot:.2f} ({moneyness}"
+        + (f", {otm_pct:.1f}% away" if otm_pct is not None else "") + ")\n"
+        f"- Contract mid: ${mid:.2f}  (breakeven {breakeven:.2f})\n"
+        f"- DTE {dte} | delta {delta} | theta {theta}"
+        + (f" (~${abs(theta_day):.0f}/day" + (f", {theta_pct:.1f}%/day" if theta_pct else "") + ")" if theta_day else "")
+        + f" | IV {iv}\n"
+        f"- Daily bias: **{bias}** | IV regime: **{verdict}**\n"
+        + (f"- Suggested exit by ~**{exit_by:%b %d}**\n" if exit_by else "")
+    )
+    if bt_metrics.get("trades"):
+        full_md += (
+            "\n**Backtest — last 12 months**\n\n"
+            f"- {bt_metrics['trades']} trades | win rate {int(bt_metrics['win_rate']*100)}% | "
+            f"profit factor {bt_metrics.get('profit_factor')} | total {bt_metrics.get('total_pnl'):+.0f} | "
+            f"max drawdown {bt_metrics.get('max_drawdown'):.0f}\n"
+        )
+        if bt_verdict:
+            full_md += f"- {bt_verdict}\n"
+    elif bt_line:
+        full_md += f"\n_{bt_line}_\n"
+    return spoken, full_md
+
+
 def _size_contracts(account: float, max_risk_pct: float, stop_pct: float, entry: float) -> tuple[int, float]:
     """(qty, dollar risk) for a long option, risk-sized so a stop-out loses no
     more than max_risk_pct of the account. Mirrors the frontend sizePosition."""
@@ -1313,6 +2168,80 @@ def _size_contracts(account: float, max_risk_pct: float, stop_pct: float, entry:
         return 0, 0.0
     qty = int(budget // per_contract_risk)
     return qty, round(qty * per_contract_risk, 2)
+
+
+def _is_watchlist_screen_request(text: str) -> bool:
+    """A trade-idea request that names NO ticker -> screen the watchlist.
+    Same trigger+context gate as a named trade idea, but only fires when we
+    couldn't pull a symbol out of the text (so 'recommend a trade' scans the
+    list, while 'recommend an NVDA trade' goes to the named builder)."""
+    if not text:
+        return False
+    if not (_TRADE_IDEA_TRIGGERS.search(text) and _TRADING_CONTEXT.search(text)):
+        return False
+    return _extract_trade_symbol(text) is None
+
+
+async def _llm_oneshot(prompt: str, *, system: str | None = None, timeout: float = 60.0) -> str:
+    """One-shot, non-streaming completion on the fast model (no tools, no
+    thinking channel) for quick internal classification like news sentiment.
+    Returns '' on any failure so callers can degrade gracefully."""
+    messages: list[dict] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    payload = {
+        "model": OLLAMA_FAST_MODEL,
+        "messages": messages,
+        "stream": False,
+        "think": False,
+        "options": {"temperature": 0.3, "num_ctx": 2048},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(OLLAMA_URL, json=payload)
+            r.raise_for_status()
+            content = r.json().get("message", {}).get("content", "")
+            return _strip_thinking(content).strip()
+    except Exception as e:
+        print(f"[llm] oneshot failed: {e}")
+        return ""
+
+
+async def _news_sentiment(sym: str) -> dict:
+    """Read recent headlines for `sym` and have the fast model classify the
+    near-term read. Returns {'label': 'bullish'|'bearish'|'neutral', 'thesis':
+    str, 'count': int}. Never raises; degrades to neutral on any failure."""
+    out = {"label": "neutral", "thesis": "", "count": 0}
+    try:
+        async with httpx.AsyncClient(timeout=15.0, headers={"User-Agent": "HAL"}) as client:
+            items = await news.fetch_symbol_news(client, sym)
+    except Exception as e:
+        print(f"[news] sentiment fetch failed for {sym}: {e}")
+        return out
+    if not items:
+        return out
+    out["count"] = len(items)
+    headlines = "\n".join(f"- {it.get('title', '')}" for it in items[:6] if it.get("title"))
+    if not headlines:
+        return out
+    prompt = (
+        f"Recent news headlines for {sym}:\n{headlines}\n\n"
+        "Judge the near-term sentiment for the stock. Reply on ONE line as "
+        "`LABEL | reason` where LABEL is exactly BULLISH, BEARISH, or NEUTRAL "
+        "and reason is a short clause (max 12 words)."
+    )
+    raw = await _llm_oneshot(prompt)
+    if not raw:
+        return out
+    label_part, _, thesis = raw.splitlines()[0].partition("|")
+    lp = label_part.strip().upper()
+    if "BULL" in lp:
+        out["label"] = "bullish"
+    elif "BEAR" in lp:
+        out["label"] = "bearish"
+    out["thesis"] = thesis.strip().rstrip(".")
+    return out
 
 
 async def build_trade_reco(symbol: str, risk: dict | None, websocket: WebSocket) -> tuple[str, str]:
@@ -1334,15 +2263,37 @@ async def build_trade_reco(symbol: str, risk: dict | None, websocket: WebSocket)
     await _emit_telemetry(websocket, "trade.start", f"trade idea: {sym}",
                           f"Building a sized long-option recommendation for {sym}.")
 
-    # Direction from the daily chart bias (reuses charting).
+    # Direction from the daily chart bias. render_chart pushes the chart to the
+    # UI (so the panel stays on screen alongside the recommendation) AND returns
+    # the analysis, so a single fetch both shows the chart and gives the bias.
     try:
-        chart_payload = await charting.build_chart(sym, "1d")
-        ca = charting.analyze(chart_payload)
-        bias = ca.get("bias", "neutral")
+        _status, chart_payload, ca = await render_chart(sym, "1d", websocket)
     except Exception as e:
-        await _emit_telemetry(websocket, "trade.bias", sym, f"data error: {e}", status="error")
-        return (f"I could not pull {sym} data, Jeffery. {e}", "")
-    side = "call" if bias == "bullish" else "put" if bias == "bearish" else "call"
+        ca = None
+        print(f"[trade] chart render failed for {sym}: {e}")
+    if not ca:
+        await _emit_telemetry(websocket, "trade.bias", sym, "data error", status="error")
+        return (f"I could not pull {sym} data, Jeffery.", "")
+    bias = ca.get("bias", "neutral")
+
+    # News sentiment: an LLM read of recent headlines. Informs the spoken thesis
+    # and breaks the tie on direction when the chart bias is neutral.
+    sentiment = await _news_sentiment(sym)
+    await _emit_telemetry(
+        websocket, "trade.news", f"{sym} ({sentiment['count']} headlines)",
+        f"News read: {sentiment['label']}"
+        + (f" — {sentiment['thesis']}" if sentiment["thesis"] else ""),
+    )
+    if bias == "bullish":
+        side = "call"
+    elif bias == "bearish":
+        side = "put"
+    elif sentiment["label"] == "bullish":
+        side = "call"
+    elif sentiment["label"] == "bearish":
+        side = "put"
+    else:
+        side = "call"
     await _emit_telemetry(
         websocket, "trade.bias", f"{sym} daily",
         f"Daily bias: {bias} -> {side.upper()}. Structure: {ca.get('structure','?')}. "
@@ -1477,11 +2428,17 @@ async def build_trade_reco(symbol: str, risk: dict | None, websocket: WebSocket)
                    "neutral": "no clear direction, defaulting long-call"}[bias if bias in ("bullish", "bearish") else "neutral"]
     iv_phrase = {"RICH": " IV is rich, so size down", "CHEAP": " IV is cheap, good for buying premium",
                  "FAIR": "", "UNKNOWN": ""}.get(verdict, "")
+    news_phrase = ""
+    if sentiment["label"] != "neutral":
+        news_phrase = (
+            f" News is {sentiment['label']}"
+            + (f": {sentiment['thesis']}." if sentiment["thesis"] else ".")
+        )
     if qty > 0:
         spoken = (
             f"{sym} is {bias_phrase}. I'd look at {qty} of the {strike:g} {side_label.lower()}s "
             f"expiring {expiry}, a limit around ${limit_price:.2f}, stop at ${stop_price:.2f}, "
-            f"max risk ${dollar_risk:,.0f}.{iv_phrase} "
+            f"max risk ${dollar_risk:,.0f}.{iv_phrase}{news_phrase} "
             "Want me to set a stop alert on it, and tell me once you've placed it?"
         )
         # Stash the proposed trade so the next turn can act on a yes/placed reply.
@@ -1502,6 +2459,60 @@ async def build_trade_reco(symbol: str, risk: dict | None, websocket: WebSocket)
         full_md += f"\n\n⚠️ {zero_note}"
     if bt_line:
         full_md += f"\n\n_{bt_line}_"
+    if sentiment["count"]:
+        news_md = f"News read: {sentiment['label']}"
+        if sentiment["thesis"]:
+            news_md += f" — {sentiment['thesis']}"
+        full_md += f"\n\n_{news_md} ({sentiment['count']} headlines)._"
+    return spoken, full_md
+
+
+async def screen_watchlist_and_reco(websocket: WebSocket) -> tuple[str, str]:
+    """No ticker named: scan the watchlist, score each symbol by chart bias,
+    momentum, and news flow, then recommend the strongest by building the full
+    sized trade for it. Returns (spoken, full_markdown)."""
+    try:
+        watches = await asyncio.to_thread(news.list_watches_db, True)
+    except Exception as e:
+        return (f"I couldn't read your watchlist, Jeffery. {e}", "")
+    symbols = [w["symbol"] for w in (watches or []) if w.get("symbol")]
+    if not symbols:
+        return ("Your watchlist is empty, Jeffery — name a symbol and I'll size a trade.", "")
+
+    await websocket.send_json({"state": "processing", "text": "Screening your watchlist..."})
+    # Bound the scan so a long watchlist doesn't stall the turn.
+    scan = symbols[:12]
+    await _emit_telemetry(websocket, "screen.start", f"{len(scan)} symbols",
+                          f"Scanning watchlist for the strongest setup: {', '.join(scan)}.")
+    article_counts = {w["symbol"]: w.get("article_count", 0) for w in watches}
+
+    async def _score(sym: str) -> tuple[str, float, str]:
+        """(symbol, score, bias). Score = directional conviction + momentum +
+        a small news-flow weight. Negative score means data failed."""
+        try:
+            ca = charting.analyze(await charting.build_chart(sym, "1d"))
+        except Exception:
+            return sym, -1.0, "neutral"
+        bias = ca.get("bias", "neutral")
+        momentum = abs(float(ca.get("pct") or 0.0)) / 10.0
+        conviction = 1.0 if bias in ("bullish", "bearish") else 0.0
+        news_weight = min(article_counts.get(sym, 0), 5) * 0.1
+        return sym, conviction + momentum + news_weight, bias
+
+    ranked = sorted(await asyncio.gather(*[_score(s) for s in scan]),
+                    key=lambda r: r[1], reverse=True)
+    best_sym, best_score, _best_bias = ranked[0]
+    if best_score < 0:
+        return ("I couldn't pull data for any watchlist symbol right now, Jeffery.", "")
+    ranking_line = ", ".join(f"{s} ({b})" for s, _sc, b in ranked[:3])
+    await _emit_telemetry(websocket, "screen.pick", f"top: {best_sym}",
+                          f"Ranked: {ranking_line}. Picked {best_sym}.")
+
+    spoken, full_md = await build_trade_reco(best_sym, websocket.scope.get("hal_risk"), websocket)
+    spoken = f"Across your watchlist, {best_sym} has the strongest setup. " + spoken
+    if full_md:
+        full_md = (f"**Watchlist pick: {best_sym}** "
+                   f"(top of {len(scan)} scanned — {ranking_line}).\n\n" + full_md)
     return spoken, full_md
 
 
@@ -1613,7 +2624,25 @@ async def agent_loop(
         if model_mode == "fast":
             print(f"[agent] fast mode; routing to {model}")
 
+    mcp_tools = [] if images else mcp_client.tools_for_agent()
+
     system_content = f"{HAL_SYSTEM_PROMPT}\n\n{_options_date_context()}"
+    # CAG: inject stable vault context (rules + open trades + watchlist + theses).
+    # Ollama reuses cached KV for any unchanged prefix, so this is a cache hit
+    # on every turn where the vault hasn't changed.
+    _cag_block = _cag.get_context()
+    if _cag_block:
+        system_content += _cag_block
+    if mcp_tools:
+        listing = "\n".join(
+            f"- {t['function']['name']}: {t['function']['description'][:160]}"
+            for t in mcp_tools
+        )
+        system_content += (
+            "\n\nEXTERNAL MCP TOOLS — these connect to Jeffery's configured MCP "
+            "servers. Call them by their exact name when the request matches what "
+            "they do:\n" + listing
+        )
     messages = (
         [{"role": "system", "content": system_content}]
         + history
@@ -1624,28 +2653,43 @@ async def agent_loop(
         for iteration in range(MAX_AGENT_ITERATIONS):
             _check_abort(abort_event)
 
-            # Cap context so the footprint stays small (HAL carries only a short
-            # system prompt + ~40 brief messages). TTS is Piper on the CPU now,
-            # so it uses zero VRAM — the only GPU tenants are the LLM and Whisper.
-            # The 27B's ~17 GB of weights plus the KV cache must fit in 24 GB
-            # alongside Whisper (~1.5 GB). At num_ctx 8192 the runtime footprint
-            # hit ~23 GB and Ollama spilled ~12% of layers to CPU (slow). 4096
-            # roughly halves the KV cache so the whole model can sit on the GPU.
+            # Context budget. With the model tool list trimmed to _MODEL_TOOLS,
+            # the static prompt (system + tools) is ~4.5-5k tokens, so num_ctx
+            # 8192 still leaves ~3k for recent history (~15 short turns) while
+            # keeping more of the 27B on the GPU than 10240 did — fewer CPU-spilled
+            # layers means faster per-token generation (the reported slow replies).
+            # TTS is Piper on the CPU (zero VRAM). Raise toward 12288 for deeper
+            # memory at some speed cost, lower toward 6144 for max speed.
             payload = {
                 "model": model,
                 "messages": messages,
                 "stream": bool(on_sentence),
                 "think": False,
-                "options": {"temperature": 0.7, "top_p": 0.9, "num_ctx": 4096},
+                "options": {"temperature": 0.7, "top_p": 0.9, "num_ctx": 8192,
+                            "repeat_penalty": 1.2},
             }
             # Vision models in Ollama typically don't accept the tools param;
             # only include it for the text model.
             if not images:
-                payload["tools"] = TOOLS
+                payload["tools"] = _MODEL_TOOLS + mcp_tools
+                # Qwen3 reliably plans tool calls only inside its thinking
+                # channel; with think:False it ignores freshly-added (MCP)
+                # tools. Enable thinking for the FIRST iteration when MCP tools
+                # are present (the tool-selection step, which isn't spoken).
+                # Later iterations keep think:False so the spoken answer stays
+                # fast — latency only hits MCP-eligible turns.
+                if mcp_tools and iteration == 0:
+                    payload["think"] = True
 
             accumulated = ""
             tool_calls: list = []
             spoken_buffer = ""
+            # Speak the prose lead-in, then go quiet once the reply turns into a
+            # bulleted/structured block (trade tables, metric lists, emoji
+            # headers). Reading all of that aloud sounds garbled and overlong —
+            # the full text still lands in chat + the Trade Ideas pane.
+            tts_muted = False
+            spoke_any = False
 
             try:
                 if on_sentence:
@@ -1664,11 +2708,24 @@ async def agent_loop(
                             if content_piece:
                                 accumulated += content_piece
                                 spoken_buffer += content_piece
+                                # When the model uses a <think> channel
+                                # (think:True on MCP turns), don't speak its
+                                # reasoning: hold the buffer until the block
+                                # closes, then drop everything up to </think>.
+                                if "<think>" in accumulated and "</think>" not in accumulated:
+                                    continue
+                                if "</think>" in spoken_buffer:
+                                    spoken_buffer = spoken_buffer.split("</think>", 1)[1]
+                                if not tts_muted and _TTS_STRUCT_BOUNDARY.search(accumulated):
+                                    tts_muted = True  # structured detail starts; stop speaking
                                 sentences, spoken_buffer = _peel_complete_sentences(spoken_buffer)
                                 for s in sentences:
                                     _check_abort(abort_event)
+                                    if tts_muted:
+                                        continue
                                     spoken = _strip_code_for_tts(_strip_thinking(s))
                                     if spoken.strip():
+                                        spoke_any = True
                                         try:
                                             await on_sentence(spoken)
                                         except Exception as e:
@@ -1679,13 +2736,22 @@ async def agent_loop(
                             if chunk.get("done"):
                                 break
                     # Flush whatever's left in the buffer as one final chunk.
-                    if spoken_buffer.strip():
+                    if spoken_buffer.strip() and not tts_muted and not _TTS_STRUCT_BOUNDARY.search(accumulated):
                         leftover = _strip_code_for_tts(_strip_thinking(spoken_buffer))
                         if leftover.strip():
+                            spoke_any = True
                             try:
                                 await on_sentence(leftover)
                             except Exception as e:
                                 print(f"[agent] on_sentence flush error: {e}")
+                    # If the reply was all-structured (nothing spoken), still say a
+                    # one-line pointer so HAL isn't silent on a trade idea.
+                    if on_sentence and not spoke_any and accumulated.strip():
+                        try:
+                            await on_sentence(
+                                "Here's a trade idea — the details are on screen.")
+                        except Exception as e:
+                            print(f"[agent] on_sentence summary error: {e}")
                     msg = {"role": "assistant", "content": accumulated}
                     if tool_calls:
                         msg["tool_calls"] = tool_calls
@@ -1755,6 +2821,23 @@ async def agent_loop(
 
 
 # --- XTTS synthesis ---------------------------------------------------------
+# Marks where a streamed reply turns from prose into a structured/bulleted
+# block (trade tables, metric lists, emoji headers). TTS goes quiet past this —
+# the full text is still shown on screen. See agent_loop's streaming.
+_TTS_STRUCT_BOUNDARY = re.compile(
+    r"\n\s*[\*\-•\+]\s"
+    r"|\n\s*#{1,6}\s"
+    r"|\n\s*\d+\.\s"
+    r"|[\U0001F000-\U0001FAFF←-➿️]"
+    r"|\b(Trade Structure|Key Metrics|Recommended Strategy|Max Profit|Max Loss|"
+    r"Break\s?even|Net Credit|Net Debit|Probability of Profit)\b",
+    re.IGNORECASE)
+
+# Emoji / pictographs / variation selectors — espeak chokes on or mis-speaks
+# these, so strip them from anything we synthesize.
+_EMOJI_RE = re.compile(r"[\U0001F000-\U0001FAFF←-➿⬀-⯿️]")
+
+
 def _strip_code_for_tts(text: str) -> str:
     """Strip markdown code blocks/inline code so XTTS doesn't try to speak
     syntax characters. Replaces fenced blocks with a short spoken placeholder."""
@@ -1772,6 +2855,15 @@ def _strip_code_for_tts(text: str) -> str:
         flags=re.MULTILINE,
     )
     text = re.sub(r"`([^`\n]+)`", r"\1", text)
+    # Strip Markdown emphasis/heading/bullet markers. espeak verbalizes these
+    # symbols literally ("**bold**" -> "asterisk asterisk bold", "## H" ->
+    # "hash hash H"), so HAL was reading them aloud. Keep the inner text.
+    text = re.sub(r"^[ \t]{0,3}#{1,6}[ \t]*", "", text, flags=re.MULTILINE)  # headings
+    text = re.sub(r"^[ \t]*[*+][ \t]+", "", text, flags=re.MULTILINE)        # *,+ bullets
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)                            # **bold**
+    text = re.sub(r"\*([^*\n]+)\*", r"\1", text)                              # *italic*
+    text = text.replace("*", "").replace("#", "")                            # stray markers
+    text = _EMOJI_RE.sub("", text)                                           # emoji/pictographs
     return text
 
 
@@ -1789,36 +2881,17 @@ def _peel_complete_sentences(buffer: str) -> tuple[list[str], str]:
     return completed, parts[-1]
 
 
-def _split_sentences(text: str, min_chars: int = 20) -> list[str]:
-    """Split a reply into speakable chunks so TTS can stream sentence-by-sentence.
-    Very short fragments are merged so each chunk has enough context to sound natural."""
-    text = text.strip()
-    if not text:
-        return []
-    parts = re.split(r"(?<=[.!?])\s+", text)
-    chunks: list[str] = []
-    buf = ""
-    for p in parts:
-        p = p.strip()
-        if not p:
-            continue
-        buf = f"{buf} {p}" if buf else p
-        if len(buf) >= min_chars:
-            chunks.append(buf)
-            buf = ""
-    if buf:
-        if chunks:
-            chunks[-1] = f"{chunks[-1]} {buf}"
-        else:
-            chunks.append(buf)
-    return chunks
-
-
 async def synthesize(text: str) -> bytes:
     def _run():
         # Piper yields one or more int16 PCM chunks; concatenate and wrap in a
         # WAV header at the voice's native sample rate (22.05 kHz for -medium).
-        chunks = list(piper_voice.synthesize(text))
+        if _SYN_CONFIG is not None:
+            try:
+                chunks = list(piper_voice.synthesize(text, syn_config=_SYN_CONFIG))
+            except TypeError:
+                chunks = list(piper_voice.synthesize(text))
+        else:
+            chunks = list(piper_voice.synthesize(text))
         if not chunks:
             return b""
         first = chunks[0]
@@ -1835,20 +2908,6 @@ async def synthesize(text: str) -> bytes:
 
 
 # --- WebSocket handler ------------------------------------------------------
-async def _stream_speech(
-    websocket: WebSocket,
-    text: str,
-    abort_event: asyncio.Event,
-) -> None:
-    """Synthesize sentence-by-sentence and stream chunks so playback can start
-    on the first sentence instead of waiting for the full reply."""
-    spoken = _strip_code_for_tts(text)
-    chunks = _split_sentences(spoken)
-    for chunk in chunks:
-        _check_abort(abort_event)
-        wav_bytes = await synthesize(chunk)
-        _check_abort(abort_event)
-        await websocket.send_bytes(wav_bytes)
 
 
 async def process_turn(
@@ -1937,9 +2996,10 @@ async def process_turn(
                 user_text = f"[Speaker: {speaker_name}] {user_text}"
 
         if not user_text and not has_attachments:
-            fallback = "I am sorry, Jeffery. I did not catch that."
-            await websocket.send_json({"state": "speaking", "text": fallback})
-            await _stream_speech(websocket, fallback, abort_event)
+            # Empty transcription (silence / background noise). Return to
+            # listening silently instead of speaking. In hands-free immersive
+            # mode the mic re-arms after every turn, so speaking an apology on
+            # each silent capture loops endlessly (Jeffery: chart + silence).
             await websocket.send_json({"state": "done"})
             return history
 
@@ -1960,6 +3020,112 @@ async def process_turn(
             _check_abort(abort_event)
             await websocket.send_bytes(wav_bytes)
             print(f"[tts] sent {len(wav_bytes)} bytes")
+
+        # Injected alert/announcement turns (market + news alerts and missed-alert
+        # replays) must be voiced by the model — skip ALL deterministic routes,
+        # several of which would otherwise match a keyword in the headline (e.g.
+        # 'alert'/'news' + a ticker -> the silent news-add route) and swallow the
+        # announcement so HAL says nothing.
+        if user_text.lstrip().startswith(("[MARKET ALERT FIRED]", "[MISSED ALERTS")):
+            reply, nh = await agent_loop(
+                user_text, history, websocket, abort_event,
+                attachments=attachments, on_sentence=stream_sentence,
+                vision_mode=vision_mode, model_mode=model_mode)
+            if on_reply:
+                try:
+                    await on_reply(nh)
+                except Exception as e:
+                    print(f"[turn] on_reply failed: {e}")
+            print(f"[hal] alert: {reply!r}")
+            await _emit_telemetry(websocket, "speech-out", "", reply or "(no reply)",
+                                  status="ok" if reply else "error")
+            await websocket.send_json({"state": "done"})
+            return nh[-MAX_HISTORY_MESSAGES:] if len(nh) > MAX_HISTORY_MESSAGES else nh
+
+        async def _speak_and_return(spoken: str, telem_tag: str,
+                                    assistant_content: str | None = None,
+                                    speak: bool = True):
+            """Speak a one-shot deterministic reply, persist it to history, and
+            close the turn. Mirrors the boilerplate the chart/backtest routes use.
+            speak=False persists + closes the turn silently (no TTS)."""
+            if speak:
+                await stream_sentence(spoken)
+            nh = history + [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": assistant_content or spoken},
+            ]
+            if on_reply:
+                try:
+                    await on_reply(nh)
+                except Exception as e:
+                    print(f"[turn] on_reply failed: {e}")
+            print(f"[hal] {spoken!r}")
+            await _emit_telemetry(websocket, telem_tag, "", spoken, status="ok")
+            await websocket.send_json({"state": "done"})
+            if len(nh) > MAX_HISTORY_MESSAGES:
+                nh = nh[-MAX_HISTORY_MESSAGES:]
+            return nh
+
+        async def _alert_finalize(sym: str, cond: dict):
+            """Subscribe-or-find `sym`, create the rule, confirm. cond must have a
+            resolved direction (price_cross) or a pct (pct_move)."""
+            websocket.scope.pop("pending_alert", None)
+            if cond["rule_type"] == "pct_move":
+                config = {"threshold_pct": cond["pct"], "direction": "any"}
+                confirm = f"Alert set. I'll tell you when {sym} moves {cond['pct']:g}% or more."
+            else:
+                config = {"price": cond["price"], "direction": cond["direction"]}
+                confirm = (f"Alert set. I'll tell you when {sym} crosses "
+                           f"{cond['direction']} {cond['price']:g}.")
+            sub = await asyncio.to_thread(
+                market.tool_subscribe_market, "T", sym, "price alert")
+            if isinstance(sub, dict) and sub.get("error"):
+                return await _speak_and_return(
+                    f"I couldn't set that alert, Jeffery. {sub['error']}", "alert.add")
+            rule = await asyncio.to_thread(
+                market.tool_add_alert_rule, sub["subscription_id"],
+                cond["rule_type"], config, f"voice alert: {sym}", 60.0)
+            if isinstance(rule, dict) and rule.get("error"):
+                return await _speak_and_return(
+                    f"I couldn't set that alert, Jeffery. {rule['error']}", "alert.add")
+            await _push_watch_snapshot(websocket)
+            return await _speak_and_return(confirm, "alert.add")
+
+        async def _alert_dispatch(sym: str, cond: dict | None):
+            """Create the alert, or ask for the missing piece (price, then
+            direction) and stash a pending_alert for the next turn to complete."""
+            if cond is None:
+                websocket.scope["pending_alert"] = {"symbol": sym, "need": "condition"}
+                return await _speak_and_return(
+                    f"At what price for {sym}? Say 'above 250', 'below 200', "
+                    f"or a percent move like '5 percent'.", "alert.ask")
+            if cond["rule_type"] == "price_cross" and cond["direction"] is None:
+                prices = await charting.current_prices([sym])
+                cur = prices.get(sym)
+                if cur is None:
+                    websocket.scope["pending_alert"] = {
+                        "symbol": sym, "need": "direction", "price": cond["price"]}
+                    return await _speak_and_return(
+                        f"Should I alert when {sym} goes above or below "
+                        f"{cond['price']:g}?", "alert.ask")
+                cond = {**cond, "direction": "above" if cond["price"] >= cur else "below"}
+            return await _alert_finalize(sym, cond)
+
+        # Complete a pending alert from a short follow-up answer ("above 250").
+        pending_alert = websocket.scope.get("pending_alert")
+        if pending_alert:
+            if pending_alert["need"] == "condition":
+                c = _parse_alert_reply(user_text)
+                if c is not None:
+                    return await _alert_dispatch(pending_alert["symbol"], c)
+                websocket.scope.pop("pending_alert", None)  # not an answer; move on
+            elif pending_alert["need"] == "direction":
+                d = _parse_direction(user_text)
+                if d is not None:
+                    return await _alert_finalize(pending_alert["symbol"], {
+                        "rule_type": "price_cross", "price": pending_alert["price"],
+                        "pct": None, "direction": d})
+                websocket.scope.pop("pending_alert", None)
 
         # Deterministic close-view intent: exit immersive (chart/camera/etc.)
         # directly instead of relying on the model to call open_view(off).
@@ -1983,6 +3149,66 @@ async def process_turn(
             if len(new_history) > MAX_HISTORY_MESSAGES:
                 new_history = new_history[-MAX_HISTORY_MESSAGES:]
             return new_history
+
+        # Deterministic watch-list board show/hide → the immersive visual stage.
+        # The model can't be trusted to drive the UI with think:False (cf. chart).
+        wl_mode = _match_watchlist_view_intent(user_text)
+        if wl_mode == "hide":
+            await run_open_view_tool({"kind": "off"}, websocket)
+            return await _speak_and_return("Closed the watchlist.", "watchlist.hide")
+        if wl_mode:  # show or toggle
+            payload = await watchlist.build_payload()
+            await websocket.send_json(
+                {"action": "open_view", "kind": "watchlist", "watchlist": payload})
+            n = len(payload.get("rows", []))
+            spoken = ("Your watchlist is empty — add a symbol and I'll track it."
+                      if n == 0
+                      else f"Here's your watchlist, {n} symbol{'' if n == 1 else 's'}.")
+            return await _speak_and_return(spoken, "watchlist.show")
+
+        # News-watch list management — all deterministic, before the LLM.
+        if _match_news_list_intent(user_text):
+            watches = await asyncio.to_thread(news.list_watches_db, True)
+            if not watches:
+                spoken = "You have no news watches yet, Jeffery."
+            else:
+                syms = ", ".join(w["symbol"] for w in watches)
+                spoken = f"You're watching news on {syms}."
+            return await _speak_and_return(spoken, "news.list")
+
+        unwatch_sym = _match_news_unwatch_intent(user_text)
+        if unwatch_sym:
+            res = await asyncio.to_thread(news.tool_remove_news_watch, 0, unwatch_sym)
+            spoken = (f"Stopped watching {unwatch_sym} news."
+                      if res.get("deactivated")
+                      else f"You weren't watching {unwatch_sym} news.")
+            await _push_watch_snapshot(websocket)
+            return await _speak_and_return(spoken, "news.remove")
+
+        watch_sym = _match_news_watch_intent(user_text)
+        if watch_sym:
+            res = await asyncio.to_thread(news.tool_add_news_watch, watch_sym, "", "")
+            spoken = (f"I couldn't add that watch, Jeffery. {res['error']}"
+                      if res.get("error")
+                      else f"Watching {watch_sym} news. I'll speak any new headlines.")
+            await _push_watch_snapshot(websocket)
+            # Silent on success — the watchlist panel reflects the add visually;
+            # only speak if the add failed. (Jeffery asked: don't announce this.)
+            return await _speak_and_return(
+                spoken, "news.add", speak=bool(res.get("error")))
+
+        # Deterministic price-alert route (after news so news phrasing wins).
+        # Qwen3 ignores add_alert_rule with think:False, so set alerts here.
+        if _match_alert_intent(user_text):
+            alert_sym = _extract_alert_symbol(user_text)
+            alert_cond = _parse_alert_condition(user_text)
+            if alert_sym:
+                return await _alert_dispatch(alert_sym, alert_cond)
+            if alert_cond is not None:
+                return await _speak_and_return(
+                    "Which symbol should I set that alert on, Jeffery?", "alert.ask")
+            # No symbol and no price — probably a question about alerts; let the
+            # model field it rather than mis-firing the add flow.
 
         # Index comparison sweep: "backtest the indexes" / "compare the indexes"
         # runs the set and shows a ranked table. Checked BEFORE the single-symbol
@@ -2129,6 +3355,72 @@ async def process_turn(
                     new_history = new_history[-MAX_HISTORY_MESSAGES:]
                 return new_history
 
+        # Deterministic hold/exit route: a "how long should I hold my <option>"
+        # question. Runs BEFORE the trade route (which also matches "should i
+        # sell") so a held-contract question isn't answered with a fresh trade
+        # idea. See build_hold_check.
+        _HOLD_FIELDS = ("symbol", "strike", "type", "expiry")
+
+        async def _run_hold(c: dict):
+            """Run build_hold_check for a fully-specified contract and close out."""
+            websocket.scope.pop("pending_hold", None)
+            websocket.scope["hal_last_option"] = {k: c[k] for k in _HOLD_FIELDS}
+            spoken, full_md = await build_hold_check(c, websocket)
+            await stream_sentence(spoken)
+            assistant_content = full_md or spoken
+            await _push_trade_idea(websocket, "hold", c["symbol"], full_md)
+            nh = history + [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": assistant_content},
+            ]
+            if on_reply:
+                try:
+                    await on_reply(nh)
+                except Exception as e:
+                    print(f"[turn] on_reply failed: {e}")
+            print(f"[hal] hold check {c['symbol']} {c['strike']:g}: {spoken!r}")
+            await _emit_telemetry(websocket, "hold", f"{c['symbol']} {c['strike']:g}",
+                                  assistant_content, status="ok")
+            await websocket.send_json({"state": "done"})
+            return nh[-MAX_HISTORY_MESSAGES:] if len(nh) > MAX_HISTORY_MESSAGES else nh
+
+        async def _ask_hold(c: dict):
+            """Stash the partial contract and ask for the first missing field, so
+            the user's next reply (even without a hold cue) completes it."""
+            websocket.scope["pending_hold"] = {k: c.get(k) for k in _HOLD_FIELDS}
+            if not (c.get("symbol") and c.get("strike") and c.get("type")):
+                msg = ("Which position, Jeffery? Tell me the ticker, strike, call or "
+                       "put, and expiration — like 'my AVGO 485 call for June 26'.")
+            else:
+                msg = (f"What expiration is that {c['symbol']} {c['strike']:g} "
+                       f"{c['type']}, Jeffery?")
+            return await _speak_and_return(msg, "hold.ask")
+
+        # Continue a pending hold question: a prior turn asked which contract, so
+        # this reply ("my AVGO 485 call for June 26") completes it even though it
+        # carries no hold/sell cue of its own.
+        pend_hold = websocket.scope.get("pending_hold")
+        if pend_hold:
+            pc = _parse_option_phrase(user_text) or {}
+            merged = {k: (pc.get(k) or pend_hold.get(k)) for k in _HOLD_FIELDS}
+            if all(merged.get(k) for k in _HOLD_FIELDS):
+                return await _run_hold(merged)
+            if any(pc.get(k) for k in _HOLD_FIELDS):
+                return await _ask_hold(merged)  # progress; ask for what's still missing
+            websocket.scope.pop("pending_hold", None)  # unrelated reply; fall through
+
+        hold_contract = _match_hold_intent(user_text)
+        # "when should I sell this position" — no contract re-stated; resolve it
+        # from the last option discussed so it isn't mistaken for a short setup.
+        if hold_contract is None and _is_exit_question(user_text):
+            remembered = websocket.scope.get("hal_last_option")
+            hold_contract = dict(remembered) if remembered else {
+                "symbol": None, "strike": None, "type": None, "expiry": None}
+        if hold_contract is not None:
+            if not all(hold_contract.get(k) for k in _HOLD_FIELDS):
+                return await _ask_hold(hold_contract)
+            return await _run_hold(hold_contract)
+
         # Deterministic trade route: build a sized long call/put + table in
         # Python so HAL never blanks on a trade question (the model returns ''
         # under think:False on heavy directives). See build_trade_reco.
@@ -2137,17 +3429,11 @@ async def process_turn(
             spoken, full_md = await build_trade_reco(
                 trade_sym, websocket.scope.get("hal_risk"), websocket
             )
-            # If a chart is open, close it so the trade-setup table is front and
-            # center in the transcript (the chart -> trade transition the user
-            # expects). Only fires when a chart is actually up.
-            if websocket.scope.get("hal_chart") is not None:
-                try:
-                    await run_open_view_tool({"kind": "off"}, websocket)
-                    websocket.scope.pop("hal_chart", None)
-                except Exception as e:
-                    print(f"[trade] view close failed: {e}")
+            # build_trade_reco renders the underlying's chart, so the panel
+            # stays on screen alongside the spoken recommendation.
             await stream_sentence(spoken)
             assistant_content = full_md or spoken
+            await _push_trade_idea(websocket, "trade", trade_sym, full_md)
             new_history = history + [
                 {"role": "user", "content": user_text},
                 {"role": "assistant", "content": assistant_content},
@@ -2159,6 +3445,31 @@ async def process_turn(
                     print(f"[turn] on_reply failed: {e}")
             print(f"[hal] trade reco for {trade_sym}: {spoken!r}")
             await _emit_telemetry(websocket, "trade", trade_sym, assistant_content, status="ok")
+            await websocket.send_json({"state": "done"})
+            if len(new_history) > MAX_HISTORY_MESSAGES:
+                new_history = new_history[-MAX_HISTORY_MESSAGES:]
+            return new_history
+
+        # Deterministic watchlist screen: a trade-idea request with NO ticker
+        # named -> scan the watchlist, pick the strongest setup, recommend it.
+        if _is_watchlist_screen_request(user_text):
+            spoken, full_md = await screen_watchlist_and_reco(websocket)
+            await stream_sentence(spoken)
+            assistant_content = full_md or spoken
+            _wl_m = re.search(r"\|\s*([A-Z]{1,5})\s*\|\s*Long", full_md or "")
+            await _push_trade_idea(
+                websocket, "trade", _wl_m.group(1) if _wl_m else "", full_md)
+            new_history = history + [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": assistant_content},
+            ]
+            if on_reply:
+                try:
+                    await on_reply(new_history)
+                except Exception as e:
+                    print(f"[turn] on_reply failed: {e}")
+            print(f"[hal] watchlist screen: {spoken!r}")
+            await _emit_telemetry(websocket, "trade_screen", user_text, assistant_content, status="ok")
             await websocket.send_json({"state": "done"})
             if len(new_history) > MAX_HISTORY_MESSAGES:
                 new_history = new_history[-MAX_HISTORY_MESSAGES:]
@@ -2189,22 +3500,16 @@ async def process_turn(
                     new_history = new_history[-MAX_HISTORY_MESSAGES:]
                 return new_history
             # Actionable trade request while a chart is open -> build the real
-            # sized trade (which closes the chart and shows the table), using
-            # the chart's symbol. Broader than _match_trade_intent so phrases
-            # like "show me the trade" / "what position should I put here" work.
+            # sized trade using the chart's symbol. Broader than
+            # _match_trade_intent so phrases like "show me the trade" / "what
+            # position should I put here" work. build_trade_reco re-renders the
+            # chart, so the panel stays on screen with the recommendation.
             if _is_chart_trade_request(user_text):
                 csym = active_chart.get("symbol")
                 if csym:
                     spoken, full_md = await build_trade_reco(
                         csym, websocket.scope.get("hal_risk"), websocket
                     )
-                    # Close the chart so the trade-setup table is front and
-                    # center in the transcript (the transition the user expects).
-                    try:
-                        await run_open_view_tool({"kind": "off"}, websocket)
-                        websocket.scope.pop("hal_chart", None)
-                    except Exception as e:
-                        print(f"[trade] view close failed: {e}")
                     await stream_sentence(spoken)
                     assistant_content = full_md or spoken
                     new_history = history + [
@@ -2258,6 +3563,10 @@ async def process_turn(
                 await on_reply(new_history)
             except Exception as e:
                 print(f"[turn] on_reply failed: {e}")
+        # Pin LLM-generated trade recommendations in the Trade Ideas pane too
+        # (deterministic routes pin theirs; this catches questions the routes
+        # don't, like "recommend any strategies on Google").
+        await _push_idea_if_trade(websocket, user_text, reply)
         print(f"[hal] {reply!r}")
         await _emit_telemetry(
             websocket,
@@ -2337,12 +3646,34 @@ async def voice_interface(websocket: WebSocket):
         except Exception:
             pass
 
+    async def send_mcp_snapshot():
+        try:
+            servers = await asyncio.to_thread(mcp_client.status_snapshot)
+            await websocket.send_json({"mcp_servers": servers})
+        except Exception:
+            pass
+
+    async def _mcp_auth_then_snapshot(server_id: int):
+        """Run the interactive OAuth sign-in for a server, then refresh the
+        UI. Spawned as a task so the up-to-5-min browser wait never blocks
+        the websocket receive loop."""
+        try:
+            await mcp_client.authorize(server_id)
+        except Exception as e:
+            print(f"[mcp] auto-authorize failed: {e}")
+        await send_mcp_snapshot()
+
+    async def send_subscriptions_snapshot():
+        await _push_watch_snapshot(websocket)
+
     def persist_current():
         current_conv["messages"] = history
         save_conversation(current_conv)
 
     await send_conversations_snapshot()
     await send_conversation_history()
+    await send_mcp_snapshot()
+    await send_subscriptions_snapshot()
 
     async def deliver_alert(message: str, payload: dict):
         """Called by market.SubscriptionManager when a rule fires. Aborts any
@@ -2351,6 +3682,18 @@ async def voice_interface(websocket: WebSocket):
         the alert lands in conversation history."""
         nonlocal current_task, abort_event, history
         print(f"[alert] inbound: {message}")
+        # Dedup: never speak the same alert/headline twice on one connection
+        # (guards against a double broadcast or a replay-vs-live overlap).
+        _aid = payload.get("event_id") or payload.get("article_id")
+        if _aid is not None:
+            _key = f"{payload.get('kind') or payload.get('ev') or 'mkt'}:{_aid}"
+            _seen = websocket.scope.setdefault("hal_spoken_alert_ids", [])
+            if _key in _seen:
+                print(f"[alert] duplicate suppressed: {_key}")
+                return
+            _seen.append(_key)
+            if len(_seen) > 100:
+                del _seen[:50]
         # Interrupt any speaking/processing.
         abort_event.set()
         if current_task and not current_task.done():
@@ -2359,6 +3702,9 @@ async def voice_interface(websocket: WebSocket):
             except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                 pass
         try:
+            # Drop any audio from the interrupted turn so the alert doesn't
+            # play over the top of it (overlapping voices).
+            await websocket.send_json({"action": "audio_flush"})
             await websocket.send_json(
                 {"state": "processing", "text": f"ALERT: {message}"}
             )
@@ -2427,18 +3773,31 @@ async def voice_interface(websocket: WebSocket):
             pending = await asyncio.to_thread(market.list_unspoken_alerts)
         except Exception as e:
             print(f"[alert] replay fetch failed: {e}")
+            pending = []
+        try:
+            news_pending = await asyncio.to_thread(news.list_unspoken_articles)
+        except Exception as e:
+            print(f"[news] replay fetch failed: {e}")
+            news_pending = []
+        total = len(pending) + len(news_pending)
+        if total == 0:
             return
-        if not pending:
-            return
-        print(f"[alert] replaying {len(pending)} missed alert(s)")
+        print(f"[alert] replaying {total} missed alert(s)")
         for p in pending:
             try:
                 await asyncio.to_thread(market.mark_alert_spoken, p["id"])
             except Exception:
                 pass
-        bullets = "\n".join(f"- {p['message']}" for p in pending)
+        for a in news_pending:
+            try:
+                await asyncio.to_thread(news.mark_article_spoken, a["id"])
+            except Exception:
+                pass
+        lines = [f"- {p['message']}" for p in pending]
+        lines += [f"- News on {a['symbol']}: {a['title']}" for a in news_pending]
+        bullets = "\n".join(lines)
         synthetic = (
-            f"[MISSED MARKET ALERTS — {len(pending)} fired while you were away]\n"
+            f"[MISSED ALERTS — {total} fired while you were away]\n"
             f"{bullets}\n\n"
             "Brief Jeffery on these in one or two short sentences total; lead with "
             "the count. Do not call any tools."
@@ -2479,6 +3838,15 @@ async def voice_interface(websocket: WebSocket):
                     print(
                         f"[ws] Listening stopped ({len(audio_buffer)} bytes, mime={mime or 'unknown'}, +{len(attachments)} attachment(s))"
                     )
+                    # Preempt any in-flight turn before starting a new one, so
+                    # two turns never run concurrently and race on `history`
+                    # (which double-appends the exchange — duplicate chat lines).
+                    abort_event.set()
+                    if current_task and not current_task.done():
+                        try:
+                            await asyncio.wait_for(current_task, timeout=3)
+                        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                            pass
                     abort_event = asyncio.Event()
                     buffer_snapshot = audio_buffer
                     audio_buffer = bytearray()
@@ -2514,6 +3882,14 @@ async def voice_interface(websocket: WebSocket):
                                 preview,
                             )
                         model_mode = (command.get("model_mode") or "").lower()
+                        # Preempt any in-flight turn so two turns can't race on
+                        # `history` and double-append the exchange.
+                        abort_event.set()
+                        if current_task and not current_task.done():
+                            try:
+                                await asyncio.wait_for(current_task, timeout=3)
+                            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                                pass
                         abort_event = asyncio.Event()
                         current_task = asyncio.create_task(
                             run_turn(
@@ -2538,6 +3914,83 @@ async def voice_interface(websocket: WebSocket):
                         pass
                 elif cmd == "list_conversations":
                     await send_conversations_snapshot()
+                elif cmd == "list_subscriptions":
+                    await send_subscriptions_snapshot()
+                elif cmd == "news_remove_watch":
+                    try:
+                        await asyncio.to_thread(
+                            news.tool_remove_news_watch,
+                            int(command.get("watch_id", 0) or 0),
+                        )
+                    except Exception as e:
+                        print(f"[news] remove watch failed: {e}")
+                    await send_subscriptions_snapshot()
+                elif cmd == "watchlist_refresh":
+                    try:
+                        payload = await watchlist.build_payload()
+                        await websocket.send_json(
+                            {"action": "watchlist_update", "watchlist": payload})
+                    except Exception as e:
+                        print(f"[watchlist] refresh failed: {e}")
+                elif cmd == "chart_refresh":
+                    req = websocket.scope.get("hal_chart_req")
+                    if req:
+                        try:
+                            await render_chart(
+                                req["symbol"], req["timeframe"], websocket, refresh=True)
+                        except Exception as e:
+                            print(f"[chart] refresh failed: {e}")
+                elif cmd == "mcp_list":
+                    await send_mcp_snapshot()
+                elif cmd == "mcp_add":
+                    try:
+                        added = await mcp_client.add(
+                            name=command.get("name", ""),
+                            transport=command.get("transport", "stdio"),
+                            command=command.get("server_command", ""),
+                            args=command.get("args", ""),
+                            url=command.get("url", ""),
+                            env=command.get("env", ""),
+                            headers=command.get("headers", ""),
+                            api_key=command.get("api_key", ""),
+                        )
+                        # If the newly added http server needs login, kick off the
+                        # interactive OAuth sign-in immediately (opens the browser),
+                        # so the user doesn't have to find an Authorize button.
+                        sid = (added or {}).get('id')
+                        if sid is not None:
+                            entry = mcp_client._cache.get(sid) or {}
+                            if entry.get('status') == 'needs_auth':
+                                asyncio.create_task(_mcp_auth_then_snapshot(sid))
+                    except Exception as e:
+                        print(f"[mcp] add failed: {e}")
+                    await send_mcp_snapshot()
+                elif cmd == "mcp_remove":
+                    try:
+                        await mcp_client.remove(int(command.get("id", 0)))
+                    except Exception as e:
+                        print(f"[mcp] remove failed: {e}")
+                    await send_mcp_snapshot()
+                elif cmd == "mcp_toggle":
+                    try:
+                        await mcp_client.set_enabled(
+                            int(command.get("id", 0)), bool(command.get("enabled"))
+                        )
+                    except Exception as e:
+                        print(f"[mcp] toggle failed: {e}")
+                    await send_mcp_snapshot()
+                elif cmd == "mcp_refresh":
+                    try:
+                        await mcp_client.refresh_all()
+                    except Exception as e:
+                        print(f"[mcp] refresh failed: {e}")
+                    await send_mcp_snapshot()
+                elif cmd == "mcp_authorize":
+                    try:
+                        await mcp_client.authorize(int(command.get("id", 0)))
+                    except Exception as e:
+                        print(f"[mcp] authorize failed: {e}")
+                    await send_mcp_snapshot()
                 elif cmd == "new_conversation":
                     abort_event.set()
                     current_conv = _new_conversation_obj()

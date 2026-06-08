@@ -6,7 +6,7 @@ Optional args: ticker months   (e.g.  dump_trades.py SPY 24)
 import asyncio
 import sys
 
-import backtest
+from hal.cerebellum import backtest
 
 
 def key() -> str:

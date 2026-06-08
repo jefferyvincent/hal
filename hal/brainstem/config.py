@@ -44,8 +44,39 @@ if _ENV_PATH.exists():
         _k, _v = _line.split("=", 1)
         os.environ.setdefault(_k.strip(), _v.strip())
 
+
+# --- Typed .env helpers ---------------------------------------------------
+def _env_str(key: str, default: str) -> str:
+    return os.environ.get(key, default)
+
+
+# --- Identity (configurable via .env; defaults preserve current behavior) --
+USER_NAME = _env_str("HAL_USER_NAME", "Jeffery")
+HAL_NAME = _env_str("HAL_NAME", "HAL")
+HAL_VERSION = _env_str("HAL_VERSION", "9000")
+HAL_DESIGNATION = f"{HAL_NAME} {HAL_VERSION}".strip()  # e.g. "HAL 9000"
+
+# --- Obsidian vault (journal / rules / theses / watchlist) ------------------
+# The vault is the human-authored corpus; HAL reads rules from it at boot and
+# injects them into the system prompt (restart to pick up edits, for now).
+VAULT_ROOT = Path(_env_str("HAL_VAULT", "C:/Users/Gamer/HAL-Vault")).expanduser()
+_RULES_FILE = VAULT_ROOT / "Rules" / "trading-rules.md"
+try:
+    TRADING_RULES = _RULES_FILE.read_text(encoding="utf-8") if _RULES_FILE.is_file() else ""
+except OSError:
+    TRADING_RULES = ""  # a missing/unreadable vault must never block boot
+
 MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY", "")
 MASSIVE_BASE_URL = "https://api.massive.com"
+
+# News watch monitor: poll interval (seconds) and primary RSS source
+# ("yahoo" or "google"). Both feeds are keyless; Yahoo is per-symbol headlines.
+NEWS_POLL_SECONDS = float(os.environ.get("NEWS_POLL_SECONDS", "300"))
+NEWS_PRIMARY_FEED = os.environ.get("NEWS_PRIMARY_FEED", "yahoo")
+
+# Chart bar source: "yahoo" (free, keyless, near-real-time for US equities) or
+# "massive" (REST aggregates; freshness depends on the stock-data entitlement).
+CHART_DATA_SOURCE = os.environ.get("CHART_DATA_SOURCE", "yahoo")
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 OLLAMA_MODEL = "qwen3.6:27b"  # default LLM (smart, slower)
@@ -69,13 +100,22 @@ PIPER_VOICE_PATH = "D:/hal_scratch/piper_voices/en_US-ryan-medium.onnx"
 TTS_PITCH_SHIFT_STEPS = 0
 WHISPER_MODEL_SIZE = "medium"
 WHISPER_PROMPT = (
-    "Conversation with HAL 9000, the AI computer from 2001: A Space Odyssey. "
-    "User is Jeffery. Topics include PowerShell, Python, Ollama, files, and tasks "
+    f"Conversation with {HAL_DESIGNATION}, the AI computer from 2001: A Space Odyssey. "
+    f"User is {USER_NAME}. Topics include PowerShell, Python, Ollama, files, and tasks "
     "on a Windows desktop."
 )
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 SCRATCH_DIR = Path("D:/hal_scratch").resolve()
+
+# HAL-Vault: the Obsidian vault that doubles as the RAG corpus, HAL write target,
+# and live Dataview dashboard source. Override via HAL_VAULT_DIR env var.
+VAULT_DIR = Path(os.environ.get("HAL_VAULT_DIR", Path.home() / "HAL-Vault")).resolve()
+
+# LanceDB index and SQLite for RAG live outside the vault so Obsidian doesn't
+# try to index them. They're derived data, fully rebuildable from the vault.
+RAG_DB_DIR = Path(os.environ.get("HAL_RAG_DB_DIR", Path("D:/hal_scratch/rag"))).resolve()
+RAG_DB_DIR.mkdir(parents=True, exist_ok=True)
 SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
 
 HISTORY_FILE = Path("./hal_history.json").resolve()  # legacy single-history file

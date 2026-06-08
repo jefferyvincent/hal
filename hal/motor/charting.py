@@ -13,6 +13,8 @@ client stores it and renders it as a new immersive source.
 """
 from __future__ import annotations
 
+import asyncio
+import time
 from datetime import date, timedelta
 from typing import Any, Optional
 
@@ -21,12 +23,14 @@ import httpx
 
 BASE_URL: str = ""
 API_KEY: str = ""
+SOURCE: str = "massive"  # "massive" | "yahoo"
 
 
-def configure(base_url: str, api_key: str) -> None:
-    global BASE_URL, API_KEY
+def configure(base_url: str, api_key: str, source: str = "massive") -> None:
+    global BASE_URL, API_KEY, SOURCE
     BASE_URL = base_url
     API_KEY = api_key
+    SOURCE = source if source in ("massive", "yahoo") else "massive"
 
 
 # --- timeframe parsing -----------------------------------------------------
@@ -142,6 +146,115 @@ def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {API_KEY}"}
 
 
+# --- bar sources -----------------------------------------------------------
+# Both return raw bars as [{t: ms, o, h, l, c, v}] so build_chart's loop is
+# source-agnostic.
+
+_YAHOO_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+# Massive (multiplier, timespan) -> Yahoo interval. Yahoo has no 4-hour bar, so
+# it degrades to hourly.
+_YAHOO_INTERVALS: dict[tuple[int, str], str] = {
+    (1, "minute"): "1m", (2, "minute"): "2m", (5, "minute"): "5m",
+    (15, "minute"): "15m", (30, "minute"): "30m",
+    (1, "hour"): "60m", (4, "hour"): "60m",
+    (1, "day"): "1d", (1, "week"): "1wk",
+}
+
+
+async def _fetch_bars_massive(sym, mult, timespan, from_d, to_d) -> list[dict]:
+    if not API_KEY:
+        raise RuntimeError("MASSIVE_API_KEY not configured")
+    path = (
+        f"/v2/aggs/ticker/{sym}/range/{mult}/{timespan}/"
+        f"{from_d.isoformat()}/{to_d.isoformat()}"
+    )
+    params = {"adjusted": "true", "sort": "asc", "limit": 50000}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(BASE_URL + path, headers=_headers(), params=params)
+    if r.status_code != 200:
+        raise RuntimeError(f"Massive HTTP {r.status_code}: {r.text[:300]}")
+    return (r.json() or {}).get("results") or []
+
+
+async def _fetch_bars_yahoo(sym, mult, timespan, from_d, to_d) -> list[dict]:
+    """Free, keyless OHLC from Yahoo Finance's chart API. Near-real-time for US
+    equities during market hours. Nulls (gaps / a still-forming bar) are skipped."""
+    interval = _YAHOO_INTERVALS.get((mult, timespan), "5m")
+    period1 = int(time.mktime(from_d.timetuple()))
+    period2 = int(time.mktime((to_d + timedelta(days=1)).timetuple()))
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
+    params = {
+        "interval": interval, "period1": period1, "period2": period2,
+        "includePrePost": "false",
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(url, params=params, headers={"User-Agent": _YAHOO_UA})
+    if r.status_code != 200:
+        raise RuntimeError(f"Yahoo HTTP {r.status_code}: {r.text[:200]}")
+    chart = (r.json() or {}).get("chart") or {}
+    if chart.get("error"):
+        raise RuntimeError(f"Yahoo error: {chart['error']}")
+    result = (chart.get("result") or [None])[0]
+    if not result:
+        return []
+    ts = result.get("timestamp") or []
+    quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+    opens = quote.get("open") or []
+    highs = quote.get("high") or []
+    lows = quote.get("low") or []
+    closes = quote.get("close") or []
+    vols = quote.get("volume") or []
+    bars: list[dict] = []
+    for i, t in enumerate(ts):
+        o = opens[i] if i < len(opens) else None
+        h = highs[i] if i < len(highs) else None
+        l = lows[i] if i < len(lows) else None
+        c = closes[i] if i < len(closes) else None
+        if o is None or h is None or l is None or c is None:
+            continue
+        v = vols[i] if i < len(vols) and vols[i] is not None else 0
+        bars.append({"t": int(t) * 1000, "o": o, "h": h, "l": l, "c": c, "v": v})
+    return bars
+
+
+async def current_prices(symbols: list[str]) -> dict[str, float]:
+    """Latest price per symbol from Yahoo Finance (meta.regularMarketPrice).
+    Always Yahoo (keyless, near-real-time for US equities), independent of the
+    chart SOURCE setting — used by the price-alert poller and direction
+    inference. Symbols that fail to fetch are simply omitted from the result."""
+    out: dict[str, float] = {}
+    syms = [s for s in dict.fromkeys(symbols) if s]  # dedupe, preserve order
+    if not syms:
+        return out
+
+    async def _one(client: httpx.AsyncClient, sym: str) -> None:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
+        params = {"interval": "1m", "range": "1d"}
+        try:
+            r = await client.get(url, params=params, headers={"User-Agent": _YAHOO_UA})
+            if r.status_code != 200:
+                return
+            result = (((r.json() or {}).get("chart") or {}).get("result") or [None])[0]
+            price = ((result or {}).get("meta") or {}).get("regularMarketPrice")
+            if price is not None:
+                out[sym] = float(price)
+        except Exception:
+            return
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        await asyncio.gather(*[_one(client, s) for s in syms])
+    return out
+
+
+async def _fetch_bars(sym, mult, timespan, from_d, to_d) -> list[dict]:
+    if SOURCE == "yahoo":
+        return await _fetch_bars_yahoo(sym, mult, timespan, from_d, to_d)
+    return await _fetch_bars_massive(sym, mult, timespan, from_d, to_d)
+
+
 async def build_chart(
     symbol: str,
     timeframe: str = "5m",
@@ -153,26 +266,13 @@ async def build_chart(
     Raises RuntimeError on configuration/API problems so the caller can
     surface a spoken error.
     """
-    if not API_KEY:
-        raise RuntimeError("MASSIVE_API_KEY not configured")
-
     sym = symbol.upper().strip()
     (mult, timespan, lookback), tf_label = _resolve_timeframe(timeframe)
 
     to_d = date.today()
     from_d = to_d - timedelta(days=lookback)
-    path = (
-        f"/v2/aggs/ticker/{sym}/range/{mult}/{timespan}/"
-        f"{from_d.isoformat()}/{to_d.isoformat()}"
-    )
-    params = {"adjusted": "true", "sort": "asc", "limit": 50000}
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(BASE_URL + path, headers=_headers(), params=params)
-    if r.status_code != 200:
-        raise RuntimeError(f"Massive HTTP {r.status_code}: {r.text[:300]}")
-
-    results = (r.json() or {}).get("results") or []
+    results = await _fetch_bars(sym, mult, timespan, from_d, to_d)
     if not results:
         raise RuntimeError(f"no bars returned for {sym} ({tf_label})")
 
