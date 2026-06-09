@@ -4,6 +4,7 @@ import { captureFrameFromVideo } from "@/lib/vision";
 import { cn } from "@/lib/cn";
 import ChartStage from "@/components/immersive/ChartStage";
 import BacktestStage from "@/components/immersive/BacktestStage";
+import WatchlistStage from "@/components/immersive/WatchlistStage";
 
 function mapEmbedUrl(query: string): string {
   return `https://maps.google.com/maps?q=${encodeURIComponent(query)}&t=&z=13&ie=UTF8&iwloc=&output=embed`;
@@ -66,10 +67,13 @@ export default function ImmersiveStage() {
         source === "map" && "src-map",
         source === "chart" && "src-chart",
         source === "backtest" && "src-chart",
+        source === "watchlist" && "src-chart",
+        source === "trade_ideas" && "src-chart",
       )}
     >
       {source === "chart" && <ChartStage />}
       {source === "backtest" && <BacktestStage />}
+      {source === "watchlist" && <WatchlistStage />}
       <video
         ref={videoRef}
         autoPlay

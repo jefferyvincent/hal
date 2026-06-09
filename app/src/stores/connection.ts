@@ -11,13 +11,30 @@ import { useImmersive } from "@/stores/immersive";
 import { useUi } from "@/stores/ui";
 import { usePositionSizing } from "@/stores/positionSizing";
 import type {
+  AlertEvent,
   Attachment,
   ChatMessage,
   ConversationSummary,
+  McpServer,
   Mode,
+  NewsArticle,
+  NewsWatch,
   ServerEnvelope,
+  Subscription,
   TelemetryEvent,
+  TradeIdea,
 } from "@/types";
+
+export interface McpAddPayload {
+  name: string;
+  transport: string;
+  server_command?: string;
+  args?: string;
+  url?: string;
+  env?: string;
+  headers?: string;
+  api_key?: string;
+}
 
 interface ConnectionState {
   mode: Mode;
@@ -37,12 +54,24 @@ interface ConnectionState {
    *  their own AnalyserNode. Null when not recording. */
   micStream: MediaStream | null;
   liveVision: boolean;
+  // MCP servers + market subscriptions (server-authoritative).
+  mcpServers: McpServer[];
+  subscriptions: Subscription[];
+  subscriptionsConnected: boolean;
+  subscriptionsUrl: string;
+  alertEvents: AlertEvent[];
+  newsWatches: NewsWatch[];
+  newsArticles: NewsArticle[];
+  // Pinned trade ideas / hold reads (newest first), so they don't scroll away
+  // in the chat. Populated by the server's trade_idea messages.
+  tradeIdeas: TradeIdea[];
 }
 
 interface ConnectionActions {
   init: () => Promise<void>;
   startRecording: (pushToTalk?: boolean) => Promise<void>;
   stopRecording: () => void;
+  cancelRecording: () => void;
   abort: () => Promise<void>;
   wipe: () => Promise<void>;
   sendText: (text: string, attachments?: Attachment[]) => Promise<void>;
@@ -52,6 +81,17 @@ interface ConnectionActions {
   toggleFastMode: () => void;
   clearTelemetry: () => void;
   appendOptimisticUser: (content: string) => void;
+  listMcp: () => void;
+  addMcp: (payload: McpAddPayload) => void;
+  removeMcp: (id: number) => void;
+  toggleMcpServer: (id: number, enabled: boolean) => void;
+  refreshMcp: () => void;
+  authorizeMcp: (id: number) => void;
+  listSubscriptions: () => void;
+  removeNewsWatch: (watchId: number) => void;
+  clearTradeIdeas: () => void;
+  refreshWatchlist: () => void;
+  refreshChart: () => void;
 }
 
 const STATE_LABELS: Record<Mode, string[]> = {
@@ -119,19 +159,17 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
     function maybeReturnToIdle() {
       if (!streamDone || audio.playing) return;
       setMode("idle", "DORMANT");
-      // Push-to-talk everywhere: HAL never re-opens the mic on its own. The
-      // user holds the mic button to talk and releases to send, in every mode
-      // (including immersive). No auto-listen loop — that felt unnatural.
+      // Hands-free immersive: re-arm the mic after each turn so listening
+      // continues until the user exits immersive. Outside immersive we stay
+      // push-to-talk and never re-open the mic on our own.
       try {
-        if (false) {
-          window.setTimeout(() => {
-            const stillImmersive = useImmersive.getState().active;
-            const stillIdle = get().mode === "idle";
-            if (stillImmersive && stillIdle && !get().recording) {
-              void get().startRecording();
-            }
-          }, 250);
-        }
+        window.setTimeout(() => {
+          const stillImmersive = useImmersive.getState().active;
+          const stillIdle = get().mode === "idle";
+          if (stillImmersive && stillIdle && !get().recording) {
+            void get().startRecording(false);
+          }
+        }, 250);
       } catch {
         /* ignore */
       }
@@ -139,10 +177,38 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
     audio.onDrain(maybeReturnToIdle);
 
     function onJson(msg: ServerEnvelope) {
+      if (msg.mcp_servers) {
+        set({ mcpServers: msg.mcp_servers });
+        return;
+      }
+      if (msg.subscriptions || msg.alert_events || msg.news_watches || msg.news_articles) {
+        set({
+          subscriptions: msg.subscriptions ?? [],
+          subscriptionsConnected: !!msg.subscriptions_connected,
+          subscriptionsUrl: msg.subscriptions_url ?? "",
+          alertEvents: msg.alert_events ?? [],
+          newsWatches: msg.news_watches ?? [],
+          newsArticles: msg.news_articles ?? [],
+        });
+        return;
+      }
       if (msg.telemetry) {
         set((s) => ({
           telemetry: [...s.telemetry, msg.telemetry!].slice(-25),
         }));
+        return;
+      }
+      if (msg.trade_idea) {
+        // Pin it (newest first, capped) and open the trade-ideas immersive
+        // stage so the reco doesn't get lost when the chat keeps scrolling.
+        set((s) => ({
+          tradeIdeas: [msg.trade_idea!, ...s.tradeIdeas].slice(0, 20),
+        }));
+        (async () => {
+          const immersive = useImmersive.getState();
+          await immersive.setSource("trade_ideas");
+          if (!immersive.active) await immersive.enter();
+        })().catch((err) => console.warn("trade_idea open:", err));
         return;
       }
       if (msg.conversations) {
@@ -164,6 +230,12 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
             /* ignore */
           }
         }
+        return;
+      }
+      // Server preempted the current turn (e.g. an alert fired mid-speech) —
+      // drop any audio still playing/queued so the new reply doesn't overlap.
+      if (msg.action === "audio_flush") {
+        audio.flush();
         return;
       }
       // Server→client action: HAL is driving the UI (e.g. open_view).
@@ -188,6 +260,11 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
             if (!immersive.active) await immersive.enter();
             return;
           }
+          if (kind === "watchlist") {
+            await immersive.setSource("watchlist", { watchlist: msg.watchlist });
+            if (!immersive.active) await immersive.enter();
+            return;
+          }
           if (!immersive.active) await immersive.enter();
           if (kind === "map") {
             await immersive.setSource("map", { query });
@@ -199,6 +276,16 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
             immersive.pushThought("note", `open_view: unknown kind "${kind}"`);
           }
         })().catch((err) => console.warn("open_view:", err));
+        return;
+      }
+      // Live refresh of the watch-list board while it's open.
+      if (msg.action === "watchlist_update") {
+        if (msg.watchlist) useImmersive.getState().setWatchlist(msg.watchlist);
+        return;
+      }
+      // Live refresh of the chart while it's open (preserves zoom client-side).
+      if (msg.action === "chart_update") {
+        if (msg.chart) useImmersive.getState().setChart(msg.chart);
         return;
       }
       if (msg.action === "chart_zoom") {
@@ -256,6 +343,14 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
       recording: false,
       micStream: null,
       liveVision: false,
+      mcpServers: [],
+      subscriptions: [],
+      subscriptionsConnected: false,
+      subscriptionsUrl: "",
+      alertEvents: [],
+      newsWatches: [],
+      newsArticles: [],
+      tradeIdeas: [],
 
       // -- actions -----------------------------------------------------
       async init() {
@@ -376,10 +471,36 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
         vad?.stop();
         vad = null;
         if (recorder && recorder.state === "recording") {
+          audio.flush();  // barge-in: cut HAL off before sending the new turn
           setMode("processing", "PROCESSING");
           set({ pendingHal: true });
           recorder.stop();
         }
+      },
+
+      cancelRecording() {
+        // Tear down the mic without sending a turn. Detach onstop first so the
+        // normal send-on-stop handler doesn't fire, then stop the tracks.
+        vad?.stop();
+        vad = null;
+        const r = recorder;
+        recorder = null;
+        if (r) {
+          r.onstop = null;
+          try {
+            if (r.state !== "inactive") r.stop();
+          } catch {
+            /* ignore */
+          }
+        }
+        try {
+          micStream?.getTracks().forEach((t) => t.stop());
+        } catch {
+          /* ignore */
+        }
+        micStream = null;
+        set({ recording: false, micStream: null });
+        if (get().mode === "listening") setMode("idle", "DORMANT");
       },
 
       async abort() {
@@ -407,6 +528,7 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
       async sendText(text, attachments = []) {
         const trimmed = text.trim();
         if (!trimmed && attachments.length === 0) return;
+        audio.flush();  // stop any in-flight speech so voices don't overlap
         await audio.ensureContext();
         const sock = getSocket();
         await sock.sendCommand({
@@ -458,6 +580,43 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
 
       clearTelemetry() {
         set({ telemetry: [] });
+      },
+
+      listMcp() {
+        void getSocket().sendCommand({ command: "mcp_list" });
+      },
+      addMcp(payload) {
+        void getSocket().sendCommand({ command: "mcp_add", ...payload });
+      },
+      removeMcp(id) {
+        void getSocket().sendCommand({ command: "mcp_remove", id });
+      },
+      toggleMcpServer(id, enabled) {
+        void getSocket().sendCommand({ command: "mcp_toggle", id, enabled });
+      },
+      refreshMcp() {
+        void getSocket().sendCommand({ command: "mcp_refresh" });
+      },
+      authorizeMcp(id) {
+        void getSocket().sendCommand({ command: "mcp_authorize", id });
+      },
+      listSubscriptions() {
+        void getSocket().sendCommand({ command: "list_subscriptions" });
+      },
+      removeNewsWatch(watchId) {
+        void getSocket().sendCommand({
+          command: "news_remove_watch",
+          watch_id: watchId,
+        });
+      },
+      clearTradeIdeas() {
+        set({ tradeIdeas: [] });
+      },
+      refreshWatchlist() {
+        void getSocket().sendCommand({ command: "watchlist_refresh" });
+      },
+      refreshChart() {
+        void getSocket().sendCommand({ command: "chart_refresh" });
       },
     };
   },

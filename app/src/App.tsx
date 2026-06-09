@@ -10,6 +10,9 @@ import Transcript from "@/components/Transcript";
 import ConversationsPanel from "@/components/ConversationsPanel";
 import TelemetryPanel from "@/components/TelemetryPanel";
 import PositionSizing from "@/components/PositionSizing";
+import McpPanel from "@/components/McpPanel";
+import SubscriptionsPanel from "@/components/SubscriptionsPanel";
+import TradeIdeasStage from "@/components/TradeIdeasPanel";
 import ImmersiveStage from "@/components/immersive/ImmersiveStage";
 import SourceBar from "@/components/immersive/SourceBar";
 import MapInput from "@/components/immersive/MapInput";
@@ -111,6 +114,9 @@ export default function App() {
       <TelemetryPanel />
       {/* Risk-based options position sizing (account size + risk rules). */}
       <PositionSizing />
+      <SubscriptionsPanel />
+      <TradeIdeasStage />
+      <McpPanel />
 
       <main
         className={`relative z-[5] flex h-full w-full items-center justify-center pt-[70px] pb-[260px] ${

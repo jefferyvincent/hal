@@ -8,6 +8,16 @@ export class AudioPlayer {
   private isPlaying = false;
   private idleTimer: number | null = null;
   private onDrainCb: (() => void) | null = null;
+  // Serializes decode+schedule so chunks are placed on the timeline in arrival
+  // order. decodeAudioData is async, so without this, chunks that arrive in a
+  // burst decode concurrently and race on nextChunkStart — scheduling
+  // overlapping sources, which sounds like stuttering/garbled speech.
+  private chain: Promise<void> = Promise.resolve();
+  // Bumped on flush(). Chunks captured before a flush are dropped even if their
+  // async decode was already in flight — otherwise stale audio from an
+  // interrupted turn schedules onto the new context and plays over the top
+  // (overlap = stuttering / sped-up garble).
+  private epoch = 0;
 
   /** Lazily build / resume the AudioContext (browser autoplay rules). */
   async ensureContext(): Promise<AudioContext> {
@@ -32,8 +42,18 @@ export class AudioPlayer {
     this.onDrainCb = cb;
   }
 
-  /** Enqueue a single WAV blob for gap-free playback. */
-  async queue(buffer: ArrayBuffer): Promise<void> {
+  /** Enqueue a single WAV blob for gap-free playback. Calls are serialized so
+   *  chunks land on the timeline in arrival order regardless of decode timing. */
+  queue(buffer: ArrayBuffer): Promise<void> {
+    const epoch = this.epoch;
+    this.chain = this.chain
+      .then(() => this._decodeAndSchedule(buffer, epoch))
+      .catch((err) => console.warn("AudioPlayer: chunk failed", err));
+    return this.chain;
+  }
+
+  private async _decodeAndSchedule(buffer: ArrayBuffer, epoch: number): Promise<void> {
+    if (epoch !== this.epoch) return; // flushed after this chunk was queued
     const ctx = await this.ensureContext();
     let audioBuffer: AudioBuffer;
     try {
@@ -42,6 +62,7 @@ export class AudioPlayer {
       console.warn("AudioPlayer: skip chunk", err);
       return;
     }
+    if (epoch !== this.epoch) return; // flushed while decoding — drop it
     const source = ctx.createBufferSource();
     source.buffer = audioBuffer;
     source.connect(ctx.destination);
@@ -73,6 +94,8 @@ export class AudioPlayer {
     }
     this.nextChunkStart = 0;
     this.isPlaying = false;
+    this.epoch += 1;  // invalidate any in-flight chunks queued before this flush
+    this.chain = Promise.resolve();  // drop any pending decode/schedule work
     // Best-effort: closing & rebuilding the context kills any in-flight
     // sources. Cheaper than tracking each source manually.
     if (this.ctx) {

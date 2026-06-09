@@ -1,7 +1,6 @@
 import { useEffect, useRef } from "react";
 import { useConnection } from "@/stores/connection";
 import { useUi } from "@/stores/ui";
-import { useImmersive } from "@/stores/immersive";
 import { renderMessage } from "@/lib/markdown";
 import { cn } from "@/lib/cn";
 
@@ -10,12 +9,24 @@ export default function Transcript() {
   const pendingHal = useConnection((s) => s.pendingHal);
   const fullscreen = useUi((s) => s.fullscreenChat);
   const chatOpen = useUi((s) => s.chatOpen);
-  const chartActive = useImmersive((s) => s.active && s.source === "chart");
+  const containerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
+  // Jump to the latest message when the panel is first opened.
+  useEffect(() => {
+    if (chatOpen) bottomRef.current?.scrollIntoView({ block: "end" });
+  }, [chatOpen]);
+
+  // On new content, only stick to the bottom if the user is already near it —
+  // so scrolling up to read history isn't yanked back down mid-reply.
   useEffect(() => {
     if (!chatOpen) return;
-    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    const el = containerRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+    if (nearBottom) {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    }
   }, [history, pendingHal, chatOpen]);
 
   if (!chatOpen) return null;
@@ -40,6 +51,7 @@ export default function Transcript() {
 
   return (
     <div
+      ref={containerRef}
       className={cn(
         // Fixed positioning with a hard bottom floor at 240px keeps the
         // transcript from ever sliding under the Controls bar (which sits
@@ -48,7 +60,6 @@ export default function Transcript() {
         fullscreen
           ? "top-[80px] bottom-[280px]"
           : "bottom-[280px] max-h-[46vh]",
-        chartActive && "pointer-events-none",
       )}
       onClick={onCopy}
     >

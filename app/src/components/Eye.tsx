@@ -2,8 +2,9 @@ import { useConnection } from "@/stores/connection";
 import { useImmersive } from "@/stores/immersive";
 import { cn } from "@/lib/cn";
 
-/** The HAL 9000 eye — digital-signal styling with sweeping scanline +
- *  dot-matrix noise pattern over the red iris core. */
+/** The HAL eye — a glowing red ring (Jarvis-style) with counter-rotating
+ *  arc sweeps, radial tick marks, and a molten core at center. Speed and
+ *  intensity react to the body.<mode> class set by the connection store. */
 export default function Eye() {
   const startRecording = useConnection((s) => s.startRecording);
   const immersive = useImmersive((s) => s.active);
@@ -17,38 +18,28 @@ export default function Eye() {
           : "h-[480px] w-[480px]",
       )}
     >
-      {/* Decorative pin dots on the hex plate */}
-      <span className="pointer-events-none absolute left-1/2 top-[30px] h-2 w-2 -translate-x-1/2 rounded-full bg-[radial-gradient(circle,#2a2a2f_30%,#050507_80%)]" />
-      <span className="pointer-events-none absolute bottom-[30px] left-1/2 h-2 w-2 -translate-x-1/2 rounded-full bg-[radial-gradient(circle,#2a2a2f_30%,#050507_80%)]" />
-
       <button
         type="button"
         onClick={() => startRecording()}
         aria-label="Activate HAL"
         className={cn(
-          "hal-eye relative cursor-pointer overflow-hidden rounded-full",
+          "hal-eye relative cursor-pointer rounded-full",
           immersive ? "h-[120px] w-[120px]" : "h-80 w-80",
         )}
       >
-        <span
-          className={cn(
-            "hal-eye-iris pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full",
-            immersive ? "h-[60px] w-[60px]" : "h-[160px] w-[160px]",
-          )}
-        />
-        <span
-          className={cn(
-            "hal-eye-pupil pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full",
-            immersive ? "h-3 w-3" : "h-[22px] w-[22px]",
-          )}
-        />
-        <span className="hal-eye-specular pointer-events-none absolute left-[28%] top-[22%] h-[30px] w-[60px] rounded-full" />
-
-        {/* Dot-matrix noise pattern over the whole eye */}
-        <span className="hal-eye-noise pointer-events-none absolute inset-0" />
-
-        {/* Horizontal scanline sweeping top-to-bottom */}
-        <span className="hal-eye-scanline pointer-events-none absolute left-[-5%] top-0 h-[3px] w-[110%]" />
+        {/* Soft outer glow halo */}
+        <span className="hal-ring-glow pointer-events-none absolute left-1/2 top-1/2 h-[90%] w-[90%] -translate-x-1/2 -translate-y-1/2 rounded-full" />
+        {/* Radial tick marks just outside the ring */}
+        <span className="hal-ticks pointer-events-none absolute left-1/2 top-1/2 h-[104%] w-[104%] -translate-x-1/2 -translate-y-1/2 rounded-full" />
+        {/* Counter-rotating arc sweeps */}
+        <span className="hal-arc-outer pointer-events-none absolute left-1/2 top-1/2 h-full w-full -translate-x-1/2 -translate-y-1/2 rounded-full" />
+        <span className="hal-arc-inner pointer-events-none absolute left-1/2 top-1/2 h-[74%] w-[74%] -translate-x-1/2 -translate-y-1/2 rounded-full" />
+        {/* Bright main ring */}
+        <span className="hal-ring pointer-events-none absolute left-1/2 top-1/2 h-[90%] w-[90%] -translate-x-1/2 -translate-y-1/2 rounded-full" />
+        {/* Dark center socket with molten core */}
+        <span className="hal-core-disc pointer-events-none absolute left-1/2 top-1/2 flex h-[64%] w-[64%] -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full">
+          <span className="hal-core pointer-events-none h-[18%] w-[18%] rounded-full" />
+        </span>
       </button>
     </div>
   );

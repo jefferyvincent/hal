@@ -5,7 +5,7 @@
 import { create } from "zustand";
 import { openRearCamera, openScreenShare } from "@/lib/vision";
 import { useConnection } from "@/stores/connection";
-import type { ImmersiveSource, ChartPayload, BacktestPayload } from "@/types";
+import type { ImmersiveSource, ChartPayload, BacktestPayload, WatchlistPayload } from "@/types";
 
 export interface Thought {
   id: number;
@@ -22,6 +22,7 @@ interface ImmersiveState {
   mapQuery: string;
   chart: ChartPayload | null;
   backtest: BacktestPayload | null;
+  watchlist: WatchlistPayload | null;
   chartZoom: { from?: number; to?: number; reset?: boolean; nonce: number } | null;
   thoughts: Thought[];
   /** Frame-capture callback registered by ImmersiveStage. Returns a base64
@@ -33,8 +34,10 @@ interface ImmersiveState {
   exit: () => void;
   setSource: (
     src: ImmersiveSource,
-    payload?: { url?: string; query?: string; chart?: ChartPayload; backtest?: BacktestPayload },
+    payload?: { url?: string; query?: string; chart?: ChartPayload; backtest?: BacktestPayload; watchlist?: WatchlistPayload },
   ) => Promise<void>;
+  setWatchlist: (payload: WatchlistPayload) => void;
+  setChart: (payload: ChartPayload) => void;
   setMapQuery: (q: string) => void;
   setChartZoom: (z: { from?: number; to?: number; reset?: boolean }) => void;
   pushThought: (kind: Thought["kind"], text: string) => void;
@@ -62,6 +65,7 @@ export const useImmersive = create<ImmersiveState>((set, get) => ({
   mapQuery: "New York, NY",
   chart: null,
   backtest: null,
+  watchlist: null,
   chartZoom: null,
   thoughts: [],
   frameProvider: null,
@@ -76,18 +80,26 @@ export const useImmersive = create<ImmersiveState>((set, get) => ({
     set({ active: true });
     get().pushThought("note", "Immersive mode engaged.");
     if (get().source === "off") await get().setSource("camera");
-    // Push-to-talk: do NOT auto-start the mic on entering immersive. The user
-    // holds the mic button to talk in every mode — no surprise hot mic.
+    // Hands-free: entering immersive opens the mic and keeps it live. VAD
+    // sends each utterance and the loop re-arms (see maybeReturnToIdle) until
+    // the user toggles immersive off.
+    try {
+      const conn = useConnection.getState();
+      if (!conn.recording) void conn.startRecording(false);
+    } catch {
+      /* ignore */
+    }
   },
 
   exit() {
     stopStream(get().stream);
     document.body.classList.remove("immersive");
     set({ active: false, stream: null, source: "off", videoUrl: null });
-    // Stop the mic on exit — we no longer want continuous listening.
+    // Tear the mic down WITHOUT sending a turn — leaving immersive shouldn't
+    // fire whatever was being captured as a stray utterance at HAL.
     try {
       const conn = useConnection.getState();
-      if (conn.recording) conn.stopRecording();
+      if (conn.recording) conn.cancelRecording();
     } catch {
       /* ignore */
     }
@@ -145,11 +157,34 @@ export const useImmersive = create<ImmersiveState>((set, get) => ({
         }
         set({ source: "backtest", backtest });
         get().pushThought("note", `Source: backtest · ${backtest.underlying}`);
+      } else if (src === "watchlist") {
+        const watchlist = payload?.watchlist ?? get().watchlist;
+        if (!watchlist) {
+          get().pushThought("note", "Watchlist source requires a payload.");
+          return;
+        }
+        set({ source: "watchlist", watchlist });
+        get().pushThought("note", `Source: watchlist · ${watchlist.rows.length} symbols`);
+      } else if (src === "trade_ideas") {
+        // No payload — the stage reads the running list from the connection store.
+        set({ source: "trade_ideas" });
+        get().pushThought("note", "Source: trade ideas");
       }
     } catch (err) {
       get().pushThought("note", `Source error: ${(err as Error).message}`);
       console.warn("Immersive source error:", err);
     }
+  },
+
+  setWatchlist(payload) {
+    // Live refresh: update the data only if the board is the active source, so
+    // a stray late update can't yank the user back into the watchlist.
+    if (get().source === "watchlist") set({ watchlist: payload });
+  },
+
+  setChart(payload) {
+    // Live chart refresh: swap data only while the chart is the active source.
+    if (get().source === "chart") set({ chart: payload });
   },
 
   setMapQuery(q) {

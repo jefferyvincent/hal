@@ -6,60 +6,28 @@
 [boot] Whisper on CUDA.
 [boot] Loading Piper voice en_US-ryan-medium...
 [boot] Piper ready (CPU).
+[boot] Piper length_scale=1.15
 [boot] Ollama unload request: HTTP 200
 [boot] Ready.
 
 [boot] market manager: wss://socket.massive.com/options
+[alert-poll] started (15s, regular hours)
+[news] monitor started (poll 300s, feed yahoo)
+[mcp] 0/0 server(s) connected
 [market] connected wss://socket.massive.com/options
 [market] hello: '[{"ev":"status","status":"connected","message":"Connected Successfully"}]'
 [market] auth resp: '[{"ev":"status","status":"auth_success","message":"authenticated"}]'
-[market] subscribe: AM.O:SPY*,T.O:SPY*
+[market] subscribe: AM.O:SPY*,T.AVGO,T.MOVES,T.O:AVGO260608C00482500,T.O:AVGO260612C00475000,T.O:SPY*
 [market] status: subscribed to: AM.O:SPY*
+[market] status: subscribed to: T.AVGO
+[market] status: subscribed to: T.MOVES
+[market] status: subscribed to: T.O:AVGO260608C00482500
+[market] status: subscribed to: T.O:AVGO260612C00475000
 [market] status: subscribed to: T.O:SPY*
 [ws] Client connected
-[ws] Loaded conversation 'c_1780244102_a78e92' (0 messages, title='New conversation')
-[ws] Listening started
-[ws] Listening stopped (21571 bytes, mime=audio/webm;codecs=opus, +0 attachment(s))
-[stt] 'How are you functioning?' (mime=audio/webm;codecs=opus, +0 attachment(s))
-[tts] synth: "I'm online and fully operational, Jeffery."
-[tts] sent 106540 bytes
-[tts] synth: 'All systems are nominal.'
-[tts] sent 56876 bytes
-[tts] synth: 'How can I help you today?'
-[tts] sent 44588 bytes
-[hal] "I'm online and fully operational, Jeffery. All systems are nominal. How can I help you today?"
-[ws] Listening started
-[ws] Listening stopped (30345 bytes, mime=audio/webm;codecs=opus, +0 attachment(s))
-[stt] 'Pull up a chart for Apple.' (mime=audio/webm;codecs=opus, +0 attachment(s))
-[tts] synth: 'Here is AAPL on the 5m. Heads up, possible sell setup: three descending peaks (l'
-[tts] sent 231468 bytes
-[hal] 'Here is AAPL on the 5m. Heads up, possible sell setup: three descending peaks (lower highs).'
-[ws] Listening started
-[ws] Listening stopped (33259 bytes, mime=audio/webm;codecs=opus, +0 attachment(s))
-[stt] "What's the trade for Monday?" (mime=audio/webm;codecs=opus, +0 attachment(s))
-[tts] synth: 'I need one clarifying question before I commit: which underlying are you looking'
-[tts] sent 309804 bytes
-[hal] 'I need one clarifying question before I commit: which underlying are you looking at for Monday — SPY, QQQ, or something else?'
-[ws] Listening started
-[ws] Listening stopped (28397 bytes, mime=audio/webm;codecs=opus, +0 attachment(s))
-[stt] "I'm looking at Apple." (mime=audio/webm;codecs=opus, +0 attachment(s))
-[tts] synth: 'Let me pull up the current chain for AAPL.'
-[tts] sent 72748 bytes
-[tts] synth: ' ... code block follows on screen ... '
-[tts] sent 70188 bytes
-[hal] 'Let me pull up the current chain for AAPL.\n\n```json\n{"tool": "query_massive", "args": {"endpoint": "/v1/chain/AAPL", "params": {"expiry": "260605"}}}\n```'
-[ws] Listening started
-[ws] Listening stopped (32293 bytes, mime=audio/webm;codecs=opus, +0 attachment(s))
-[stt] 'HAL Clubs.' (mime=audio/webm;codecs=opus, +0 attachment(s))
-[ws] Listening started
-[ws] Listening stopped (30345 bytes, mime=audio/webm;codecs=opus, +0 attachment(s))
-[stt] 'HAL Closed Chart.' (mime=audio/webm;codecs=opus, +0 attachment(s))
-[agent] ollama error: Server error '500 Internal Server Error' for url 'http://localhost:11434/api/chat'
-For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500 body=''
-[hal] 'I am sorry, Jeffery. The language core returned 500.'
-[ws] Abort requested
-[agent] on_sentence flush error: 
-[turn] Aborted
-[ws] Memory wipe for conversation c_1780244102_a78e92
-[ws] Client connected
-[ws] Loaded conversation 'c_1780244102_a78e92' (0 messages, title='New conversation')
+[ws] Loaded conversation 'c_1780449531_cf9d4d' (40 messages, title='If I was to clone you HAL on another computer what would you')
+[alert] replaying 20 missed alert(s)
+[text] "[MISSED ALERTS \u2014 20 fired while you were away]\n- News on GOOGL: Wall Street Analyst: Broadcom\u2019s Flat AI Guidance Justified the Selloff, but Nvidia Remains Best-in-Class Chip Play\n- News on GOOGL: Sorcero CEO Dipanwita Das Among Only 3 Founders in Life Sciences AI Recognized on 2026 100 Women in AI\n- News on GOOGL: Broadcom Just Had a Record Quarter\u2014and It Just Wasn\u2019t Good Enough\n- News on GOOGL: Sector Update: Tech Stocks Fall Late Afternoon\n- News on GOOGL: Huge News For Apple and Nvidia Stock Investors\n- News on GOOGL: The Smartest $500 You Can Put to Work in AI Right Now Isn't Going Into Nvidia\n- News on GOOGL: AI Power Boom Revives Natural Gas as Infrastructure Bet\n- News on GOOGL: GOOG Stock Climbs Nearly 4% \u2014 Google Expands Texas Footprint With New Data Center, Energy Hub\n- News on GOOGL: AMD Is Up 55% in a Month and Trouncing Intel. Should Intel Stockholders Switch to AMD Now?\n- News on GOOGL: Pinterest and IBM Just Struck Massive AI Deals. Amazon and Google Are the Big Winners.\n- News on GOOGL: World\u2019s largest sovereign wealth fund backs push for Google oversight on government use of its AI and cloud technology\n- News on GOOGL: Apple Stock And The Intelligence Test\n- News on AVGO: Stock Market Today, June 4: Dow Hits Record as Tech Stocks Falter\n- News on AVGO: Dow Jones Hits High, AI Stocks Shrug Off Broadcom, Ciena Sell-Offs; Jobs Report Looms\n- News on AVGO: Stock Market Today, June 4: Broadcom Shares Plunge After AI Outlook Misses High Investor Expectations\n- News on AVGO: Broadcom Could Be The Biggest AI Winner Nobody Is Talking About\n- News on AVGO: Stock Market Today: Dow Jumps 875 Points; Ciena Slammed Yet Holds Key Mark; These 2 Areas Shine (Live Coverage)\n- News on AVGO: Broadcom miss sparks fears around AI margin pressure, investor says\n- News on AVGO: US Equity Indexes Mixed as Sliding Technology Pulls Nasdaq Composite Lower, Crude Oil Sinks\n- News on AVGO: Quantinuum, Broadcom, UnitedHealth, and More Stocks That Explain Today\u2019s Market\n\nBrief Jeffery on these in one or two short sentences total; lead with the count. Do not call any tools." (+0 attachment(s))
+[tts] synth: "20 more alerts fired, with Broadcom's AI guidance miss triggering a sector-wide "
+[tts] sent 432684 bytes
+[hal] alert: "20 more alerts fired, with Broadcom's AI guidance miss triggering a sector-wide selloff despite a record quarter, while Google climbed on new data center expansion news."

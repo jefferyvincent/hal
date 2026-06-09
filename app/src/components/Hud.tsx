@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useConnection } from "@/stores/connection";
 import { useUi } from "@/stores/ui";
+import { useImmersive } from "@/stores/immersive";
 
 function formatUptime(ms: number): string {
   const s = Math.floor(ms / 1000);
@@ -17,6 +18,19 @@ export default function Hud() {
   const stateLabel = useConnection((s) => s.stateLabel);
   const subline = useConnection((s) => s.subline);
   const toggleConv = useUi((s) => s.toggleConversations);
+  const toggleMcp = useUi((s) => s.toggleMcp);
+  const toggleSubscriptions = useUi((s) => s.toggleSubscriptions);
+  // Trade ideas live in the immersive stage: toggle that source on/off.
+  const toggleTradeIdeas = () => {
+    const im = useImmersive.getState();
+    if (im.active && im.source === "trade_ideas") {
+      im.exit();
+    } else {
+      void im.setSource("trade_ideas").then(() => {
+        if (!useImmersive.getState().active) void useImmersive.getState().enter();
+      });
+    }
+  };
 
   useEffect(() => {
     const id = window.setInterval(
@@ -68,6 +82,33 @@ export default function Hud() {
           className="flex flex-col gap-[3px] border border-hal-red/35 bg-hal-red/[0.06] px-3 py-[5px] uppercase tracking-[4px] transition-colors hover:border-hal-red hover:bg-hal-red/20 hover:shadow-[0_0_14px_rgba(255,30,30,0.4)]"
         >
           <span className="text-[9px] text-hal-red">CHATS</span>
+          <span className="font-bold text-white">OPEN</span>
+        </button>
+        <button
+          type="button"
+          onClick={toggleSubscriptions}
+          data-tauri-drag-region="false"
+          className="flex flex-col gap-[3px] border border-hal-red/35 bg-hal-red/[0.06] px-3 py-[5px] uppercase tracking-[4px] transition-colors hover:border-hal-red hover:bg-hal-red/20 hover:shadow-[0_0_14px_rgba(255,30,30,0.4)]"
+        >
+          <span className="text-[9px] text-hal-red">WATCHES</span>
+          <span className="font-bold text-white">OPEN</span>
+        </button>
+        <button
+          type="button"
+          onClick={toggleTradeIdeas}
+          data-tauri-drag-region="false"
+          className="flex flex-col gap-[3px] border border-hal-amber/35 bg-hal-amber/[0.06] px-3 py-[5px] uppercase tracking-[4px] transition-colors hover:border-hal-amber hover:bg-hal-amber/20 hover:shadow-[0_0_14px_rgba(255,176,0,0.4)]"
+        >
+          <span className="text-[9px] text-hal-amber">IDEAS</span>
+          <span className="font-bold text-white">OPEN</span>
+        </button>
+        <button
+          type="button"
+          onClick={toggleMcp}
+          data-tauri-drag-region="false"
+          className="flex flex-col gap-[3px] border border-hal-red/35 bg-hal-red/[0.06] px-3 py-[5px] uppercase tracking-[4px] transition-colors hover:border-hal-red hover:bg-hal-red/20 hover:shadow-[0_0_14px_rgba(255,30,30,0.4)]"
+        >
+          <span className="text-[9px] text-hal-red">MCP</span>
           <span className="font-bold text-white">OPEN</span>
         </button>
       </div>
