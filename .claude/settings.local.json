@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(flatpak-spawn --host bash -lc ' *)",
+      "Bash(chmod +x setup.sh)",
+      "Bash(flatpak-spawn --host bash -lc 'cd \"/media/jefferyvincent/New Volume1/repos/hal\" && ./setup.sh > setup.log 2>&1')",
+      "Bash(echo \"exit=$?\")",
+      "Bash(flatpak-spawn --host bash -lc 'tail -n 25 \"/media/jefferyvincent/New Volume1/repos/hal/setup.log\" 2>/dev/null')",
+      "Bash(flatpak-spawn --host bash -lc 'sudo -n true 2>/dev/null && echo \"passwordless sudo: YES\" || echo \"passwordless sudo: NO \\(needs your password in a real terminal\\)\"; echo \"--- host pip/venv ---\"; command -v pip3 || echo \"no pip3\"; dpkg -l | grep -i python3.12-venv >/dev/null 2>&1 && echo \"venv pkg installed\" || echo \"python3.12-venv NOT installed\"')",
+      "Bash(flatpak-spawn --host bash -lc 'cd \"/media/jefferyvincent/New Volume1/repos/hal\" && rm -rf .venv && rm -f setup.log && echo \"cleaned partial .venv\"; echo \"--- requirements.linux.txt head ---\"; head -5 requirements.linux.txt; echo \"lines: $\\(wc -l < requirements.linux.txt\\)\"; grep -c pywin32 requirements.linux.txt | xargs echo \"pywin32 lines \\(want 0\\):\"')",
+      "Bash(ls \"/home/jefferyvincent/.claude/projects/-media-jefferyvincent-New-Volume1-repos-hal/memory/\")",
+      "Bash(cat \"/home/jefferyvincent/.claude/projects/-media-jefferyvincent-New-Volume1-repos-hal/memory/MEMORY.md\")",
+      "Bash(flatpak-spawn --host which npm node)",
+      "Bash(sh -c 'command -v npm || echo NOT FOUND in sh')",
+      "Bash(bash -ic 'command -v npm')",
+      "Bash(npm --version)",
+      "Bash(flatpak-spawn --host bash -lc 'echo \"=== fs type + mount opts ===\"; findmnt -no FSTYPE,OPTIONS,TARGET \"/media/jefferyvincent/New Volume1\" 2>/dev/null || df -T \"/media/jefferyvincent/New Volume1\"; echo \"=== traverse perms ===\"; ls -ld /media /media/jefferyvincent \"/media/jefferyvincent/New Volume1\"; echo \"=== does ollama user exist? ===\"; id ollama 2>&1')",
+      "Bash(bash -n setup.sh)",
+      "Bash(flatpak-spawn --host bash -lc 'for v in /home/jefferyvincent/Desktop/HAL-Vault \"/media/jefferyvincent/New Volume1/repos/HAL-Vault\"; do echo \"=== $v ===\"; find \"$v\" -maxdepth 2 -type f 2>/dev/null | head -20; echo \"  \\(file count: $\\(find \"$v\" -type f 2>/dev/null | wc -l\\)\\)\"; done')",
+      "Bash(flatpak-spawn --host bash -lc 'cd \"/media/jefferyvincent/New Volume1/repos/hal\" && python3 -m py_compile hal/brainstem/config.py && echo \"config.py compiles OK\"')",
+      "Bash(flatpak-spawn --host bash -lc 'cd \"/media/jefferyvincent/New Volume1/repos/hal\" && if [ -d .venv ]; then source .venv/bin/activate; PY=python; else PY=python3; echo \"\\(no .venv; using system python3 — torch import may fail, that is OK\\)\"; fi; $PY -c \"import hal.brainstem.config as c; print\\(\\\\\"HAL_DESIGNATION  :\\\\\", c.HAL_DESIGNATION\\); print\\(\\\\\"VAULT_DIR        :\\\\\", c.VAULT_DIR\\); print\\(\\\\\"SCRATCH_DIR      :\\\\\", c.SCRATCH_DIR\\); print\\(\\\\\"RAG_DB_DIR       :\\\\\", c.RAG_DB_DIR\\); print\\(\\\\\"CONVERSATIONS_DIR:\\\\\", c.CONVERSATIONS_DIR\\); print\\(\\\\\"DB_PATH          :\\\\\", c.DB_PATH\\); print\\(\\\\\"PIPER_VOICE_PATH :\\\\\", c.PIPER_VOICE_PATH\\); print\\(\\\\\"OLLAMA_MODEL     :\\\\\", c.OLLAMA_MODEL\\); print\\(\\\\\"OLLAMA_URL       :\\\\\", c.OLLAMA_URL\\); print\\(\\\\\"HAL_SPEAKER      :\\\\\", repr\\(c.HAL_SPEAKER\\)\\)\"')",
+      "Bash(python3 -)",
+      "Bash(bash -n start-hal.sh)",
+      "Bash(./start-hal.sh)",
+      "Bash(echo \"exit code: $?\")",
+      "Bash(flatpak-spawn --host bash -lc 'python3 -c \"import itsdangerous, starlette; print\\(\\\\\"itsdangerous\\\\\", itsdangerous.__version__\\); import starlette; print\\(\\\\\"starlette\\\\\", starlette.__version__\\)\" 2>&1')",
+      "Bash(python3 -c 'import secrets; print\\(secrets.token_hex\\(32\\)\\)')",
+      "Bash(echo \"SECRET_KEY=$\\(python3 -c 'import secrets; print\\(secrets.token_hex\\(32\\)\\)'\\)\")",
+      "Bash(flatpak-spawn --host bash -lc 'cd \"/media/jefferyvincent/New Volume1/repos/hal/app\" && npm run build 2>&1 | tail -25')",
+      "Bash(flatpak-spawn --host bash -lc 'export PATH=\"$HOME/.nvm/versions/node/v26.3.0/bin:$PATH\"; cd \"/media/jefferyvincent/New Volume1/repos/hal/app\" && node --version && npm run build 2>&1 | tail -30')",
+      "Bash(git check-ignore *)"
+    ]
+  }
+}
