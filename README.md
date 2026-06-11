@@ -28,7 +28,8 @@ Two completely decoupled processes:
 ```
 hal-voice/
   server.py            FastAPI server, all AI logic
-  start-hal.ps1        Activates .venv and runs server.py, logs to hal.log
+  start-hal.sh         Linux/macOS launcher: activates .venv, runs server.py, logs to hal.log
+  start-hal.ps1        Windows launcher (same job, PowerShell)
   static/              Legacy single-file UI (still served as a fallback)
   app/                 Tauri 2 + React + Vite frontend (current UI)
     src/               React components, stores, lib
@@ -59,18 +60,17 @@ PULL_MODELS=1 ./setup.sh        # or: ollama pull qwen3.6:27b  (etc.)
 
 ### Server
 
-```powershell
-.\start-hal.ps1                 # Windows
-```
-```sh
-source .venv/bin/activate && python server.py    # Linux
+```bash
+./start-hal.sh                                   # launcher: venv + server, logs to hal.log
+# or, in an already-activated shell:
+source .venv/bin/activate && python server.py
 ```
 
 Logs stream to `hal.log`. Server listens on `:8000`.
 
 ### UI — browser mode (fast iteration)
 
-```powershell
+```bash
 cd app
 npm install        # first time only
 npm run dev
@@ -80,7 +80,7 @@ Opens at `http://localhost:1420`. Vite proxies `/ws` to FastAPI on `:8000`.
 
 ### UI — native Tauri window
 
-```powershell
+```bash
 cd app
 npm run tauri:dev
 ```
@@ -89,50 +89,90 @@ First run compiles the Rust shell (5–10 min). Subsequent runs are fast.
 
 ### Production build
 
-```powershell
+```bash
 cd app
 npm run tauri:build
 ```
 
-Produces an installer in `app/src-tauri/target/release/bundle/`. Install it once
-to register HAL with Windows Startup (see Auto-start below).
+Produces a bundle in `app/src-tauri/target/release/bundle/` (AppImage + `.deb`
+on Linux). Launch it once to register HAL for login autostart (see Auto-start
+below).
+
+## Network access (LAN)
+
+`server.py` binds `0.0.0.0:8000`, so HAL is reachable from other devices once
+you serve the UI from FastAPI and protect it with a password.
+
+1. **Build the UI.** FastAPI serves `app/dist` when present (else the legacy
+   `static/` UI):
+
+   ```bash
+   cd app && npm run build
+   ```
+
+2. **Set a password** in `.env`. Network devices must then log in; this machine
+   (localhost + the Tauri app) is always exempt. Empty `HAL_PASSWORD` disables
+   auth.
+
+   ```ini
+   HAL_PASSWORD=your-password-here
+   HAL_SECRET_KEY=...   # python -c "import secrets; print(secrets.token_hex(32))"
+   ```
+
+3. **Connect.** Start the server, then open `http://<host-ip>:8000/` from any
+   device on the network (e.g. `http://192.168.1.199:8000/`). A login page
+   appears; after the password, the UI and its WebSocket are unlocked.
+
+> **Security:** HAL runs commands with `AUTO_APPROVE_TOOLS = True`, so anyone who
+> logs in can execute code on this machine. Use a strong password and only expose
+> HAL on a trusted network. If a firewall is active, allow the port:
+> `sudo ufw allow 8000/tcp`.
 
 ## Auto-start at logon
 
 Two pieces, configured independently.
 
-### 1. Server — Windows Task Scheduler (already configured)
+### 1. Server — systemd user service
 
-A scheduled task named `HAL Voice Server` runs `start-hal.ps1` hidden at user
-logon, auto-restarts on failure. Set up with:
+Run the server with the launcher, which activates the venv and appends all
+output to `hal.log`:
 
-```powershell
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-  -Argument '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\Users\Gamer\hal-voice\start-hal.ps1"'
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
-  -DontStopIfGoingOnBatteries -StartWhenAvailable `
-  -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
-  -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
-$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME `
-  -LogonType Interactive -RunLevel Limited
-Register-ScheduledTask -TaskName 'HAL Voice Server' -Action $action `
-  -Trigger $trigger -Settings $settings -Principal $principal -Force
+```bash
+./start-hal.sh            # foreground
+./start-hal.sh &          # or background it
 ```
 
-Test without rebooting:
+To start it at login, add a user service at `~/.config/systemd/user/hal.service`
+(replace the path with your checkout):
 
-```powershell
-Start-ScheduledTask -TaskName 'HAL Voice Server'
-# wait ~20s for model warmup, then:
-Invoke-WebRequest http://localhost:8000/ -UseBasicParsing | Select-Object StatusCode
+```ini
+[Unit]
+Description=HAL Voice Server
+After=network.target
+
+[Service]
+WorkingDirectory=/path/to/hal
+ExecStart=/path/to/hal/start-hal.sh
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
 ```
 
-Disable / remove:
+Enable it, and keep it running without an active login session:
 
-```powershell
-Disable-ScheduledTask    -TaskName 'HAL Voice Server'
-Unregister-ScheduledTask -TaskName 'HAL Voice Server' -Confirm:$false
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now hal
+loginctl enable-linger "$USER"
+```
+
+Check it (give it ~20s for model warmup):
+
+```bash
+systemctl --user status hal
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8000/
+tail -f hal.log
 ```
 
 ### 2. App window — Tauri autostart plugin
@@ -140,8 +180,10 @@ Unregister-ScheduledTask -TaskName 'HAL Voice Server' -Confirm:$false
 Code lives in `app/src/App.tsx` and `app/src-tauri/src/lib.rs`. Guarded by
 `import.meta.env.PROD` so `npm run tauri:dev` does not pollute startup.
 
-After running `npm run tauri:build` and launching the installed app once, HAL
-will appear in **Settings → Apps → Startup**. Disable from there.
+After running `npm run tauri:build` and launching the installed app once, the
+plugin registers HAL via an XDG autostart entry in `~/.config/autostart/`. Delete
+that `.desktop` file (or remove it from your desktop's Startup Applications) to
+disable.
 
 ### Startup order caveat
 
@@ -174,9 +216,9 @@ via `tauri-plugin-global-shortcut`. Works even when the window is hidden.
 
 ## Known things to know
 
-- **Torch env is fragile.** The `.venv` has a hand-pinned `torch 2.12+cu126 /
-  torchaudio 2.11 / torchcodec 0.13 / FFmpeg DLL` matrix. Do not blindly
-  `pip upgrade`.
+- **Torch env is fragile.** The `.venv` has a hand-pinned `torch / torchaudio /
+  torchcodec / FFmpeg` matrix (see `setup.sh` for the exact CUDA pins). Do not
+  blindly `pip upgrade`.
 - **VRAM budget.** RTX 3090 (24 GB) is shared between Ollama LLM, Whisper, and
   XTTS. Loading a larger LLM may starve TTS.
 - **Map embed has no API key.** `app/src/components/immersive/ImmersiveStage.tsx`
@@ -193,7 +235,7 @@ Key files when something breaks:
 | File | Purpose |
 | --- | --- |
 | `server.py` | FastAPI WS server, all model invocation |
-| `start-hal.ps1` | Venv activation + server launch |
+| `start-hal.sh` | Venv activation + server launch (Linux) |
 | `app/src/App.tsx` | Root layout, autostart hook, immersive thought mirroring |
 | `app/src/lib/ws.ts` | WS client (binary audio + JSON envelopes) |
 | `app/src/lib/audio.ts` | Gap-free WAV chunk playback queue |

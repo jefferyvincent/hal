@@ -1,6 +1,6 @@
 """Dump every backtest trade as a table.
 
-Run from the hal-voice folder:  C:\\Python312\\python.exe dump_trades.py
+Run from the repo root:  python hal/cerebellum/dump_trades.py
 Optional args: ticker months   (e.g.  dump_trades.py SPY 24)
 """
 import asyncio

@@ -1,6 +1,6 @@
 """Option strategy knowledge for HAL.
 
-Ported from TradeScan (D:\\repos\\tradescans):
+Ported from TradeScan:
   - src/constants/options.ts        SPREAD_TYPE_DESCRIPTIONS, labels
   - src/utils/strategy-screener.ts  bias x IV -> ranked spreads, leg specs
   - src/types/strategy-screener.ts  shapes

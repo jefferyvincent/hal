@@ -10,10 +10,12 @@ from hal.brainstem.config import (
     DB_PATH, MAX_HISTORY_MESSAGES, MAX_TITLE_CHARS,
     MAX_TOOL_OUTPUT_CHARS, MAX_AGENT_ITERATIONS, AUTO_APPROVE_TOOLS,
     NEWS_POLL_SECONDS, NEWS_PRIMARY_FEED, CHART_DATA_SOURCE,
+    HAL_PASSWORD, HAL_SECRET_KEY,
 )
 
 import os
 import asyncio
+import hmac
 import io
 import json
 import re
@@ -21,14 +23,15 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import wave
 from datetime import date, timedelta
 from pathlib import Path
 
 import httpx
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from faster_whisper import WhisperModel
 from piper import PiperVoice
@@ -313,13 +316,91 @@ async def _lifespan(_app: FastAPI):
 app = FastAPI(lifespan=_lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# The production React build sits in app/dist (run `npm run build` in app/).
+# When present we serve it; otherwise we fall back to the legacy static UI.
+_DIST_DIR = Path("app/dist")
+if (_DIST_DIR / "assets").is_dir():
+    app.mount("/assets", StaticFiles(directory=str(_DIST_DIR / "assets")), name="assets")
+
+
+# --- LAN access auth ---------------------------------------------------------
+# Only enforced when HAL_PASSWORD is set. Loopback (this machine — the Tauri app
+# and localhost browsers) is always exempt; network clients must log in. The
+# cookie just proves "knew the password": an HMAC token nobody can forge without
+# HAL_SECRET_KEY. See hal/brainstem/config.py.
+_AUTH_COOKIE = "hal_auth"
+_AUTH_TOKEN = hmac.new(HAL_SECRET_KEY.encode(), b"hal-authenticated", "sha256").hexdigest()
+_AUTH_EXEMPT_PATHS = ("/login",)  # the only routes reachable without a session
+
+
+def _is_loopback(host: str | None) -> bool:
+    return host in (None, "127.0.0.1", "::1", "localhost")
+
+
+def _is_authed(conn: Request | WebSocket) -> bool:
+    """True if this connection may talk to HAL. `conn` is a Request or WebSocket
+    (both expose .cookies and .client)."""
+    if not HAL_PASSWORD:
+        return True  # auth disabled
+    if _is_loopback(conn.client.host if conn.client else None):
+        return True  # this machine is trusted (you're at the keyboard)
+    return hmac.compare_digest(conn.cookies.get(_AUTH_COOKIE, ""), _AUTH_TOKEN)
+
+
+@app.middleware("http")
+async def _auth_gate(request: Request, call_next):
+    if request.url.path.startswith(_AUTH_EXEMPT_PATHS) or _is_authed(request):
+        return await call_next(request)
+    return RedirectResponse("/login", status_code=302)
+
+
+_LOGIN_HTML = """<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>HAL 9000</title><style>
+body{background:#000;color:#e33;font-family:monospace;display:flex;height:100vh;
+margin:0;align-items:center;justify-content:center}
+form{text-align:center}input{background:#111;color:#e33;border:1px solid #e33;
+padding:.6rem;font:inherit;font-size:1.1rem;text-align:center}
+button{background:#e33;color:#000;border:0;padding:.6rem 1.2rem;font:inherit;
+margin-top:1rem;cursor:pointer}.err{color:#fa0;min-height:1.2rem}
+.eye{width:60px;height:60px;border-radius:50%;background:radial-gradient(circle,
+#f33 0%,#811 60%,#200 100%);margin:0 auto 1.5rem;box-shadow:0 0 30px #f00}
+</style></head><body><form method=post action=/login>
+<div class=eye></div><div class=err>%ERR%</div>
+<input type=password name=password placeholder="PASSWORD" autofocus autocomplete=current-password>
+<br><button type=submit>UNLOCK</button></form></body></html>"""
+
+
+@app.get("/login")
+async def login_page():
+    return HTMLResponse(_LOGIN_HTML.replace("%ERR%", ""))
+
+
+@app.post("/login")
+async def login_submit(request: Request):
+    body = (await request.body()).decode("utf-8", "replace")
+    password = (urllib.parse.parse_qs(body).get("password") or [""])[0]
+    if HAL_PASSWORD and hmac.compare_digest(password, HAL_PASSWORD):
+        resp = RedirectResponse("/", status_code=302)
+        resp.set_cookie(
+            _AUTH_COOKIE, _AUTH_TOKEN,
+            httponly=True, samesite="lax", max_age=30 * 24 * 3600,
+        )
+        return resp
+    return HTMLResponse(
+        _LOGIN_HTML.replace("%ERR%", "ACCESS DENIED"), status_code=401
+    )
+
 
 @app.get("/")
 async def serve_index():
     # Browsers (esp. iOS Safari) aggressively cache the index HTML, which
     # makes UI iteration painful. Force revalidation on every request.
+    index = _DIST_DIR / "index.html"
+    if not index.is_file():
+        index = Path("static/index.html")  # legacy fallback if app not built
     return FileResponse(
-        "static/index.html",
+        str(index),
         headers={
             "Cache-Control": "no-cache, no-store, must-revalidate",
             "Pragma": "no-cache",
@@ -3605,6 +3686,10 @@ async def process_turn(
 
 @app.websocket("/ws")
 async def voice_interface(websocket: WebSocket):
+    if not _is_authed(websocket):
+        await websocket.close(code=1008)  # policy violation: not logged in
+        print("[ws] Rejected unauthenticated client")
+        return
     await websocket.accept()
     print("[ws] Client connected")
 

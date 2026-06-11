@@ -3,9 +3,10 @@
 ## One-time install (required)
 HAL's MCP client uses the official `mcp` Python SDK. Install it into HAL's venv:
 
-```powershell
-cd C:\Users\Gamer\hal-voice
-& '.\.venv\Scripts\python.exe' -m pip install mcp
+```bash
+# from the repo root:
+.venv/bin/python -m pip install mcp
+# Windows:  & '.\.venv\Scripts\python.exe' -m pip install mcp
 ```
 
 ## Apply the changes

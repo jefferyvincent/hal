@@ -1,6 +1,6 @@
 """One-shot probe: does Massive serve historical bars for EXPIRED options?
 
-Run from the hal-voice folder:  python probe.py
+Run from the repo root:  python hal/cerebellum/probe.py
 Reads MASSIVE_API_KEY from .env. Prints PASS/FAIL and a sample.
 This is the make-or-break check for the singles backtester.
 """

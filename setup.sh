@@ -18,6 +18,15 @@ TORCH_VER="2.6.0"
 TORCHAUDIO_VER="2.6.0"
 CUDA_INDEX="https://download.pytorch.org/whl/cu124"
 
+# Where Ollama keeps its model blobs (~30 GB). Precedence:
+#   1. OLLAMA_MODELS already exported in the shell
+#   2. the OLLAMA_MODELS= line in .env (single source of truth with HAL)
+#   3. the big data drive, so models stay off the system disk
+# We parse the one line rather than `source` .env (which holds secrets + would
+# execute arbitrary content).
+_env_models="$(sed -n 's/^OLLAMA_MODELS=//p' .env 2>/dev/null | tail -1 | tr -d '"'"'"'"')"
+OLLAMA_MODELS="${OLLAMA_MODELS:-${_env_models:-/media/jefferyvincent/New Volume1/ollama-models}}"
+
 say()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m!  %s\033[0m\n' "$*"; }
 
@@ -115,9 +124,48 @@ else
   warn "Skipping Ollama install: needs sudo. Re-run ./setup.sh in a host terminal."
 fi
 
+# --- 5.5 Point Ollama's model store at $OLLAMA_MODELS -------------------------
+# Ollama reads OLLAMA_MODELS for where it keeps blobs. The official installer
+# runs the daemon as a dedicated 'ollama' user, but our target lives on an NTFS
+# drive mounted uid=1000 under /media (which that user can neither own nor
+# traverse). So override the service to run as the invoking user, carry the env
+# var, and wait for the drive to be mounted before starting.
+configure_ollama_models_dir() {
+  local dir="$1" user grp
+  user="$(id -un)"; grp="$(id -gn)"
+  say "Pointing Ollama model store at: $dir (service runs as $user)"
+  mkdir -p "$dir"  # we own the NTFS mount (uid=1000), so no chown/sudo needed
+
+  if systemctl list-unit-files 2>/dev/null | grep -q '^ollama\.service'; then
+    sudo mkdir -p /etc/systemd/system/ollama.service.d
+    sudo tee /etc/systemd/system/ollama.service.d/override.conf >/dev/null <<EOF
+[Service]
+User=$user
+Group=$grp
+Environment="OLLAMA_MODELS=$dir"
+RequiresMountsFor="$dir"
+EOF
+    sudo systemctl daemon-reload
+    sudo systemctl restart ollama
+    warn "Ollama now waits for $dir to mount; it comes up after you log in."
+  else
+    warn "No ollama systemd service found; exporting OLLAMA_MODELS for this run only."
+    export OLLAMA_MODELS="$dir"
+  fi
+}
+
+if command -v ollama >/dev/null 2>&1; then
+  if can_sudo; then
+    configure_ollama_models_dir "$OLLAMA_MODELS"
+  else
+    warn "Skipping model-dir setup (needs sudo). Re-run in a host terminal to apply"
+    warn "  OLLAMA_MODELS=$OLLAMA_MODELS"
+  fi
+fi
+
 # --- 6. Ollama models (heavy: ~30 GB total). Opt in with PULL_MODELS=1 --------
 if command -v ollama >/dev/null 2>&1 && [ "${PULL_MODELS:-0}" = "1" ]; then
-  say "Pulling Ollama models (this is large)"
+  say "Pulling Ollama models into $OLLAMA_MODELS (this is large)"
   for m in qwen3.6:27b llama3.2:3b qwen2.5vl:7b qwen2.5vl:3b; do
     ollama pull "$m"
   done

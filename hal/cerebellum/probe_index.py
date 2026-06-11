@@ -1,7 +1,7 @@
 """Probe how Massive serves cash-settled INDEX data (SPX), so we wire the
 backtester to the right ticker format.
 
-Run from hal-voice:  C:\\Python312\\python.exe probe_index.py
+Run from the repo root:  python hal/cerebellum/probe_index.py
 Reads MASSIVE_API_KEY from .env. Prints which formats return data.
 """
 import datetime
