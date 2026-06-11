@@ -1,0 +1,379 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* HAL 9000 — CRT chrome carried over from the legacy index.html, now scoped
+   via Tailwind layers. Only effects that don't translate well into utility
+   classes live here. */
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  html,
+  body {
+    background: theme("colors.hal.bg");
+    color: theme("colors.hal.text");
+    font-family: theme("fontFamily.mono");
+    overflow: hidden;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  /* In Tauri, the whole window is a drag region by default; we opt out for
+     interactive elements via data-tauri-drag-region="false". */
+
+  /* ---- HAL-themed scrollbars ---- Applied universally so every panel,
+     transcript, conversation list, telemetry feed, and thoughts feed all
+     share the same red-on-black aesthetic. Per-component scrollbar styling
+     in older panels still works but this is now the baseline. */
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  *::-webkit-scrollbar-track {
+    background: #0a0a0d;
+    border-left: 1px solid rgba(255, 30, 30, 0.12);
+  }
+  *::-webkit-scrollbar-thumb {
+    background: linear-gradient(180deg, #8a0000 0%, #ff1a1a 100%);
+    border-radius: 2px;
+    border: 1px solid #050507;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: linear-gradient(180deg, #ff1a1a 0%, #ff3838 100%);
+    box-shadow: 0 0 8px rgba(255, 30, 30, 0.6);
+  }
+  *::-webkit-scrollbar-corner {
+    background: #0a0a0d;
+  }
+  /* Firefox */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #8a0000 #0a0a0d;
+  }
+}
+
+@layer components {
+  /* CRT scanlines */
+  .crt-scanlines::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    background-image: linear-gradient(
+      to bottom,
+      transparent 0%,
+      rgba(255, 255, 255, 0.025) 50%,
+      transparent 100%
+    );
+    background-size: 100% 4px;
+    pointer-events: none;
+    z-index: 100;
+    mix-blend-mode: overlay;
+  }
+  /* Vignette */
+  .crt-vignette::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    background: radial-gradient(
+      ellipse at center,
+      transparent 30%,
+      rgba(0, 0, 0, 0.85) 100%
+    );
+    pointer-events: none;
+    z-index: 99;
+  }
+  /* Faint grid */
+  .crt-grid {
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(255, 30, 30, 0.04) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 30, 30, 0.04) 1px, transparent 1px);
+    background-size: 60px 60px;
+    z-index: 1;
+    opacity: 0.5;
+    pointer-events: none;
+  }
+
+  /* Eye container — transparent so the faint grid shows through behind the
+     eye (the plate/hex backing was removed). The .hal-panel class is kept
+     for layout + the body.fullscreen-chat hide rule below. */
+
+  /* The eye socket — dark well that the ring sits in, with bezel rings */
+  .hal-eye {
+    background: radial-gradient(
+      circle at 50% 50%,
+      #0a0001 35%,
+      #160000 60%,
+      #050000 80%
+    );
+    box-shadow:
+      inset 0 0 50px rgba(0, 0, 0, 1),
+      0 0 0 8px #050507,
+      0 0 0 10px #1a1a1f,
+      0 0 0 12px #050507;
+    transition: box-shadow 0.6s ease;
+  }
+
+  /* Soft outer glow halo */
+  .hal-ring-glow {
+    box-shadow:
+      0 0 50px 8px rgba(255, 25, 25, 0.5),
+      0 0 100px 26px rgba(200, 0, 0, 0.22);
+    animation: evil-breathe 5s ease-in-out infinite;
+  }
+
+  /* Bright main ring */
+  .hal-ring {
+    border: 5px solid rgba(255, 30, 30, 0.95);
+    box-shadow:
+      0 0 22px rgba(255, 40, 40, 0.85),
+      inset 0 0 22px rgba(255, 30, 30, 0.55);
+    transition: border-color 0.5s ease, box-shadow 0.5s ease;
+  }
+
+  /* Counter-rotating arc sweeps (only two borders coloured per arc) */
+  .hal-arc-outer {
+    border: 3px solid transparent;
+    border-top-color: rgba(255, 90, 90, 0.95);
+    border-right-color: rgba(255, 60, 60, 0.5);
+    animation: hal-spin-cw 8s linear infinite;
+  }
+  .hal-arc-inner {
+    border: 2px solid transparent;
+    border-bottom-color: rgba(255, 120, 120, 0.9);
+    border-left-color: rgba(255, 40, 40, 0.4);
+    animation: hal-spin-ccw 6s linear infinite;
+  }
+
+  /* Radial tick marks rendered as a masked conic gradient ring */
+  .hal-ticks {
+    background: repeating-conic-gradient(
+      from 0deg,
+      rgba(255, 45, 45, 0.55) 0deg 0.6deg,
+      transparent 0.6deg 7.5deg
+    );
+    -webkit-mask: radial-gradient(
+      circle,
+      transparent 45%,
+      #000 46%,
+      #000 50%,
+      transparent 51%
+    );
+    mask: radial-gradient(
+      circle,
+      transparent 45%,
+      #000 46%,
+      #000 50%,
+      transparent 51%
+    );
+    opacity: 0.8;
+  }
+
+  /* Dark center socket holding the molten core */
+  .hal-core-disc {
+    background: radial-gradient(
+      circle at 50% 50%,
+      #1a0000 0%,
+      #0a0001 55%,
+      #000 100%
+    );
+    box-shadow: inset 0 0 40px rgba(0, 0, 0, 0.95);
+  }
+  .hal-core {
+    background: radial-gradient(
+      circle at 45% 40%,
+      #ff7a4a 0%,
+      #ff2a00 45%,
+      #8a0000 100%
+    );
+    box-shadow:
+      0 0 22px 5px rgba(255, 40, 0, 0.8),
+      0 0 44px 12px rgba(255, 0, 0, 0.38);
+    animation: hal-core-pulse 4s ease-in-out infinite;
+  }
+
+  /* Per-state speed / intensity adjustments */
+  body.idle .hal-arc-outer {
+    animation-duration: 12s;
+  }
+  body.idle .hal-arc-inner {
+    animation-duration: 9s;
+  }
+  body.idle .hal-ring-glow {
+    animation-duration: 6s;
+  }
+  body.idle .hal-core {
+    animation-duration: 5s;
+  }
+  body.idle .hal-ring {
+    border-color: rgba(255, 30, 30, 0.78);
+  }
+
+  body.listening .hal-arc-outer {
+    animation-duration: 5s;
+  }
+  body.listening .hal-arc-inner {
+    animation-duration: 4s;
+  }
+  body.listening .hal-ring-glow {
+    animation-duration: 2.2s;
+  }
+  body.listening .hal-core {
+    animation-duration: 1.6s;
+  }
+  body.listening .hal-ring {
+    border-color: rgba(255, 60, 60, 1);
+    box-shadow:
+      0 0 34px rgba(255, 40, 40, 1),
+      inset 0 0 26px rgba(255, 40, 40, 0.7);
+  }
+
+  body.processing .hal-arc-outer {
+    animation-duration: 1.6s;
+  }
+  body.processing .hal-arc-inner {
+    animation-duration: 1.2s;
+  }
+  body.processing .hal-ring-glow {
+    animation-duration: 1s;
+  }
+  body.processing .hal-ring {
+    border-color: rgba(255, 150, 40, 1);
+    box-shadow:
+      0 0 30px rgba(255, 140, 30, 0.9),
+      inset 0 0 22px rgba(255, 140, 30, 0.6);
+  }
+  body.processing .hal-core {
+    background: radial-gradient(
+      circle at 45% 40%,
+      #ffd24a 0%,
+      #ff7a00 45%,
+      #aa3300 100%
+    );
+    animation: hal-core-flicker 0.4s linear infinite;
+  }
+
+  body.speaking .hal-arc-outer {
+    animation-duration: 2.5s;
+  }
+  body.speaking .hal-arc-inner {
+    animation-duration: 2s;
+  }
+  body.speaking .hal-ring-glow {
+    animation-duration: 0.7s;
+  }
+  body.speaking .hal-core {
+    animation-duration: 0.5s;
+  }
+  body.speaking .hal-ring {
+    border-color: rgba(255, 45, 45, 1);
+    box-shadow:
+      0 0 44px rgba(255, 30, 30, 1),
+      inset 0 0 30px rgba(255, 30, 30, 0.75);
+  }
+
+  /* Fullscreen chat mode: hides the HAL eye, lets <main> reflow to top.
+     Transcript size is bumped via React state in Transcript.tsx (cleaner
+     than fighting Tailwind specificity). */
+  body.fullscreen-chat .hal-panel {
+    display: none;
+  }
+  body.fullscreen-chat main {
+    justify-content: flex-start;
+    padding-top: 70px;
+    gap: 14px;
+  }
+
+  /* Immersive: fade non-essential UI until interacted with. Each panel
+     opts in by adding the `immersive-fade` class. */
+  body.immersive .immersive-fade {
+    opacity: 0.08;
+    transition: opacity 0.9s ease;
+  }
+  body.immersive .immersive-fade:hover,
+  body.immersive .immersive-fade:focus-within {
+    opacity: 1;
+    transition: opacity 0.2s ease;
+  }
+
+}
+
+/* ---------------------------------------------------------------------------
+   Keyframes. These live as raw CSS (not Tailwind theme.extend.keyframes)
+   because Tailwind's JIT only emits @keyframes blocks when the matching
+   animate-* utility class is used in markup. We drive the eye state via
+   body.<mode> selectors above, so the utility never appears in source and
+   the keyframes never get compiled in. Defining them here guarantees they
+   ship.
+   --------------------------------------------------------------------------- */
+/* Ring arcs spin while preserving their centering translate */
+@keyframes hal-spin-cw {
+  from { transform: translate(-50%, -50%) rotate(0deg); }
+  to   { transform: translate(-50%, -50%) rotate(360deg); }
+}
+@keyframes hal-spin-ccw {
+  from { transform: translate(-50%, -50%) rotate(0deg); }
+  to   { transform: translate(-50%, -50%) rotate(-360deg); }
+}
+/* Glow halo "breathing" pulse */
+@keyframes evil-breathe {
+  0%, 100% { transform: translate(-50%, -50%) scale(0.97); opacity: 0.82; }
+  50%      { transform: translate(-50%, -50%) scale(1.04); opacity: 1; }
+}
+/* Molten core pulse */
+@keyframes hal-core-pulse {
+  0%, 100% { transform: scale(0.9);  opacity: 0.85; }
+  50%      { transform: scale(1.15); opacity: 1; }
+}
+/* Core flicker for the processing state */
+@keyframes hal-core-flicker {
+  0%, 100% { opacity: 1;    transform: scale(1.05); }
+  45%      { opacity: 0.5;  transform: scale(0.9); }
+  50%      { opacity: 1;    transform: scale(1.1); }
+  55%      { opacity: 0.55; transform: scale(0.92); }
+}
+
+@layer components {
+
+  /* Markdown */
+  .md code {
+    background: rgba(255, 30, 30, 0.08);
+    border: 1px solid rgba(255, 30, 30, 0.2);
+    padding: 1px 4px;
+    border-radius: 2px;
+    font-size: 0.9em;
+  }
+  .md pre {
+    background: rgba(0, 0, 0, 0.5);
+    border-left: 2px solid theme("colors.hal.amber");
+    padding: 10px 12px;
+    overflow-x: auto;
+    font-size: 12px;
+    line-height: 1.45;
+    -webkit-user-select: text;
+    user-select: text;
+    position: relative;
+  }
+  .md pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    color: theme("colors.hal.text");
+  }
+  .md ul {
+    list-style: disc;
+    padding-left: 1.4em;
+  }
+  .md h1,
+  .md h2,
+  .md h3,
+  .md h4 {
+    color: theme("colors.hal.amber");
+    letter-spacing: 1px;
+    margin: 0.4em 0 0.2em;
+  }
+}

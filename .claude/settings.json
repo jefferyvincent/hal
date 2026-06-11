@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(try { $r = Invoke-WebRequest -Uri http://localhost:8000/ -UseBasicParsing -TimeoutSec 2; \"HAL responding: HTTP $\\($r.StatusCode\\)\" } catch { \"HAL not responding on :8000 \\($\\($_.Exception.Message\\)\\)\" })",
+      "Bash(curl -sL \"https://massive.com/docs/websocket/quickstart\")",
+      "Bash(curl -sL \"https://massive.com/docs/websocket/options/trades\")"
+    ]
+  }
+}
