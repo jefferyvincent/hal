@@ -35,12 +35,35 @@ hal-voice/
     src-tauri/         Rust shell (window, tray, global shortcut, autostart)
 ```
 
+## Setup (Linux)
+
+One command from a **host terminal** (not the VSCode Flatpak terminal — it has no
+`sudo`/`apt` and can't see the GPU):
+
+```sh
+./setup.sh
+```
+
+It installs system prereqs (python venv, ffmpeg, libsndfile), creates `.venv`,
+installs GPU torch (CUDA 12.4) + the rest of `requirements.linux.txt`, sets up the
+`app/` frontend, and installs Ollama. The Python requirements are regenerated from
+`requirements.windows.txt` each run, so the two stay in sync.
+
+Pull the LLM/vision models (~30 GB, separate step):
+
+```sh
+PULL_MODELS=1 ./setup.sh        # or: ollama pull qwen3.6:27b  (etc.)
+```
+
 ## Development
 
 ### Server
 
 ```powershell
-.\start-hal.ps1
+.\start-hal.ps1                 # Windows
+```
+```sh
+source .venv/bin/activate && python server.py    # Linux
 ```
 
 Logs stream to `hal.log`. Server listens on `:8000`.
