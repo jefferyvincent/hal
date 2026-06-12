@@ -28,7 +28,13 @@
       "Bash(echo \"SECRET_KEY=$\\(python3 -c 'import secrets; print\\(secrets.token_hex\\(32\\)\\)'\\)\")",
       "Bash(flatpak-spawn --host bash -lc 'cd \"/media/jefferyvincent/New Volume1/repos/hal/app\" && npm run build 2>&1 | tail -25')",
       "Bash(flatpak-spawn --host bash -lc 'export PATH=\"$HOME/.nvm/versions/node/v26.3.0/bin:$PATH\"; cd \"/media/jefferyvincent/New Volume1/repos/hal/app\" && node --version && npm run build 2>&1 | tail -30')",
-      "Bash(git check-ignore *)"
+      "Bash(git check-ignore *)",
+      "Bash(cd \"/media/jefferyvincent/New Volume1/repos/hal\" && rm BACKTEST_WIRING.md && echo \"deleted\")",
+      "Bash(command -v python3 python)",
+      "Bash(python3 -c \"import mcp; print\\('mcp', mcp.__version__ if hasattr\\(mcp,'__version__'\\) else 'ok'\\)\")"
+    ],
+    "additionalDirectories": [
+      "/media/jefferyvincent/New Volume1/repos/hal"
     ]
   }
 }
