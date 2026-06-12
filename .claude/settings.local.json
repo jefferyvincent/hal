@@ -31,7 +31,9 @@
       "Bash(git check-ignore *)",
       "Bash(cd \"/media/jefferyvincent/New Volume1/repos/hal\" && rm BACKTEST_WIRING.md && echo \"deleted\")",
       "Bash(command -v python3 python)",
-      "Bash(python3 -c \"import mcp; print\\('mcp', mcp.__version__ if hasattr\\(mcp,'__version__'\\) else 'ok'\\)\")"
+      "Bash(python3 -c \"import mcp; print\\('mcp', mcp.__version__ if hasattr\\(mcp,'__version__'\\) else 'ok'\\)\")",
+      "Bash(lsblk -o NAME,LABEL,UUID,FSTYPE,SIZE,MOUNTPOINT /dev/sda /dev/sdb)",
+      "Bash(sed -n '176,185p' \"/media/jefferyvincent/HAL/repos/hal/setup.sh\")"
     ],
     "additionalDirectories": [
       "/media/jefferyvincent/New Volume1/repos/hal"

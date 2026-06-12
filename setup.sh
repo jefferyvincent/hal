@@ -79,26 +79,36 @@ iconv -f UTF-16 -t UTF-8 requirements.windows.txt \
   > requirements.linux.txt
 
 # --- 3. Python venv + GPU torch + the rest -----------------------------------
+# venvs bake their absolute path into activate/pyvenv.cfg and are NOT relocatable.
+# If .venv was built under a different path (e.g. the drive remounted from
+# "New Volume" to "New Volume1"), activation prepends a dead dir to PATH and the
+# venv's `python`/`pip` vanish. Recreate it whenever the recorded path no longer
+# matches this checkout.
+VENV_DIR="$PWD/.venv"
+if [ -d .venv ] && ! grep -qF "$VENV_DIR" .venv/bin/activate 2>/dev/null; then
+  warn "Existing .venv was built for a different path; recreating it."
+  rm -rf .venv
+fi
 if [ ! -d .venv ]; then
   say "Creating virtualenv (.venv)"
   "$PY" -m venv .venv
 fi
-# shellcheck disable=SC1091
-source .venv/bin/activate
-python -m pip install --upgrade pip wheel
+# Call the interpreter by absolute path instead of trusting the activated PATH,
+# so a stale activate script can never shadow it.
+VPY="$VENV_DIR/bin/python"
+"$VPY" -m pip install --upgrade pip wheel
 
 say "Installing GPU torch ${TORCH_VER} (CUDA 12.4)"
-pip install "torch==${TORCH_VER}" "torchaudio==${TORCHAUDIO_VER}" --index-url "$CUDA_INDEX"
+"$VPY" -m pip install "torch==${TORCH_VER}" "torchaudio==${TORCHAUDIO_VER}" --index-url "$CUDA_INDEX"
 
 say "Installing remaining Python deps"
-pip install -r requirements.linux.txt
+"$VPY" -m pip install -r requirements.linux.txt
 
-python - <<'PY'
+"$VPY" - <<'PY'
 import torch
 print(f"torch {torch.__version__} | CUDA available: {torch.cuda.is_available()} | "
       f"device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU only'}")
 PY
-deactivate
 
 # --- 4. Node (frontend) ------------------------------------------------------
 if command -v npm >/dev/null 2>&1; then
