@@ -305,6 +305,23 @@ async def _lifespan(_app: FastAPI):
     _rag.start_watcher()
     # Background initial ingest so search works immediately after boot
     asyncio.get_event_loop().run_in_executor(None, _rag.ingest_vault)
+    # Everything above is up: announce HAL is live so the end user (watching
+    # hal.log or the console) knows the server is ready to take requests.
+    print("\n" + "=" * 70)
+    print("  HAL is running — open  http://localhost:8000  in your browser")
+    print("  (or launch the native window:  cd app && npm run tauri:dev)")
+    print("=" * 70 + "\n", flush=True)
+    # Best-effort desktop popup so the user sees HAL is up even without the log.
+    # Silently skipped when notify-send is missing or there's no desktop session
+    # (e.g. headless or a systemd service with no DBus address).
+    try:
+        subprocess.Popen(
+            ["notify-send", "--app-name=HAL", "HAL is running",
+             "Open http://localhost:8000"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except (FileNotFoundError, OSError) as e:
+        print(f"[boot] desktop notification skipped ({e})")
     try:
         yield
     finally:
@@ -3112,6 +3129,16 @@ async def process_turn(
                 user_text, history, websocket, abort_event,
                 attachments=attachments, on_sentence=stream_sentence,
                 vision_mode=vision_mode, model_mode=model_mode)
+            # A news alert also proposes a position: deliver_alert stashes the
+            # symbol, and we build the sized reco here (same path the on-demand
+            # trade route uses) so HAL announces the headline THEN the trade.
+            _news_sym = websocket.scope.pop("hal_pending_news_position", None)
+            if _news_sym:
+                spoken, full_md = await build_trade_reco(
+                    _news_sym, websocket.scope.get("hal_risk"), websocket)
+                await stream_sentence(spoken)
+                await _push_trade_idea(websocket, "trade", _news_sym, full_md)
+                nh = nh + [{"role": "assistant", "content": full_md or spoken}]
             if on_reply:
                 try:
                     await on_reply(nh)
@@ -3684,6 +3711,11 @@ async def process_turn(
             print(f"[turn] park_tts failed: {e}")
 
 
+# A news alert auto-builds a position once per symbol within this window, so a
+# busy news day on one ticker can't spam Jeffery with repeated trade recos.
+NEWS_POSITION_COOLDOWN_SECONDS = 1800.0
+
+
 @app.websocket("/ws")
 async def voice_interface(websocket: WebSocket):
     if not _is_authed(websocket):
@@ -3779,6 +3811,16 @@ async def voice_interface(websocket: WebSocket):
             _seen.append(_key)
             if len(_seen) > 100:
                 del _seen[:50]
+        # News alerts also propose a position (the announcement turn picks this
+        # up in process_turn and builds a sized reco). Cooldown per symbol so a
+        # busy news day doesn't fire repeated recos for the same ticker.
+        if payload.get("kind") == "news" and payload.get("symbol"):
+            _sym = payload["symbol"]
+            _now = time.time()
+            _fired = websocket.scope.setdefault("hal_news_pos_fired", {})
+            if _now - _fired.get(_sym, 0.0) >= NEWS_POSITION_COOLDOWN_SECONDS:
+                _fired[_sym] = _now
+                websocket.scope["hal_pending_news_position"] = _sym
         # Interrupt any speaking/processing.
         abort_event.set()
         if current_task and not current_task.done():

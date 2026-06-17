@@ -85,8 +85,26 @@ iconv -f UTF-16 -t UTF-8 requirements.windows.txt \
 # venv's `python`/`pip` vanish. Recreate it whenever the recorded path no longer
 # matches this checkout.
 VENV_DIR="$PWD/.venv"
-if [ -d .venv ] && ! grep -qF "$VENV_DIR" .venv/bin/activate 2>/dev/null; then
-  warn "Existing .venv was built for a different path; recreating it."
+# A venv is unusable — recreate it — if any of these hold:
+#   (a) it was built for a different path (activate bakes in an absolute path,
+#       e.g. the drive remounted "New Volume" -> "New Volume1");
+#   (b) its interpreter no longer runs (the system Python was removed/upgraded
+#       so .venv/bin/python dangles to a deleted binary);
+#   (c) the interpreter runs but its version-stamped site-packages is gone — a
+#       Python minor bump (3.12 -> 3.13) leaves the python symlink pointing at
+#       the new interpreter while every installed package is orphaned under the
+#       old lib/python3.12, so the venv looks alive but imports nothing.
+venv_is_stale() {
+  [ -d .venv ] || return 1                                            # nothing to recreate
+  grep -qF "$VENV_DIR" .venv/bin/activate 2>/dev/null || return 0     # (a)
+  .venv/bin/python -c '' 2>/dev/null || return 0                      # (b)
+  .venv/bin/python -c "import os,sys; sys.exit(0 if os.path.isdir(\
+os.path.join('$VENV_DIR','lib','python%d.%d'%sys.version_info[:2],'site-packages')) else 1)" \
+    2>/dev/null || return 0                                           # (c)
+  return 1
+}
+if venv_is_stale; then
+  warn "Existing .venv is stale (path moved, interpreter gone, or Python upgraded); recreating it."
   rm -rf .venv
 fi
 if [ ! -d .venv ]; then
@@ -110,6 +128,24 @@ print(f"torch {torch.__version__} | CUDA available: {torch.cuda.is_available()} 
       f"device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU only'}")
 PY
 
+# --- 3.5 Piper TTS voice (HAL's voice; not shipped via pip) -------------------
+# server.py loads en_US-ryan-medium at boot from $HAL_SCRATCH_DIR/piper_voices.
+# The .onnx model + its .onnx.json config live on Hugging Face, not in any pip
+# package, so fetch them here. Idempotent: skips files already present.
+SCRATCH_DIR="${HAL_SCRATCH_DIR:-$HOME/hal_scratch}"
+PIPER_DIR="$SCRATCH_DIR/piper_voices"
+PIPER_BASE="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/medium"
+say "Checking Piper voice (en_US-ryan-medium) in $PIPER_DIR"
+mkdir -p "$PIPER_DIR"
+for f in en_US-ryan-medium.onnx en_US-ryan-medium.onnx.json; do
+  if [ -s "$PIPER_DIR/$f" ]; then
+    say "  $f already present"
+  else
+    say "  downloading $f"
+    curl -fL --retry 3 -o "$PIPER_DIR/$f" "$PIPER_BASE/$f?download=true"
+  fi
+done
+
 # --- 4. Node (frontend) ------------------------------------------------------
 if command -v npm >/dev/null 2>&1; then
   say "Node already present: $(node --version)"
@@ -122,6 +158,31 @@ elif can_sudo; then
   ( cd app && npm install )
 else
   warn "Skipping Node install: needs sudo. Re-run ./setup.sh in a host terminal."
+fi
+
+# --- 4.5 Rust + Tauri system libs (the native window: `npm run tauri:dev`) ----
+# `tauri dev` compiles a Rust shell, so it needs cargo (via rustup, no sudo) plus
+# the webkit/gtk dev libs Tauri 2 links against (those need apt + sudo). Browser
+# mode (`npm run dev`) needs none of this; we install it so the native window
+# works out of the box.
+if command -v cargo >/dev/null 2>&1; then
+  say "Rust already present: $(cargo --version)"
+else
+  say "Installing Rust toolchain (rustup, no sudo)"
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  # shellcheck disable=SC1091
+  . "$HOME/.cargo/env"
+fi
+
+# Tauri 2's Linux build deps. Names are for Debian/Ubuntu/Pop!_OS.
+TAURI_APT=(libwebkit2gtk-4.1-dev build-essential file libxdo-dev libssl-dev \
+           libayatana-appindicator3-dev librsvg2-dev)
+if can_sudo; then
+  say "Installing Tauri system libs: ${TAURI_APT[*]}"
+  sudo apt-get update && sudo apt-get install -y "${TAURI_APT[@]}"
+else
+  warn "Skipping Tauri system libs: needs sudo. Re-run ./setup.sh in a host terminal."
+  warn "  Needed for the native window: ${TAURI_APT[*]}"
 fi
 
 # --- 5. Ollama (the LLM backend) ---------------------------------------------
@@ -176,13 +237,15 @@ fi
 # --- 6. Ollama models (heavy: ~30 GB total). Opt in with PULL_MODELS=1 --------
 if command -v ollama >/dev/null 2>&1 && [ "${PULL_MODELS:-0}" = "1" ]; then
   say "Pulling Ollama models into $OLLAMA_MODELS (this is large)"
-  for m in qwen3.6:27b llama3.2:3b qwen2.5vl:7b qwen2.5vl:3b; do
+  for m in qwen3.6:27b llama3.2:3b qwen2.5vl:7b qwen2.5vl:3b nomic-embed-text; do
     ollama pull "$m"
   done
 else
   warn "Skipping model pulls. When ready:  PULL_MODELS=1 ./setup.sh   (or pull individually)"
-  warn "  Models used: qwen3.6:27b (smart), llama3.2:3b (fast), qwen2.5vl:7b/3b (vision)"
+  warn "  Models used: qwen3.6:27b (smart), llama3.2:3b (fast), qwen2.5vl:7b/3b (vision),"
+  warn "               nomic-embed-text (RAG embeddings — vault search needs this)"
 fi
 
 say "Done. Start the server with:  source .venv/bin/activate && python server.py"
 say "Frontend (browser mode):       cd app && npm run dev   ->  http://localhost:1420"
+say "Frontend (native window):      cd app && npm run tauri:dev  (first build: 5-10 min)"

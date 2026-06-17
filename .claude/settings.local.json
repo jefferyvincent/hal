@@ -33,7 +33,11 @@
       "Bash(command -v python3 python)",
       "Bash(python3 -c \"import mcp; print\\('mcp', mcp.__version__ if hasattr\\(mcp,'__version__'\\) else 'ok'\\)\")",
       "Bash(lsblk -o NAME,LABEL,UUID,FSTYPE,SIZE,MOUNTPOINT /dev/sda /dev/sdb)",
-      "Bash(sed -n '176,185p' \"/media/jefferyvincent/HAL/repos/hal/setup.sh\")"
+      "Bash(sed -n '176,185p' \"/media/jefferyvincent/HAL/repos/hal/setup.sh\")",
+      "Bash(command -v shellcheck)",
+      "Bash(shellcheck setup.sh)",
+      "Bash(.venv/bin/python -c \"import ast; ast.parse\\(open\\('server.py'\\).read\\(\\)\\); print\\('server.py parses OK'\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('server.py'\\).read\\(\\)\\); print\\('server.py parses OK'\\)\")"
     ],
     "additionalDirectories": [
       "/media/jefferyvincent/New Volume1/repos/hal"
