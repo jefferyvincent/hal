@@ -6,8 +6,9 @@ import { create } from "zustand";
 
 const STORAGE_KEY = "hal.positionSizing";
 
-/** Brokers HAL knows how to give order-entry instructions for. */
-export const BROKERS = ["Webull", "Robinhood", "Schwab", "Fidelity", "IBKR", "Tastytrade", "E*TRADE"] as const;
+/** Brokers HAL knows. Alpaca is the integrated execution broker (HAL places
+ *  orders directly); the rest are instruction-only (HAL tailors order steps). */
+export const BROKERS = ["Alpaca", "Webull", "Robinhood", "Schwab", "Fidelity", "IBKR", "Tastytrade", "E*TRADE"] as const;
 export type Broker = (typeof BROKERS)[number];
 
 export interface PositionSizingState {
@@ -36,7 +37,7 @@ const DEFAULTS: Persisted = {
   accountSize: 0,
   maxRiskPct: 5,
   stopLossPct: 20,
-  broker: "Webull",
+  broker: "Alpaca",
 };
 
 function load(): Persisted {

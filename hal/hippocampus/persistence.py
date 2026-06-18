@@ -134,12 +134,60 @@ def _init_db() -> None:
                 tokens      TEXT,
                 updated_at  REAL NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS broker_orders (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_order_id TEXT,
+                broker_order_id TEXT,
+                symbol          TEXT NOT NULL,
+                asset_class     TEXT NOT NULL,
+                side            TEXT NOT NULL,
+                qty             TEXT,
+                order_type      TEXT,
+                limit_price     REAL,
+                status          TEXT,
+                mode            TEXT,
+                paper           INTEGER NOT NULL DEFAULT 1,
+                submitted_at    REAL NOT NULL,
+                detail          TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_broker_orders_submitted
+                ON broker_orders(submitted_at DESC);
             """
         )
 
 
 _init_db()
 print(f"[boot] DB: {DB_PATH}")
+
+
+def log_broker_order(spec: dict, result: dict, mode: str, paper: bool) -> None:
+    """Record a submitted Alpaca order. `spec` is the prepared order, `result`
+    is the broker's response (see broker._order_to_dict)."""
+    with _db() as conn:
+        conn.execute(
+            """
+            INSERT INTO broker_orders
+                (client_order_id, broker_order_id, symbol, asset_class, side, qty,
+                 order_type, limit_price, status, mode, paper, submitted_at, detail)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                result.get("client_order_id"),
+                result.get("id"),
+                spec.get("symbol"),
+                spec.get("asset_class"),
+                spec.get("side"),
+                str(spec.get("qty")),
+                spec.get("type"),
+                spec.get("limit_price"),
+                result.get("status"),
+                mode,
+                1 if paper else 0,
+                time.time(),
+                json.dumps(result, default=str),
+            ),
+        )
 
 
 def _new_conversation_obj(title: str = "New conversation") -> dict:

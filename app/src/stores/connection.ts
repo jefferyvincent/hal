@@ -13,6 +13,8 @@ import { usePositionSizing } from "@/stores/positionSizing";
 import type {
   AlertEvent,
   Attachment,
+  BrokerAccount,
+  BrokerPosition,
   ChatMessage,
   ConversationSummary,
   McpServer,
@@ -65,6 +67,13 @@ interface ConnectionState {
   // Pinned trade ideas / hold reads (newest first), so they don't scroll away
   // in the chat. Populated by the server's trade_idea messages.
   tradeIdeas: TradeIdea[];
+  // Live brokerage view (Alpaca), for the Positions panel.
+  positions: BrokerPosition[];
+  brokerAccount: BrokerAccount | null;
+  brokerReady: boolean;
+  brokerPaper: boolean;
+  tradeMode: string; // "confirm" | "autopilot"
+  positionsError: string | null;
 }
 
 interface ConnectionActions {
@@ -92,6 +101,9 @@ interface ConnectionActions {
   clearTradeIdeas: () => void;
   refreshWatchlist: () => void;
   refreshChart: () => void;
+  refreshPositions: () => void;
+  closePosition: (symbol: string) => void;
+  setTradeMode: (mode: "confirm" | "autopilot") => void;
 }
 
 const STATE_LABELS: Record<Mode, string[]> = {
@@ -189,6 +201,17 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
           alertEvents: msg.alert_events ?? [],
           newsWatches: msg.news_watches ?? [],
           newsArticles: msg.news_articles ?? [],
+        });
+        return;
+      }
+      if (msg.broker_ready !== undefined) {
+        set({
+          positions: msg.positions ?? [],
+          brokerAccount: msg.broker_account ?? null,
+          brokerReady: !!msg.broker_ready,
+          brokerPaper: msg.broker_paper ?? true,
+          tradeMode: msg.trade_mode ?? "confirm",
+          positionsError: msg.positions_error ?? null,
         });
         return;
       }
@@ -351,6 +374,12 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
       newsWatches: [],
       newsArticles: [],
       tradeIdeas: [],
+      positions: [],
+      brokerAccount: null,
+      brokerReady: false,
+      brokerPaper: true,
+      tradeMode: "confirm",
+      positionsError: null,
 
       // -- actions -----------------------------------------------------
       async init() {
@@ -617,6 +646,15 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
       },
       refreshChart() {
         void getSocket().sendCommand({ command: "chart_refresh" });
+      },
+      refreshPositions() {
+        void getSocket().sendCommand({ command: "positions_refresh" });
+      },
+      closePosition(symbol) {
+        void getSocket().sendCommand({ command: "position_close", symbol });
+      },
+      setTradeMode(mode) {
+        void getSocket().sendCommand({ command: "set_trade_mode", mode });
       },
     };
   },

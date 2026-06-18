@@ -11,6 +11,7 @@ from hal.brainstem.config import (
     MAX_TOOL_OUTPUT_CHARS, MAX_AGENT_ITERATIONS, AUTO_APPROVE_TOOLS,
     NEWS_POLL_SECONDS, NEWS_PRIMARY_FEED, CHART_DATA_SOURCE,
     HAL_PASSWORD, HAL_SECRET_KEY,
+    ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER, ALPACA_AUTOPILOT,
 )
 
 import os
@@ -39,9 +40,12 @@ from piper import PiperVoice
 from hal.sensory import market
 from hal.sensory import news
 from hal.sensory import watchlist
+from hal.sensory import broker
 from hal.cortex import analysis
+from hal.cortex import committee
 from hal.motor import charting
 from hal.cerebellum import backtest
+from hal.cerebellum import committee_backtest
 from hal.cerebellum import option_strategy
 from hal.peripheral import mcp_client
 from hal.cerebellum.symbols import _resolve_company_name, _resolve_symbol
@@ -72,6 +76,9 @@ _MODEL_TOOL_NAMES = {
     "run_command", "run_cmd", "run_python", "query_massive",
     "open_webull", "open_view",
     "journal_search", "vault_close_trade",
+    "place_order", "confirm_order", "cancel_pending_order", "set_trade_mode",
+    "get_account", "list_positions", "list_orders", "cancel_order", "close_position",
+    "committee_review", "committee_backtest",
 }
 _MODEL_TOOLS = [
     t for t in TOOLS if t.get("function", {}).get("name") in _MODEL_TOOL_NAMES
@@ -299,6 +306,14 @@ async def _lifespan(_app: FastAPI):
     await market.alert_poller.start()
     news.configure(DB_PATH, NEWS_POLL_SECONDS, NEWS_PRIMARY_FEED)
     watchlist.configure(MASSIVE_BASE_URL, MASSIVE_API_KEY)
+    broker.configure(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER, ALPACA_AUTOPILOT)
+    print(
+        f"[boot] broker: {'ready' if broker.is_ready() else 'no credentials'} "
+        f"({'paper' if broker.is_paper() else 'LIVE'}, {broker.get_mode()} mode)"
+    )
+    # Committee reuses the already-configured analysis/option-strategy tools, so
+    # there's nothing to wire here — just confirm the tools are registered.
+    print("[boot] committee: review + backtest tools registered")
     await news.monitor.start()
     await mcp_client.start()
     # Start vault RAG watcher (incremental re-index on file changes)
@@ -970,6 +985,15 @@ async def execute_tool(name: str, args: dict, websocket: WebSocket, abort_event:
         return await run_analysis_tool(name, args, websocket)
     if name == "recommend_strategy":
         return await run_strategy_tool(args, websocket)
+    if name in (
+        "place_order", "confirm_order", "cancel_pending_order", "set_trade_mode",
+        "get_account", "list_positions", "list_orders", "cancel_order", "close_position",
+    ):
+        return await run_broker_tool(name, args, websocket)
+    if name == "committee_review":
+        return await run_committee_tool(args, websocket)
+    if name == "committee_backtest":
+        return await run_committee_backtest_tool(args, websocket)
     if name == "open_webull":
         return await run_webull_tool(args, websocket)
     if name == "open_view":
@@ -1095,6 +1119,170 @@ async def open_webull(action: str, ticker: str = "") -> dict:
     except Exception as e:
         return {"error": f"failed to launch browser: {e}", "url": url}
     return {"opened": url, "action": action, "ticker": ticker or None}
+
+
+def _broker_rules_check(spec: dict) -> dict:
+    """Backstop the model's own rule-compliance with the vault rules gate. Only
+    keyword blockers (wont_trade) can fire here — account-size caps are skipped
+    (account_size left 0) so we never false-block on a missing risk estimate."""
+    strategy = f"{spec['asset_class']} {spec['symbol']}"
+    return _check_trade(symbol=spec["symbol"], strategy=strategy,
+                        side=spec["side"], reward_risk=None)
+
+
+async def _stage_or_submit(spec: dict, summary: str) -> dict:
+    """Confirm mode stages the order and returns a token; autopilot submits now."""
+    if broker.get_mode() == "autopilot":
+        order = await asyncio.to_thread(broker.submit_order, spec)
+        return {"submitted": order, "summary": summary,
+                "message": f"Autopilot submitted: {summary}"}
+    token = broker.stage_order(spec, summary)
+    return {"staged": True, "token": token, "summary": summary,
+            "message": f"Staged — confirm to send. {summary} (token {token})"}
+
+
+async def _place_order(args: dict) -> dict:
+    spec = broker.prepare_order(
+        asset_class=args.get("asset_class", "equity"),
+        side=args.get("side", ""),
+        qty=args.get("qty", 0),
+        order_type=args.get("order_type", "market"),
+        limit_price=args.get("limit_price"),
+        symbol=args.get("symbol"),
+        underlying=args.get("underlying"),
+        expiration=args.get("expiration"),
+        option_type=args.get("option_type"),
+        strike=args.get("strike"),
+    )
+    gate = _broker_rules_check(spec)
+    if not gate["passed"]:
+        return {"blocked": True, "failures": gate["failures"],
+                "message": "Blocked by your trading rules: " + "; ".join(gate["failures"])}
+    return await _stage_or_submit(spec, broker.summarize_order(spec))
+
+
+async def _close_position(args: dict) -> dict:
+    """Close a holding by staging/submitting an offsetting order, so it rides the
+    same confirm/autopilot gate and order log as any other order."""
+    symbol = (args.get("symbol") or "").strip().upper()
+    if not symbol:
+        return {"error": "symbol is required"}
+    spec = await asyncio.to_thread(broker.build_close_spec, symbol)
+    return await _stage_or_submit(spec, "CLOSE " + broker.summarize_order(spec))
+
+
+async def _broker_dispatch(name: str, args: dict) -> dict:
+    if name == "get_account":
+        return await asyncio.to_thread(broker.get_account)
+    if name == "list_positions":
+        return {"positions": await asyncio.to_thread(broker.list_positions)}
+    if name == "list_orders":
+        return {"orders": await asyncio.to_thread(
+            broker.list_orders, args.get("status", "open"), int(args.get("limit", 20)))}
+    if name == "cancel_order":
+        oid = (args.get("order_id") or "").strip()
+        return await asyncio.to_thread(broker.cancel_order, oid) if oid \
+            else {"error": "order_id is required"}
+    if name == "set_trade_mode":
+        mode = broker.set_mode(args.get("mode", "confirm"))
+        return {"mode": mode, "message": f"Order gate is now {mode} mode."}
+    if name == "cancel_pending_order":
+        ok = broker.discard_pending(args.get("token"))
+        return {"discarded": ok,
+                "message": "Staged order discarded." if ok else "No matching staged order."}
+    if name == "confirm_order":
+        order = await asyncio.to_thread(broker.submit_pending, args.get("token"))
+        return {"submitted": order,
+                "message": f"Order submitted: {order.get('symbol')} ({order.get('status')})."}
+    if name == "place_order":
+        return await _place_order(args)
+    if name == "close_position":
+        return await _close_position(args)
+    return {"error": f"unknown broker tool: {name}"}
+
+
+async def run_broker_tool(name: str, args: dict, websocket: WebSocket) -> str:
+    if not broker.is_ready():
+        msg = "Alpaca isn't configured — set ALPACA_API_KEY and ALPACA_SECRET_KEY in .env."
+        await _emit_telemetry(websocket, f"broker.{name}",
+                              json.dumps(args, default=str)[:200], msg, status="error")
+        return msg
+    try:
+        result = await _broker_dispatch(name, args)
+    except Exception as e:
+        result = {"error": f"{type(e).__name__}: {e}"}
+    status = "error" if isinstance(result, dict) and result.get("error") else "ok"
+    body = json.dumps(result, indent=2, default=str)
+    preview = f"{name}({json.dumps(args, default=str)[:200]})"
+    await _emit_telemetry(websocket, f"broker.{name}", preview, body, status=status)
+    return body[:MAX_TOOL_OUTPUT_CHARS]
+
+
+async def run_committee_tool(args: dict, websocket: WebSocket) -> str:
+    """Convene the multi-agent committee on a ticker (analysts → bull/bear debate
+    → judge → rules gate), pin the verdict in the Trade Ideas pane, and return a
+    one-line spoken summary. Pure analysis — places no orders."""
+    raw = (args.get("symbol") or "").strip()
+    symbol = (await _resolve_symbol(raw)) or raw.upper()
+    if not symbol:
+        return "I need a ticker to convene the committee."
+    horizon = str(args.get("horizon") or "swing").lower()
+    risk = websocket.scope.get("hal_risk") or {}
+    account_size = float(risk.get("accountSize") or 0)
+    await websocket.send_json(
+        {"state": "processing", "text": f"Convening the committee on {symbol}..."})
+    try:
+        verdict = await committee.run_committee(
+            symbol, horizon=horizon, account_size=account_size)
+    except Exception as e:
+        msg = f"Committee failed on {symbol}: {type(e).__name__}: {e}"
+        await _emit_telemetry(websocket, "committee.review", f"{symbol} {horizon}", msg, status="error")
+        return msg
+    kind = "trade" if verdict["decision"] == "TRADE" else "hold"
+    await _push_trade_idea(websocket, kind, symbol, verdict["markdown"])
+    await _emit_telemetry(websocket, "committee.review", f"{symbol} {horizon}", verdict["markdown"])
+    if verdict["decision"] == "TRADE":
+        return (
+            f"Committee says trade {symbol}: {verdict['side']} via "
+            f"{verdict['structure'] or 'the chosen structure'}, "
+            f"{verdict['conviction']} conviction. {verdict['thesis']}".strip()
+        )
+    why = "; ".join(verdict["rules_failures"]) or verdict["invalidation"] or "the bear case held"
+    return f"Committee passes on {symbol}. {why}".strip()
+
+
+async def run_committee_backtest_tool(args: dict, websocket: WebSocket) -> str:
+    """Backtest the committee on a symbol/window. Defaults to the cheap baseline
+    arm (no LLM); set full=true to also run the committee arm (LLM calls per
+    date — slow). Returns the directional-proxy report."""
+    raw = (args.get("symbol") or "").strip()
+    symbol = (await _resolve_symbol(raw)) or raw.upper()
+    if not symbol:
+        return "I need a ticker to backtest the committee."
+    start = str(args.get("start") or "").strip()
+    end = str(args.get("end") or "").strip()
+    if not (start and end):
+        return "I need a start and end date (YYYY-MM-DD) for the backtest."
+    run_llm = bool(args.get("full"))
+    await websocket.send_json(
+        {"state": "processing",
+         "text": f"Backtesting the committee on {symbol} ({'full' if run_llm else 'baseline'})..."})
+    try:
+        result = await committee_backtest.backtest(
+            symbol, start, end,
+            horizon_days=int(args.get("horizon_days", 10)),
+            step_days=int(args.get("step_days", 5)),
+            run_llm=run_llm,
+            limit=args.get("limit"),
+        )
+    except Exception as e:
+        msg = f"Backtest failed on {symbol}: {type(e).__name__}: {e}"
+        await _emit_telemetry(websocket, "committee.backtest", f"{symbol} {start}..{end}", msg, status="error")
+        return msg
+    report = result.get("report") or result.get("error") or "no result"
+    status = "error" if result.get("error") else "ok"
+    await _emit_telemetry(websocket, "committee.backtest", f"{symbol} {start}..{end}", report, status=status)
+    return report[:MAX_TOOL_OUTPUT_CHARS]
 
 
 async def run_webull_tool(args: dict, websocket: WebSocket) -> str:
@@ -3783,6 +3971,25 @@ async def voice_interface(websocket: WebSocket):
     async def send_subscriptions_snapshot():
         await _push_watch_snapshot(websocket)
 
+    async def send_positions_snapshot(error: str | None = None):
+        """Push the live brokerage view (account + open positions + gate state)
+        to the Positions panel. Degrades gracefully when Alpaca isn't configured."""
+        payload: dict = {
+            "positions": [],
+            "broker_ready": broker.is_ready(),
+            "broker_paper": broker.is_paper(),
+            "trade_mode": broker.get_mode(),
+            "broker_account": None,
+            "positions_error": error,
+        }
+        if broker.is_ready():
+            try:
+                payload["broker_account"] = await asyncio.to_thread(broker.get_account)
+                payload["positions"] = await asyncio.to_thread(broker.list_positions)
+            except Exception as e:
+                payload["positions_error"] = error or f"{type(e).__name__}: {e}"
+        await websocket.send_json(payload)
+
     def persist_current():
         current_conv["messages"] = history
         save_conversation(current_conv)
@@ -3791,6 +3998,7 @@ async def voice_interface(websocket: WebSocket):
     await send_conversation_history()
     await send_mcp_snapshot()
     await send_subscriptions_snapshot()
+    await send_positions_snapshot()
 
     async def deliver_alert(message: str, payload: dict):
         """Called by market.SubscriptionManager when a rule fires. Aborts any
@@ -4052,6 +4260,37 @@ async def voice_interface(websocket: WebSocket):
                     except Exception as e:
                         print(f"[news] remove watch failed: {e}")
                     await send_subscriptions_snapshot()
+                elif cmd == "positions_refresh":
+                    await send_positions_snapshot()
+                elif cmd == "position_close":
+                    # Manual override from the Positions panel: the user is
+                    # closing the trade directly, so submit immediately —
+                    # bypassing HAL's confirm/autopilot gate — then refresh.
+                    sym = str(command.get("symbol", "")).strip().upper()
+                    err = None
+                    if not sym:
+                        err = "symbol is required"
+                    elif not broker.is_ready():
+                        err = "Alpaca isn't configured."
+                    else:
+                        try:
+                            order = await asyncio.to_thread(broker.close_position_now, sym)
+                            await _emit_telemetry(
+                                websocket, "broker.position_close",
+                                f"manual close {sym}",
+                                json.dumps(order, indent=2, default=str),
+                            )
+                        except Exception as e:
+                            err = f"{type(e).__name__}: {e}"
+                            print(f"[broker] manual close {sym} failed: {e}")
+                    await send_positions_snapshot(error=err)
+                elif cmd == "set_trade_mode":
+                    # HUD toggle: flip the order gate between confirm/autopilot,
+                    # then re-broadcast so the snapshot's trade_mode updates.
+                    m = str(command.get("mode", "")).strip().lower()
+                    if m in ("confirm", "autopilot"):
+                        broker.set_mode(m)
+                    await send_positions_snapshot()
                 elif cmd == "watchlist_refresh":
                     try:
                         payload = await watchlist.build_payload()

@@ -214,6 +214,60 @@ via `tauri-plugin-global-shortcut`. Works even when the window is hidden.
 - Stop button (interrupt speech/generation).
 - Fullscreen chat mode (hides the eye, expands transcript).
 
+## Trading & committee commands to remember
+
+HAL is voice/text driven — these are things to **say or type**, not CLI commands.
+Phrasing is flexible; the examples below are what reliably routes to each tool.
+
+### Order execution (Alpaca)
+
+Paper vs live is set by `ALPACA_PAPER` in `.env` (defaults to **paper** — nothing
+hits real money until you set it `false`). Orders go through a gate:
+
+- **Confirm mode (default):** an order is *staged*, not sent. HAL reads it back;
+  you then say **"yes / send it / confirm"** to fire it, or **"cancel that"** to drop it.
+- **Autopilot mode:** orders submit immediately once they pass your rules.
+  Say **"turn on autopilot"** / **"go back to confirming"** to switch.
+
+| Say something like… | What it does |
+| --- | --- |
+| "Buy 10 shares of AAPL" / "Sell 2 SPY 580 puts for Friday" | Stages an equity or single-leg option order (`place_order`) |
+| "Yes, send it" / "Confirm" | Submits the staged order (`confirm_order`) |
+| "Cancel that" / "Never mind" | Discards a staged, unsent order (`cancel_pending_order`) |
+| "Turn on autopilot" / "Go back to confirming" | Flips the order gate (`set_trade_mode`) |
+| "What's my account / buying power?" | Alpaca account snapshot (`get_account`) |
+| "What am I holding?" / "How are my positions?" | Open positions + P&L (`list_positions`) |
+| "What orders are working?" / "Did it fill?" | Working/recent orders (`list_orders`) |
+| "Cancel my AAPL order" | Cancels a live resting order (`cancel_order`) |
+| "Close my AAPL" / "Flatten that" | Submits an offsetting order (gated like any order) |
+
+**Positions panel (UI):** the **POSITIONS** button in the HUD opens a live panel
+(equity, buying power, per-position P&L, PAPER/LIVE + gate badge). The **Close**
+button there is a *manual override* — it sells immediately, bypassing the
+confirm/autopilot gate (two-click confirm so it can't fire by accident).
+
+`.env` keys: `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ALPACA_PAPER`, `ALPACA_AUTOPILOT`.
+
+### Multi-agent committee (deep analysis)
+
+A heavier, slower workup than a quick trade idea: vol/setup/catalyst analysts →
+bull-vs-bear debate → head-trader judge → your deterministic rules gate. Pins a
+TRADE-or-PASS verdict (with the full desk reasoning) in the Trade Ideas pane and
+**places no orders**.
+
+| Say something like… | What it does |
+| --- | --- |
+| "Deep dive on NVDA" / "What does the committee think about SPY?" | Full committee review (`committee_review`) |
+| "Backtest the committee on AAPL from 2025-09-01 to 2026-03-01" | Validates its directional calls (`committee_backtest`) |
+
+The backtest defaults to the **cheap baseline arm (no LLM)** — run that first to
+see if the signals predict direction at all. Add **"the full version"** to also run
+the (slow) LLM arm. It's a *directional proxy*, not options P&L — see the module
+docstrings in `hal/cerebellum/committee_backtest.py` for the honest caveats.
+
+> The committee and Alpaca tools only work after the venv is rebuilt against
+> Python 3.13 and `alpaca-py` is installed (both handled by `./setup.sh`).
+
 ## Known things to know
 
 - **Torch env is fragile.** The `.venv` has a hand-pinned `torch / torchaudio /
@@ -236,6 +290,11 @@ Key files when something breaks:
 | --- | --- |
 | `server.py` | FastAPI WS server, all model invocation |
 | `start-hal.sh` | Venv activation + server launch (Linux) |
+| `hal/sensory/broker.py` | Alpaca client + confirm/autopilot order gate |
+| `hal/cortex/committee.py` | Multi-agent trade committee (analysts → debate → judge) |
+| `hal/cerebellum/committee_backtest.py` | Committee backtest referee (baseline vs LLM) |
+| `hal/cortex/rules.py` | Deterministic trading-rules gate (`check_trade`) |
+| `app/src/components/PositionsPanel.tsx` | Live positions UI + manual close override |
 | `app/src/App.tsx` | Root layout, autostart hook, immersive thought mirroring |
 | `app/src/lib/ws.ts` | WS client (binary audio + JSON envelopes) |
 | `app/src/lib/audio.ts` | Gap-free WAV chunk playback queue |

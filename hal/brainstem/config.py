@@ -102,6 +102,18 @@ except OSError:
 MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY", "")
 MASSIVE_BASE_URL = "https://api.massive.com"
 
+# --- Alpaca brokerage (order execution) -------------------------------------
+# HAL places orders through Alpaca via the official alpaca-py SDK. ALPACA_PAPER
+# decides paper vs live: true (default) routes every order to the paper account
+# so nothing can touch real money until it's deliberately set false. The SDK
+# selects the right API host from that flag. ALPACA_AUTOPILOT flips the order
+# gate — false (default) stages each order for an explicit confirm; true submits
+# immediately once the vault rules gate passes. Both are runtime-togglable.
+ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", "")
+ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
+ALPACA_PAPER = os.environ.get("ALPACA_PAPER", "true").lower() != "false"
+ALPACA_AUTOPILOT = os.environ.get("ALPACA_AUTOPILOT", "false").lower() == "true"
+
 # News watch monitor: poll interval (seconds) and primary RSS source
 # ("yahoo" or "google"). Both feeds are keyless; Yahoo is per-symbol headlines.
 NEWS_POLL_SECONDS = float(os.environ.get("NEWS_POLL_SECONDS", "300"))

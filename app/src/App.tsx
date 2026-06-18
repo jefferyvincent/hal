@@ -10,6 +10,7 @@ import Transcript from "@/components/Transcript";
 import ConversationsPanel from "@/components/ConversationsPanel";
 import TelemetryPanel from "@/components/TelemetryPanel";
 import PositionSizing from "@/components/PositionSizing";
+import PositionsPanel from "@/components/PositionsPanel";
 import McpPanel from "@/components/McpPanel";
 import SubscriptionsPanel from "@/components/SubscriptionsPanel";
 import TradeIdeasStage from "@/components/TradeIdeasPanel";
@@ -117,6 +118,8 @@ export default function App() {
       <SubscriptionsPanel />
       <TradeIdeasStage />
       <McpPanel />
+      {/* Live brokerage positions + manual close (overrides HAL). */}
+      <PositionsPanel />
 
       <main
         className={`relative z-[5] flex h-full w-full items-center justify-center pt-[70px] pb-[260px] ${

@@ -4,6 +4,7 @@ interface UiState {
   conversationsOpen: boolean;
   telemetryHidden: boolean;
   positionSizingOpen: boolean;
+  positionsOpen: boolean;
   mcpOpen: boolean;
   subscriptionsOpen: boolean;
   chatOpen: boolean;
@@ -11,6 +12,7 @@ interface UiState {
   toggleConversations: () => void;
   setTelemetryHidden: (hidden: boolean) => void;
   togglePositionSizing: () => void;
+  togglePositions: () => void;
   toggleMcp: () => void;
   toggleSubscriptions: () => void;
   toggleChatOpen: () => void;
@@ -22,6 +24,7 @@ export const useUi = create<UiState>((set) => ({
   conversationsOpen: false,
   telemetryHidden: true,
   positionSizingOpen: false,
+  positionsOpen: false,
   mcpOpen: false,
   subscriptionsOpen: false,
   // Chat is hidden by default so the eye sits alone, uncluttered. The
@@ -36,6 +39,8 @@ export const useUi = create<UiState>((set) => ({
 
   togglePositionSizing: () =>
     set((s) => ({ positionSizingOpen: !s.positionSizingOpen })),
+
+  togglePositions: () => set((s) => ({ positionsOpen: !s.positionsOpen })),
 
   toggleMcp: () => set((s) => ({ mcpOpen: !s.mcpOpen })),
 

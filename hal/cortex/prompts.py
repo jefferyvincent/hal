@@ -36,7 +36,9 @@ You have these tools available:
 - iv_context: implied-vs-realized vol verdict (RICH/FAIR/CHEAP). Call this BEFORE deciding to sell vs buy premium.
 - recommend_strategy: given a bias (bullish/bearish/neutral) and IV regime, returns the top option strategies with rationale, risk level, and concrete legs (strikes/expiries). This is the "what structure fits this view" brain (ported from {USER_NAME}'s TradeScan screener). Use it after iv_context to turn a vol/direction read into specific spreads, then pass the legs to screen_options to pick the live contracts.
 - show_chart: render an interactive candlestick chart (candles + volume + SuperTrend + Buy/Sell markers) INSIDE the HAL interface. Use this to SHOW {USER_NAME} a setup on a ticker (args: symbol, optional timeframe like 5m/1h/1d) instead of describing price action in words. After showing it, make your point about the setup — don't narrate the candles; he's looking at it.
-- open_webull: open Webull in {USER_NAME}'s browser at a specific page. Actions: positions, orders, watchlist, alerts, screener, trade, account, quote (needs ticker), option_chain (needs ticker). Use this AFTER recommending a trade so {USER_NAME} can review and execute in Webull. Also use when he asks "show me my positions" or wants to see the chain in Webull's UI. HAL does NOT place orders directly — Webull is where {USER_NAME} executes.
+- open_webull: open Webull in {USER_NAME}'s browser at a specific page. Actions: positions, orders, watchlist, alerts, screener, trade, account, quote (needs ticker), option_chain (needs ticker). Use this when he wants to eyeball something in Webull's UI or place a trade there himself. For actually executing orders, prefer the Alpaca tools below — Webull is just a viewer now.
+- place_order, confirm_order, cancel_pending_order, set_trade_mode, get_account, list_positions, list_orders, cancel_order, close_position: live order execution through {USER_NAME}'s Alpaca account (equities + single-leg options). See TRADE EXECUTION below.
+- committee_review: convene the multi-agent committee (vol/setup/catalyst analysts → bull-vs-bear debate → judge → rules gate) for a "deep dive" / "full workup" / "what does the committee think" on a ticker. Slower than a quick trade idea; pins a TRADE-or-PASS verdict with full reasoning in the Trade Ideas pane and places no orders. committee_backtest: validate the committee's directional calls over a date window before trusting it.
 - subscribe_market, add_alert_rule, list_subscriptions, unsubscribe, remove_rule, list_alert_history: manage real-time WebSocket subscriptions and price/volume alert rules on Massive's options feed. Subscriptions persist across restarts. When a rule fires, an alert turn is automatically injected and you will be invoked to announce it — keep those announcements to one sentence and do NOT call further tools in alert turns.
 
 MARKET WATCHES & ALERTS — when {USER_NAME} asks you to watch, monitor, track, "keep an eye on", or alert/notify him about a ticker, a price level, unusual volume, or a percentage move, you set this up EXCLUSIVELY with the built-in tools: call subscribe_market to open the feed (returns a subscription_id), then add_alert_rule on that id with the right rule_type (pct_move / price_cross / volume). That is the ONLY mechanism that actually works. NEVER improvise an alerting system with run_python, Twilio, SMS, email, cron, or a polling loop — those do not connect to the live feed and are a defect. Alerts are delivered by speaking them aloud in this HAL app the moment they fire (and any that fire while the app is closed are announced when {USER_NAME} reconnects); there is no SMS or external delivery, so do not promise one. If {USER_NAME} asks whether a watch is active or "are you connected", call list_subscriptions (it reports the live socket auth state) rather than guessing.
@@ -55,6 +57,12 @@ When {USER_NAME} asks what to trade, what looks good, or for an idea:
 5. Don't predict direction with confidence. Frame as "if SPY holds above X by Friday, this works." If iv_context says CHEAP, lean to buying premium / debit spreads. If RICH, lean to selling premium / credit spreads / condors.
 6. If {USER_NAME}'s question is too broad ("what should I trade?"), ask ONE clarifying question first — underlying, horizon, or directional vs neutral — then commit. Don't ask three questions.
 {RULES_SECTION}
+TRADE EXECUTION — you can place orders directly on {USER_NAME}'s Alpaca account with place_order (equities and single-leg options). This is real order flow (paper or live per his config), so treat it with care:
+- Default gate is CONFIRM mode: place_order STAGES the order and returns a token; you tell {USER_NAME} exactly what's staged (side, quantity, symbol, type/limit, paper-or-live) and only call confirm_order once he clearly approves ("yes", "send it", "do it"). If he backs out, call cancel_pending_order. In AUTOPILOT mode place_order submits immediately — use set_trade_mode to switch, and only on his explicit instruction.
+- Before staging an order, make sure it fits his written rules (above) — same defined-risk discipline as trade ideas: no naked short options. If an order would violate a rule, say which one and don't place it.
+- Read tools (get_account, list_positions, list_orders) never place anything — use them freely for sizing and status. cancel_order kills a working broker order; cancel_pending_order only discards a staged-but-unsent one — don't confuse them. close_position flattens a holding and goes through the same confirm/autopilot gate.
+- Speak orders in plain language, not raw payloads; the telemetry panel shows {USER_NAME} the details.
+
 Example of the correct shape:
 "Sell the SPY five-eighty / five-seventy-five put credit spread for Friday, sixty cents credit. SPY held the twenty-day average and IV is rich at one-point-four times realized, so I'd rather collect premium than buy it. Closes below five-seventy-five by Friday and it goes against you. Max loss is four-forty per contract."
 
@@ -610,6 +618,253 @@ TOOLS = [
                     },
                 },
                 "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "place_order",
+            "description": (
+                f"Place a live brokerage order through Alpaca on {USER_NAME}'s account "
+                "(equities/ETFs and single-leg options). This ACTUALLY submits to the "
+                "broker — it is paper or live per the ALPACA_PAPER setting. In confirm "
+                "mode (the default) this only STAGES the order and returns a token; you "
+                "must then call confirm_order to send it. In autopilot mode it submits "
+                "immediately. Always state the order back in plain words first.\n"
+                "For an equity order: set asset_class='equity', symbol, side, qty (shares).\n"
+                "For an option: set asset_class='option' and either pass the full OCC "
+                "symbol, or underlying + expiration (YYYY-MM-DD) + option_type + strike; "
+                "qty is number of contracts. Options are day-only."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "asset_class": {
+                        "type": "string",
+                        "enum": ["equity", "option"],
+                        "description": "'equity' for shares/ETFs, 'option' for a single-leg contract.",
+                    },
+                    "side": {"type": "string", "enum": ["buy", "sell"]},
+                    "qty": {
+                        "type": "number",
+                        "description": "Shares (equity) or contracts (option). Positive.",
+                    },
+                    "order_type": {
+                        "type": "string",
+                        "enum": ["market", "limit"],
+                        "description": "Default 'market'. 'limit' requires limit_price.",
+                    },
+                    "limit_price": {"type": "number", "description": "Required for a limit order."},
+                    "symbol": {
+                        "type": "string",
+                        "description": "Equity ticker (e.g. 'AAPL') or full OCC option symbol.",
+                    },
+                    "underlying": {
+                        "type": "string",
+                        "description": "Option only: underlying ticker if not passing an OCC symbol.",
+                    },
+                    "expiration": {
+                        "type": "string",
+                        "description": "Option only: expiration date 'YYYY-MM-DD'.",
+                    },
+                    "option_type": {
+                        "type": "string",
+                        "enum": ["call", "put"],
+                        "description": "Option only.",
+                    },
+                    "strike": {"type": "number", "description": "Option only: strike price in dollars."},
+                },
+                "required": ["asset_class", "side", "qty"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "confirm_order",
+            "description": (
+                "Submit an order that place_order staged in confirm mode. Call this only "
+                f"after {USER_NAME} explicitly approves (e.g. 'yes, do it', 'send it'). "
+                "Omit token to confirm the single pending order; pass token to pick one "
+                "when several are staged."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "token": {"type": "string", "description": "Staged-order token from place_order."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_pending_order",
+            "description": (
+                "Discard a staged (not-yet-submitted) order without sending it. Use when "
+                f"{USER_NAME} says 'never mind' / 'cancel that' before confirming. Omit "
+                "token to discard the single pending order."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "token": {"type": "string", "description": "Staged-order token; optional if only one is pending."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_trade_mode",
+            "description": (
+                "Switch how orders are gated. 'confirm' (default) stages every order for "
+                f"{USER_NAME}'s explicit approval before it's sent; 'autopilot' submits "
+                "orders immediately once they pass his rules. Call this when he says "
+                "'turn on autopilot', 'just place them', or 'go back to confirming'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": ["confirm", "autopilot"]},
+                },
+                "required": ["mode"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_account",
+            "description": (
+                f"Alpaca account snapshot: equity, cash, buying power, options buying "
+                "power, PDT flag, and whether it's the paper or live account. Use for "
+                "'how much buying power do I have', 'what's my account at', sizing checks."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_positions",
+            "description": (
+                f"{USER_NAME}'s current Alpaca positions with quantity, average entry, "
+                "current price, market value, and unrealized P&L. Use for 'what am I "
+                "holding', 'how are my positions doing'."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_orders",
+            "description": (
+                "List Alpaca orders. status: 'open' (default), 'closed', or 'all'. Use "
+                "for 'what orders are working', 'did my order fill', 'recent fills'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["open", "closed", "all"]},
+                    "limit": {"type": "integer", "description": "Max orders to return (default 20)."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_order",
+            "description": (
+                "Cancel a working (open) Alpaca order by its order id — get the id from "
+                "list_orders first. This cancels a LIVE resting order at the broker; it "
+                "is not the same as cancel_pending_order (which only discards a staged "
+                "order that was never sent)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_id": {"type": "string", "description": "Broker order id from list_orders."},
+                },
+                "required": ["order_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "close_position",
+            "description": (
+                f"Liquidate {USER_NAME}'s entire position in a symbol by submitting the "
+                "offsetting order. Subject to the same confirm/autopilot gate as "
+                "place_order. Use for 'close my AAPL', 'flatten that position'. Pass the "
+                "position's symbol exactly as list_positions reports it (OCC symbol for options)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Position symbol from list_positions."},
+                },
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "committee_review",
+            "description": (
+                "Convene the multi-agent trade committee on a ticker: vol / setup / "
+                "catalyst analysts, then a bull-vs-bear debate, a head-trader judge, "
+                f"and {USER_NAME}'s deterministic rules gate. Use this when he asks for "
+                "a 'deep dive', a 'full workup', 'what does the committee think', or a "
+                "second opinion on a name — it's the heavier, slower sibling of a quick "
+                "trade idea. Pins a TRADE-or-PASS verdict (with the full desk reasoning) "
+                "in the Trade Ideas pane and places NO orders. Returns one spoken line; "
+                "relay it briefly, then offer to place it if it's a TRADE."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Ticker, e.g. 'NVDA'."},
+                    "horizon": {
+                        "type": "string",
+                        "enum": ["day", "swing", "position", "leap"],
+                        "description": "Holding horizon; sets the option DTE window. Default 'swing'.",
+                    },
+                },
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "committee_backtest",
+            "description": (
+                "Backtest the committee's directional calls on a symbol over a date "
+                "window (a DIRECTIONAL PROXY, not options P&L). Defaults to the cheap "
+                "baseline arm (no LLM); set full=true to also run the committee arm, "
+                "which makes several model calls per date and is slow. Use when "
+                f"{USER_NAME} asks whether the committee 'actually works' or to validate "
+                "it before trusting it. Returns a short report comparing baseline vs "
+                "committee hit-rate."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Ticker, e.g. 'AAPL'."},
+                    "start": {"type": "string", "description": "Start date 'YYYY-MM-DD'."},
+                    "end": {"type": "string", "description": "End date 'YYYY-MM-DD'."},
+                    "horizon_days": {"type": "integer", "description": "Trading days forward to score (default 10)."},
+                    "step_days": {"type": "integer", "description": "Trading days between as-of points (default 5)."},
+                    "full": {"type": "boolean", "description": "Run the LLM committee arm too (slow). Default false."},
+                    "limit": {"type": "integer", "description": "Cap the number of as-of points."},
+                },
+                "required": ["symbol", "start", "end"],
             },
         },
     },

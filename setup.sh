@@ -128,6 +128,13 @@ print(f"torch {torch.__version__} | CUDA available: {torch.cuda.is_available()} 
       f"device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU only'}")
 PY
 
+# alpaca-py drives HAL's order execution (hal/sensory/broker.py); it ships in
+# requirements, so this just confirms the install took and fails loudly if not.
+"$VPY" - <<'PY'
+import alpaca
+print(f"alpaca-py {alpaca.__version__} | brokerage tools ready")
+PY
+
 # --- 3.5 Piper TTS voice (HAL's voice; not shipped via pip) -------------------
 # server.py loads en_US-ryan-medium at boot from $HAL_SCRATCH_DIR/piper_voices.
 # The .onnx model + its .onnx.json config live on Hugging Face, not in any pip

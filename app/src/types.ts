@@ -69,6 +69,40 @@ export interface ServerEnvelope {
   news_articles?: NewsArticle[];
   /** A trade idea / hold read to pin in the Trade Ideas pane. */
   trade_idea?: TradeIdea;
+  /** Live brokerage view (reply to positions_refresh / position_close). */
+  positions?: BrokerPosition[];
+  broker_account?: BrokerAccount | null;
+  broker_ready?: boolean;
+  broker_paper?: boolean;
+  trade_mode?: string; // "confirm" | "autopilot"
+  positions_error?: string | null;
+}
+
+/** An open brokerage position (Alpaca), as shaped by broker.list_positions. */
+export interface BrokerPosition {
+  symbol: string;
+  asset_class: string; // "us_equity" | "us_option" | ...
+  qty: string;
+  side: string; // "long" | "short"
+  avg_entry_price: number | null;
+  current_price: number | null;
+  market_value: number | null;
+  unrealized_pl: number | null;
+  unrealized_plpc: number | null; // fraction, e.g. 0.0125 = +1.25%
+}
+
+/** Alpaca account snapshot (subset), from broker.get_account. */
+export interface BrokerAccount {
+  account_number: string;
+  status: string;
+  currency: string;
+  cash: number | null;
+  equity: number | null;
+  buying_power: number | null;
+  options_buying_power: number | null;
+  options_trading_level: number | null;
+  pattern_day_trader: boolean;
+  paper: boolean;
 }
 
 /** A pinned trade recommendation or hold/exit read for the Trade Ideas pane. */

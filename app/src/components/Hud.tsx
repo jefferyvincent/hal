@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useConnection } from "@/stores/connection";
 import { useUi } from "@/stores/ui";
 import { useImmersive } from "@/stores/immersive";
+import { cn } from "@/lib/cn";
 
 function formatUptime(ms: number): string {
   const s = Math.floor(ms / 1000);
@@ -20,6 +21,10 @@ export default function Hud() {
   const toggleConv = useUi((s) => s.toggleConversations);
   const toggleMcp = useUi((s) => s.toggleMcp);
   const toggleSubscriptions = useUi((s) => s.toggleSubscriptions);
+  const togglePositions = useUi((s) => s.togglePositions);
+  const tradeMode = useConnection((s) => s.tradeMode);
+  const setTradeMode = useConnection((s) => s.setTradeMode);
+  const autopilot = tradeMode === "autopilot";
   // Trade ideas live in the immersive stage: toggle that source on/off.
   const toggleTradeIdeas = () => {
     const im = useImmersive.getState();
@@ -92,6 +97,37 @@ export default function Hud() {
         >
           <span className="text-[9px] text-hal-red">WATCHES</span>
           <span className="font-bold text-white">OPEN</span>
+        </button>
+        <button
+          type="button"
+          onClick={togglePositions}
+          data-tauri-drag-region="false"
+          className="flex flex-col gap-[3px] border border-hal-red/35 bg-hal-red/[0.06] px-3 py-[5px] uppercase tracking-[4px] transition-colors hover:border-hal-red hover:bg-hal-red/20 hover:shadow-[0_0_14px_rgba(255,30,30,0.4)]"
+        >
+          <span className="text-[9px] text-hal-red">POSITIONS</span>
+          <span className="font-bold text-white">OPEN</span>
+        </button>
+        {/* Order-gate toggle: manual (stage + confirm) vs autopilot (HAL fires). */}
+        <button
+          type="button"
+          onClick={() => setTradeMode(autopilot ? "confirm" : "autopilot")}
+          data-tauri-drag-region="false"
+          title={
+            autopilot
+              ? "AUTOPILOT — HAL places orders without asking. Click for manual."
+              : "MANUAL — HAL stages orders for your confirmation. Click to arm autopilot."
+          }
+          className={cn(
+            "flex flex-col gap-[3px] border px-3 py-[5px] uppercase tracking-[4px] transition-colors",
+            autopilot
+              ? "border-hal-amber bg-hal-amber/20 shadow-[0_0_14px_rgba(255,176,0,0.5)] hover:bg-hal-amber/30"
+              : "border-hal-red/35 bg-hal-red/[0.06] hover:border-hal-red hover:bg-hal-red/20 hover:shadow-[0_0_14px_rgba(255,30,30,0.4)]",
+          )}
+        >
+          <span className={cn("text-[9px]", autopilot ? "text-hal-amber" : "text-hal-red")}>
+            TRADER
+          </span>
+          <span className="font-bold text-white">{autopilot ? "AUTOPILOT" : "MANUAL"}</span>
         </button>
         <button
           type="button"
