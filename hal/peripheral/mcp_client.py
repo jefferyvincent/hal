@@ -218,7 +218,7 @@ def resolve_oauth(state: str, code: str | None) -> bool:
 def _open_browser(url: str) -> None:
     try:
         subprocess.Popen(
-            ["powershell.exe", "-NoProfile", "-Command", f"Start-Process '{url}'"],
+            ["xdg-open", url],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )

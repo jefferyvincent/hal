@@ -24,6 +24,9 @@ _DEFAULT_RULES: dict[str, Any] = {
     "min_conviction": "confirmed",
     "min_reward_risk": 1.5,
     "stop": "pct-of-premium",
+    "stop_loss_pct": 20,
+    "take_profit_pct": 20,
+    "limit_buffer_pct": 2,
     "sizing": "fixed-fractional",
 }
 

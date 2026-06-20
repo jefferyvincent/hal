@@ -12,6 +12,9 @@ from hal.brainstem.config import (
     NEWS_POLL_SECONDS, NEWS_PRIMARY_FEED, CHART_DATA_SOURCE,
     HAL_PASSWORD, HAL_SECRET_KEY,
     ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER, ALPACA_AUTOPILOT,
+    RISK_MAX_ORDERS_PER_MIN, RISK_MAX_OPEN_POSITIONS,
+    RISK_MAX_GROSS_EXPOSURE_PCT, RISK_DAILY_LOSS_LIMIT_PCT,
+    REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET,
 )
 
 import os
@@ -41,11 +44,16 @@ from hal.sensory import market
 from hal.sensory import news
 from hal.sensory import watchlist
 from hal.sensory import broker
+from hal.sensory import brackets
+from hal.sensory import money
+from hal.sensory import risk
 from hal.cortex import analysis
 from hal.cortex import committee
 from hal.motor import charting
 from hal.cerebellum import backtest
 from hal.cerebellum import committee_backtest
+from hal.cerebellum import strategy as trade_strategy
+from hal.cerebellum.execution import LiveExecution
 from hal.cerebellum import option_strategy
 from hal.peripheral import mcp_client
 from hal.cerebellum.symbols import _resolve_company_name, _resolve_symbol
@@ -60,7 +68,8 @@ from hal.cortex.prompts import HAL_SYSTEM_PROMPT, TOOLS
 from hal.hippocampus import vault as _vault
 from hal.cortex import rag as _rag
 from hal.cortex import cag as _cag
-from hal.cortex.rules import check_trade as _check_trade
+from hal.cortex.rules import check_trade as _check_trade, load_rules as _load_rules
+from hal.cortex.strategies import select_strategy as _select_strategy
 
 # Tools actually advertised to the model. The market/analysis/chart tools
 # (subscribe_market, add_alert_rule, list/unsub/remove/list_alert_history,
@@ -78,6 +87,7 @@ _MODEL_TOOL_NAMES = {
     "journal_search", "vault_close_trade",
     "place_order", "confirm_order", "cancel_pending_order", "set_trade_mode",
     "get_account", "list_positions", "list_orders", "cancel_order", "close_position",
+    "manage_risk",
     "committee_review", "committee_backtest",
 }
 _MODEL_TOOLS = [
@@ -307,10 +317,18 @@ async def _lifespan(_app: FastAPI):
     news.configure(DB_PATH, NEWS_POLL_SECONDS, NEWS_PRIMARY_FEED)
     watchlist.configure(MASSIVE_BASE_URL, MASSIVE_API_KEY)
     broker.configure(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER, ALPACA_AUTOPILOT)
+    risk.configure(RISK_MAX_ORDERS_PER_MIN, RISK_MAX_OPEN_POSITIONS,
+                   RISK_MAX_GROSS_EXPOSURE_PCT, RISK_DAILY_LOSS_LIMIT_PCT)
     print(
         f"[boot] broker: {'ready' if broker.is_ready() else 'no credentials'} "
         f"({'paper' if broker.is_paper() else 'LIVE'}, {broker.get_mode()} mode)"
     )
+    # HAL-managed exits: Alpaca can't hold option stop/TP orders, so this loop
+    # flattens managed positions at market when they hit their level (catch-up
+    # pass runs first). Announcements ride the live alert path.
+    brackets.monitor.set_announce(_announce_exit)
+    await brackets.monitor.start()
+    print("[boot] managed-exit monitor started")
     # Committee reuses the already-configured analysis/option-strategy tools, so
     # there's nothing to wire here — just confirm the tools are registered.
     print("[boot] committee: review + backtest tools registered")
@@ -342,6 +360,7 @@ async def _lifespan(_app: FastAPI):
     finally:
         await market.manager.stop()
         await news.monitor.stop()
+        await brackets.monitor.stop()
         _rag.stop_watcher()
 
 
@@ -560,12 +579,28 @@ def _confirm(prompt: str) -> bool:
     return answer == "y"
 
 
+def _telemetry_source(tool: str) -> str:
+    """Bucket a telemetry event by which actor produced it, for the Cognition
+    view's source lanes. Derived from the tool label so existing call sites need
+    no change; an explicit source= overrides this."""
+    if tool.startswith("broker."):
+        return "broker"
+    if tool.startswith("risk."):
+        return "risk"
+    if tool.startswith("committee"):
+        return "committee"
+    if tool.startswith("human."):
+        return "human"
+    return "hal"
+
+
 async def _emit_telemetry(
     websocket: WebSocket,
     tool: str,
     input_text: str,
     output: str,
     status: str = "ok",
+    source: str | None = None,
 ) -> None:
     try:
         await websocket.send_json({
@@ -574,26 +609,38 @@ async def _emit_telemetry(
                 "input": input_text,
                 "output": output,
                 "status": status,
+                "source": source or _telemetry_source(tool),
+                "ts": int(time.time() * 1000),
             }
         })
     except Exception:
         pass
 
 
+async def _announce_exit(message: str) -> None:
+    """Speak a fired managed-exit through whatever client is connected. Routed
+    through the alert path so it interrupts and lands in history. The market
+    sell already happened in the monitor — this is best-effort narration."""
+    try:
+        await market.clients.broadcast(message, {"kind": "exit"})
+    except Exception as e:
+        print(f"[brackets] announce broadcast failed: {e}")
+
+
 async def run_command_tool(command: str, websocket: WebSocket, abort_event: asyncio.Event) -> str:
     _check_abort(abort_event)
     await websocket.send_json({"state": "processing", "text": f"Proposed command: {command}"})
-    approved = await asyncio.to_thread(_confirm, f"PowerShell: {command}")
+    approved = await asyncio.to_thread(_confirm, f"bash: {command}")
     _check_abort(abort_event)
     if not approved:
-        await _emit_telemetry(websocket, "powershell", command, "User declined.", status="declined")
+        await _emit_telemetry(websocket, "bash", command, "User declined.", status="declined")
         return "User declined to run this command."
 
     await websocket.send_json({"state": "processing", "text": "Running command..."})
 
     def _run():
         proc = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+            ["bash", "-c", command],
             capture_output=True,
             text=True,
             cwd=str(SCRATCH_DIR),
@@ -612,24 +659,24 @@ async def run_command_tool(command: str, websocket: WebSocket, abort_event: asyn
         result = f"Command failed: {e}"
         status = "error"
 
-    await _emit_telemetry(websocket, "powershell", command, result, status=status)
+    await _emit_telemetry(websocket, "bash", command, result, status=status)
     return result[:MAX_TOOL_OUTPUT_CHARS]
 
 
 async def run_cmd_tool(command: str, websocket: WebSocket, abort_event: asyncio.Event) -> str:
     _check_abort(abort_event)
-    await websocket.send_json({"state": "processing", "text": f"Proposed cmd: {command}"})
-    approved = await asyncio.to_thread(_confirm, f"cmd.exe: {command}")
+    await websocket.send_json({"state": "processing", "text": f"Proposed command: {command}"})
+    approved = await asyncio.to_thread(_confirm, f"sh: {command}")
     _check_abort(abort_event)
     if not approved:
-        await _emit_telemetry(websocket, "cmd", command, "User declined.", status="declined")
+        await _emit_telemetry(websocket, "sh", command, "User declined.", status="declined")
         return "User declined to run this command."
 
-    await websocket.send_json({"state": "processing", "text": "Running cmd..."})
+    await websocket.send_json({"state": "processing", "text": "Running command..."})
 
     def _run():
         proc = subprocess.run(
-            ["cmd.exe", "/C", command],
+            ["sh", "-c", command],
             capture_output=True,
             text=True,
             cwd=str(SCRATCH_DIR),
@@ -648,7 +695,7 @@ async def run_cmd_tool(command: str, websocket: WebSocket, abort_event: asyncio.
         result = f"Command failed: {e}"
         status = "error"
 
-    await _emit_telemetry(websocket, "cmd", command, result, status=status)
+    await _emit_telemetry(websocket, "sh", command, result, status=status)
     return result[:MAX_TOOL_OUTPUT_CHARS]
 
 
@@ -860,13 +907,29 @@ async def _push_trade_idea(websocket: WebSocket, kind: str, symbol: str,
     asyncio.get_event_loop().run_in_executor(
         None, _vault_write_trade_idea, kind, symbol, markdown
     )
+    idea_id = f"{symbol or 'idea'}-{int(time.time() * 1000)}"
+    # If HAL just sized this exact trade and Alpaca is live, it's placeable from
+    # a button — stash the order by id so a click can place it WITHOUT going
+    # through speech (STT mishears "place it" as "plays it"/"playset").
+    pending = websocket.scope.get("hal_pending_trade")
+    placeable = bool(
+        kind == "trade" and broker.is_ready() and pending
+        and (pending.get("symbol") or "").upper() == (symbol or "").upper()
+    )
+    if placeable:
+        store = websocket.scope.setdefault("hal_placeable", {})
+        store[idea_id] = pending
+        if len(store) > 20:  # bound it over a long session
+            for k in list(store)[:-20]:
+                del store[k]
     try:
         await websocket.send_json({"trade_idea": {
-            "id": f"{symbol or 'idea'}-{int(time.time() * 1000)}",
+            "id": idea_id,
             "kind": kind,
             "symbol": symbol or "—",
             "markdown": markdown,
             "ts": time.time(),
+            "placeable": placeable,
         }})
     except Exception as e:
         print(f"[trade_idea] push failed: {e}")
@@ -990,6 +1053,8 @@ async def execute_tool(name: str, args: dict, websocket: WebSocket, abort_event:
         "get_account", "list_positions", "list_orders", "cancel_order", "close_position",
     ):
         return await run_broker_tool(name, args, websocket)
+    if name == "manage_risk":
+        return await run_risk_tool(args, websocket)
     if name == "committee_review":
         return await run_committee_tool(args, websocket)
     if name == "committee_backtest":
@@ -1112,7 +1177,7 @@ async def open_webull(action: str, ticker: str = "") -> dict:
         }
     try:
         subprocess.Popen(
-            ["powershell.exe", "-NoProfile", "-Command", f"Start-Process '{url}'"],
+            ["xdg-open", url],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -1130,10 +1195,48 @@ def _broker_rules_check(spec: dict) -> dict:
                         side=spec["side"], reward_risk=None)
 
 
-async def _stage_or_submit(spec: dict, summary: str) -> dict:
-    """Confirm mode stages the order and returns a token; autopilot submits now."""
+def _is_entry(spec: dict, positions: list[dict]) -> bool:
+    """True if `spec` opens or increases exposure (vs reduces/closes it). An order
+    that offsets an existing position is an exit and is never risk-gated."""
+    sym = (spec.get("symbol") or "").upper()
+    pos = next((p for p in positions if (p.get("symbol") or "").upper() == sym), None)
+    if pos is None:
+        return True  # nothing held → opening
+    long = (pos.get("side") == "long")
+    # Same direction as the holding grows it; the offsetting side reduces it.
+    return spec["side"] == ("buy" if long else "sell")
+
+
+async def _risk_gate(spec: dict) -> tuple[dict | None, bool]:
+    """Apply the portfolio risk engine to an opening order. Returns
+    (block_result_or_None, is_entry). Exits pass through ungated. Latching the
+    kill switch also yanks autopilot back to confirm so HAL stops firing."""
+    account = await asyncio.to_thread(broker.get_account)
+    positions = await asyncio.to_thread(broker.list_positions)
+    is_entry = _is_entry(spec, positions)
+    if not is_entry:
+        return None, False
+    res = risk.check_entry(spec, account, positions)
+    if res["tripped_now"]:
+        broker.set_mode("confirm")
+    if not res["passed"]:
+        return res, True
+    return None, True
+
+
+# Live order surface (Execution protocol). The autopilot submit goes through this
+# so live entries share the exact call surface the backtest's SimBroker stands in
+# for; the bracket monitor (sensory.brackets) uses its own LiveExecution likewise.
+_live_exec = LiveExecution()
+
+
+async def _stage_or_submit(spec: dict, summary: str, is_entry: bool = False) -> dict:
+    """Confirm mode stages the order and returns a token; autopilot submits now.
+    A submitted entry is recorded with the risk engine so the rate throttle counts it."""
     if broker.get_mode() == "autopilot":
-        order = await asyncio.to_thread(broker.submit_order, spec)
+        order = await asyncio.to_thread(_live_exec.submit_order, spec)
+        if is_entry:
+            risk.record_entry()
         return {"submitted": order, "summary": summary,
                 "message": f"Autopilot submitted: {summary}"}
     token = broker.stage_order(spec, summary)
@@ -1158,7 +1261,11 @@ async def _place_order(args: dict) -> dict:
     if not gate["passed"]:
         return {"blocked": True, "failures": gate["failures"],
                 "message": "Blocked by your trading rules: " + "; ".join(gate["failures"])}
-    return await _stage_or_submit(spec, broker.summarize_order(spec))
+    block, is_entry = await _risk_gate(spec)
+    if block is not None:
+        return {"blocked": True, "failures": block["failures"],
+                "message": "Blocked by risk limits: " + "; ".join(block["failures"])}
+    return await _stage_or_submit(spec, broker.summarize_order(spec), is_entry=is_entry)
 
 
 async def _close_position(args: dict) -> dict:
@@ -1218,6 +1325,66 @@ async def run_broker_tool(name: str, args: dict, websocket: WebSocket) -> str:
     return body[:MAX_TOOL_OUTPUT_CHARS]
 
 
+async def run_risk_tool(args: dict, websocket: WebSocket) -> str:
+    """Report or reset the pre-trade risk circuit breakers. Independent of broker
+    readiness — the breakers exist whether or not Alpaca is configured."""
+    action = (args.get("action") or "status").strip().lower()
+    if action == "reset":
+        risk.reset_kill_switch()
+        body = "Risk kill switch cleared — new entries are allowed again. Still in confirm mode."
+        await _emit_telemetry(websocket, "risk.reset", "reset", body)
+        return body
+    st = risk.status()
+    lim = st["limits"]
+    if st["killed"]:
+        summary = (f"HALTED — {st['kill_reason']}. New entries are blocked; "
+                   "say 'reset the kill switch' to clear it.")
+    else:
+        summary = (
+            f"Risk breakers armed: at most {lim['max_orders_per_min']} orders/min, "
+            f"{lim['max_open_positions']} open positions, {lim['max_gross_exposure_pct']:g}% "
+            f"gross exposure, and a {lim['daily_loss_limit_pct']:g}% daily-loss halt. "
+            f"{st['orders_last_min']} order(s) in the last minute."
+        )
+    await _emit_telemetry(websocket, "risk.status", action, json.dumps(st, default=str))
+    return summary
+
+
+async def _open_positions_for(symbol: str) -> list[dict]:
+    """Open Alpaca positions in `symbol` — the equity leg or any option whose OCC
+    root is this underlying (e.g. AVGO250620C00485000). [] if the broker isn't
+    configured or on any error, so the committee degrades gracefully."""
+    if not broker.is_ready():
+        return []
+    root = symbol.upper().strip()
+    try:
+        positions = await asyncio.to_thread(broker.list_positions)
+    except Exception as e:
+        print(f"[committee] positions read failed: {e}")
+        return []
+    return [p for p in positions
+            if (psym := (p.get("symbol") or "").upper()) == root
+            or re.match(rf"{re.escape(root)}\d", psym)]
+
+
+# Committee step → (completion fraction, human label) for the Cognition progress
+# bar. The sequence is deterministic (reflection is the one optional step), so a
+# preset fraction per stage gives an honest fill toward done without guessing.
+_COMMITTEE_STEPS: dict[str, tuple[float, str]] = {
+    "analyst.vol": (0.12, "Vol analyst"),
+    "analyst.setup": (0.22, "Setup analyst"),
+    "analyst.catalyst": (0.32, "Catalyst analyst"),
+    "consensus": (0.42, "Consensus"),
+    "reflection": (0.52, "Reflection"),
+    "position": (0.56, "Existing position"),
+    "debate.bull": (0.64, "Bull researcher"),
+    "debate.bear": (0.76, "Bear researcher"),
+    "judge": (0.90, "Head trader"),
+    "rules_gate": (0.98, "Rules gate"),
+    "score": (1.0, "Verdict"),
+}
+
+
 async def run_committee_tool(args: dict, websocket: WebSocket) -> str:
     """Convene the multi-agent committee on a ticker (analysts → bull/bear debate
     → judge → rules gate), pin the verdict in the Trade Ideas pane, and return a
@@ -1228,27 +1395,53 @@ async def run_committee_tool(args: dict, websocket: WebSocket) -> str:
         return "I need a ticker to convene the committee."
     horizon = str(args.get("horizon") or "swing").lower()
     risk = websocket.scope.get("hal_risk") or {}
-    account_size = float(risk.get("accountSize") or 0)
+    account_size = await _resolve_account_size(risk)
     await websocket.send_json(
         {"state": "processing", "text": f"Convening the committee on {symbol}..."})
+
+    async def _committee_status(active: bool, fraction: float = 0.0, label: str = "") -> None:
+        await websocket.send_json({"committee_status": {
+            "active": active, "fraction": fraction, "label": label, "symbol": symbol}})
+
+    async def _committee_step(step: str, summary: str, detail: str) -> None:
+        # Each desk step becomes its own Committee-lane card in the Cognition view,
+        # and advances the progress bar to that stage's preset fraction.
+        await _emit_telemetry(websocket, f"committee.{step}", f"{symbol} · {summary}",
+                              detail, source="committee")
+        frac, label = _COMMITTEE_STEPS.get(step, (0.0, step))
+        if frac:
+            await _committee_status(True, frac, label)
+
+    # Existing holdings in this name (equity or any option whose OCC root matches)
+    # so the desk can weigh add/hold/trim/stand-aside instead of blindly stacking.
+    open_positions = await _open_positions_for(symbol)
+
+    await _committee_status(True, 0.03, "Convening")
     try:
         verdict = await committee.run_committee(
-            symbol, horizon=horizon, account_size=account_size)
+            symbol, horizon=horizon, account_size=account_size, emit=_committee_step,
+            open_positions=open_positions)
     except Exception as e:
+        await _committee_status(False)
         msg = f"Committee failed on {symbol}: {type(e).__name__}: {e}"
         await _emit_telemetry(websocket, "committee.review", f"{symbol} {horizon}", msg, status="error")
         return msg
+    await _committee_status(False)
     kind = "trade" if verdict["decision"] == "TRADE" else "hold"
     await _push_trade_idea(websocket, kind, symbol, verdict["markdown"])
     await _emit_telemetry(websocket, "committee.review", f"{symbol} {horizon}", verdict["markdown"])
+    score = verdict.get("score")
+    held = (f" You already hold {len(open_positions)} leg(s) in {symbol}."
+            if open_positions else "")
     if verdict["decision"] == "TRADE":
         return (
-            f"Committee says trade {symbol}: {verdict['side']} via "
-            f"{verdict['structure'] or 'the chosen structure'}, "
-            f"{verdict['conviction']} conviction. {verdict['thesis']}".strip()
+            f"Committee says PUT ON THE TRADE — {symbol}, score {score} out of 100. "
+            f"{verdict['side']} via {verdict['structure'] or 'the chosen structure'}, "
+            f"{verdict['conviction']} conviction. {verdict['thesis']}{held}".strip()
         )
     why = "; ".join(verdict["rules_failures"]) or verdict["invalidation"] or "the bear case held"
-    return f"Committee passes on {symbol}. {why}".strip()
+    return (f"Committee says DO NOT TRADE {symbol} — score {score} out of 100. "
+            f"{why}.{held}").strip()
 
 
 async def run_committee_backtest_tool(args: dict, websocket: WebSocket) -> str:
@@ -2070,6 +2263,62 @@ def _format_risk_context(risk: dict | None) -> str:
     return lines
 
 
+async def _resolve_account_size(risk: dict | None) -> float:
+    """The account total HAL sizes trades against. Prefer the live Alpaca equity
+    — the integrated broker holds the real balance — and fall back to the
+    manually entered Position-panel value only when Alpaca isn't configured or
+    the read fails. Returns 0.0 when neither is available."""
+    if broker.is_ready():
+        try:
+            acct = await asyncio.to_thread(broker.get_account)
+            equity = float(acct.get("equity") or 0)
+            if equity > 0:
+                return equity
+        except Exception as e:
+            print(f"[trade] Alpaca equity read failed, using panel value: {e}")
+    try:
+        return float(risk.get("accountSize") or 0) if isinstance(risk, dict) else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+async def _concurrent_risk_dollars(stop_pct: float) -> float:
+    """Stop-based risk already tied up in open Alpaca positions: each position's
+    current market value × the stop %, summed. This is the same yardstick used
+    to size a new trade (entry × stop %), so the two add up apples-to-apples for
+    the account-wide concurrent-risk cap. Returns 0.0 if the broker isn't ready
+    or the read fails (fail-open — never block sizing on a positions hiccup)."""
+    if not broker.is_ready():
+        return 0.0
+    try:
+        positions = await asyncio.to_thread(broker.list_positions)
+    except Exception as e:
+        print(f"[trade] couldn't read positions for concurrent-risk cap: {e}")
+        return 0.0
+    frac = (stop_pct / 100.0) if stop_pct > 0 else 1.0
+    return sum(abs(p.get("market_value") or 0.0) for p in positions) * frac
+
+
+async def _holds_underlying(symbol: str) -> bool:
+    """True if an open Alpaca position is in `symbol` — the equity itself or one
+    of its options (whose OCC symbol starts with the underlying). Used to skip
+    pitching a fresh trade on a name already held."""
+    if not broker.is_ready():
+        return False
+    try:
+        positions = await asyncio.to_thread(broker.list_positions)
+    except Exception:
+        return False
+    s = (symbol or "").upper()
+    if not s:
+        return False
+    for p in positions:
+        psym = (p.get("symbol") or "").upper()
+        if psym == s or (psym.startswith(s) and len(psym) > len(s) and psym[len(s)].isdigit()):
+            return True
+    return False
+
+
 def _extract_trade_symbol(text: str) -> str | None:
     """Pull the underlying ticker from a trade-idea question (for auto-backtest)."""
     if not text:
@@ -2103,6 +2352,31 @@ def _match_trade_intent(text: str) -> str | None:
     if not (_TRADE_IDEA_TRIGGERS.search(text) and _TRADING_CONTEXT.search(text)):
         return None
     return _extract_trade_symbol(text)
+
+
+# --- "Deep dive on X" — deterministic committee route ----------------------
+# The model narrates calling committee_review without emitting the tool call
+# (it told Jeffery "I kicked off the committee, it's running" while NOTHING ran),
+# so a deep-dive request is intercepted here and convened deterministically, like
+# the trade/chart routes.
+_COMMITTEE_TRIGGERS = re.compile(
+    r"\b("
+    r"deep[\s-]?dive|"
+    r"committee|"
+    r"convene|"
+    r"desk (view|read|take|opinion)|"
+    r"full (workup|work-up|analysis|review|breakdown)|"
+    r"run the (committee|desk|analysts?)"
+    r")\b",
+    re.IGNORECASE)
+
+
+def _match_committee_intent(text: str) -> str | None:
+    """Best-effort underlying ticker if this is a committee/deep-dive request,
+    else None. Returns the raw token; the route resolves it the rest of the way."""
+    if not text or not _COMMITTEE_TRIGGERS.search(text):
+        return None
+    return _resolve_company_name(text) or _extract_trade_symbol(text)
 
 
 # --- "How long should I hold this option?" — deterministic position check ----
@@ -2443,12 +2717,18 @@ async def build_hold_check(contract: dict, websocket: WebSocket) -> tuple[str, s
     return spoken, full_md
 
 
-def _size_contracts(account: float, max_risk_pct: float, stop_pct: float, entry: float) -> tuple[int, float]:
+def _size_contracts(account: float, max_risk_pct: float, stop_pct: float, entry: float,
+                    cap_dollars: float | None = None) -> tuple[int, float]:
     """(qty, dollar risk) for a long option, risk-sized so a stop-out loses no
-    more than max_risk_pct of the account. Mirrors the frontend sizePosition."""
+    more than max_risk_pct of the account. Mirrors the frontend sizePosition.
+
+    cap_dollars further caps the risk budget — used to keep the trade under the
+    account-wide concurrent-risk cap given what's already at risk."""
     if entry <= 0 or account <= 0 or max_risk_pct <= 0:
         return 0, 0.0
     budget = account * max_risk_pct / 100.0
+    if cap_dollars is not None:
+        budget = min(budget, max(0.0, cap_dollars))
     per_contract_risk = entry * 100.0 * (stop_pct / 100.0 if stop_pct > 0 else 1.0)
     if per_contract_risk <= 0:
         return 0, 0.0
@@ -2494,25 +2774,18 @@ async def _llm_oneshot(prompt: str, *, system: str | None = None, timeout: float
         return ""
 
 
-async def _news_sentiment(sym: str) -> dict:
-    """Read recent headlines for `sym` and have the fast model classify the
-    near-term read. Returns {'label': 'bullish'|'bearish'|'neutral', 'thesis':
-    str, 'count': int}. Never raises; degrades to neutral on any failure."""
+async def _classify_sentiment(sym: str, texts: list[str], source: str) -> dict:
+    """Run the fast model over a list of `source` texts about `sym` and return
+    {'label': 'bullish'|'bearish'|'neutral', 'thesis': str, 'count': int}. Never
+    raises; degrades to neutral on empty input or any failure."""
     out = {"label": "neutral", "thesis": "", "count": 0}
-    try:
-        async with httpx.AsyncClient(timeout=15.0, headers={"User-Agent": "HAL"}) as client:
-            items = await news.fetch_symbol_news(client, sym)
-    except Exception as e:
-        print(f"[news] sentiment fetch failed for {sym}: {e}")
+    texts = [t.strip() for t in texts if t and t.strip()]
+    if not texts:
         return out
-    if not items:
-        return out
-    out["count"] = len(items)
-    headlines = "\n".join(f"- {it.get('title', '')}" for it in items[:6] if it.get("title"))
-    if not headlines:
-        return out
+    out["count"] = len(texts)
+    joined = "\n".join(f"- {t}" for t in texts[:8])
     prompt = (
-        f"Recent news headlines for {sym}:\n{headlines}\n\n"
+        f"Recent {source} about {sym}:\n{joined}\n\n"
         "Judge the near-term sentiment for the stock. Reply on ONE line as "
         "`LABEL | reason` where LABEL is exactly BULLISH, BEARISH, or NEUTRAL "
         "and reason is a short clause (max 12 words)."
@@ -2530,6 +2803,88 @@ async def _news_sentiment(sym: str) -> dict:
     return out
 
 
+async def _news_sentiment(sym: str) -> dict:
+    """Near-term news read for `sym` (shape: see _classify_sentiment)."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0, headers={"User-Agent": "HAL"}) as client:
+            items = await news.fetch_symbol_news(client, sym)
+    except Exception as e:
+        print(f"[news] sentiment fetch failed for {sym}: {e}")
+        return {"label": "neutral", "thesis": "", "count": 0}
+    titles = [it.get("title", "") for it in (items or [])][:6]
+    return await _classify_sentiment(sym, titles, "news headlines")
+
+
+# Subreddits HAL scans for ticker chatter, and a descriptive UA (Reddit blocks
+# generic/empty ones). Reddit no longer serves keyless JSON, so we use app-only
+# OAuth (client_credentials) with a cached token.
+_REDDIT_SUBS = "wallstreetbets+options+stocks+thetagang+investing"
+_REDDIT_UA = "HAL/1.0 (options sentiment bot)"
+_reddit_token: tuple[str, float] | None = None  # (bearer, expires_at)
+
+
+async def _reddit_token_get() -> str | None:
+    """App-only OAuth bearer token for Reddit's API, cached until expiry. None if
+    creds aren't configured or auth fails (so the Reddit read stays inert)."""
+    global _reddit_token
+    if not (REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET):
+        return None
+    now = time.time()
+    if _reddit_token and _reddit_token[1] > now + 30:
+        return _reddit_token[0]
+    try:
+        async with httpx.AsyncClient(timeout=12.0, headers={"User-Agent": _REDDIT_UA}) as client:
+            r = await client.post(
+                "https://www.reddit.com/api/v1/access_token",
+                data={"grant_type": "client_credentials"},
+                auth=(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET),
+            )
+            r.raise_for_status()
+            j = r.json()
+    except Exception as e:
+        print(f"[reddit] auth failed: {e}")
+        return None
+    tok = j.get("access_token")
+    if not tok:
+        return None
+    _reddit_token = (tok, now + float(j.get("expires_in", 3600)))
+    return tok
+
+
+async def _reddit_sentiment(sym: str) -> dict:
+    """Near-term Reddit chatter read for `sym` — recent post titles that name the
+    ticker, classified by the fast model. Same shape as _news_sentiment; neutral
+    when Reddit isn't configured or the call fails (best-effort)."""
+    neutral = {"label": "neutral", "thesis": "", "count": 0}
+    token = await _reddit_token_get()
+    if not token:
+        return neutral
+    url = f"https://oauth.reddit.com/r/{_REDDIT_SUBS}/search"
+    params = {"q": sym, "restrict_sr": "1", "sort": "new", "t": "week", "limit": 25}
+    try:
+        async with httpx.AsyncClient(timeout=12.0, headers={
+            "User-Agent": _REDDIT_UA, "Authorization": f"bearer {token}",
+        }) as client:
+            r = await client.get(url, params=params)
+            r.raise_for_status()
+            children = r.json().get("data", {}).get("children", [])
+    except Exception as e:
+        print(f"[reddit] fetch failed for {sym}: {e}")
+        return neutral
+    su = sym.upper()
+    titles = [
+        (c.get("data", {}).get("title") or "").strip()
+        for c in children
+        if su in (c.get("data", {}).get("title") or "").upper()  # search is fuzzy
+    ]
+    return await _classify_sentiment(sym, titles, "Reddit posts")
+
+
+def _opposes(side: str, label: str) -> bool:
+    """A clear sentiment read that fights the chosen option direction."""
+    return (side == "put" and label == "bullish") or (side == "call" and label == "bearish")
+
+
 async def build_trade_reco(symbol: str, risk: dict | None, websocket: WebSocket) -> tuple[str, str]:
     """Deterministically build a long call/put recommendation: direction from
     the daily chart bias, contract from a liquidity-screened ATM strike, size
@@ -2540,10 +2895,19 @@ async def build_trade_reco(symbol: str, risk: dict | None, websocket: WebSocket)
     Never raises — returns a graceful spoken message on any failure."""
     sym = symbol.upper().strip()
     risk = risk if isinstance(risk, dict) else {}
-    account = float(risk.get("accountSize") or 0)
-    max_risk_pct = float(risk.get("maxRiskPct") or 5)
-    stop_pct = float(risk.get("stopLossPct") or 20)
-    broker = risk.get("broker") or "your broker"
+    # Risk policy is sourced from the vault trading rules (single source of
+    # truth); the panel only carries the broker name now. Account total comes
+    # from Alpaca (see _resolve_account_size).
+    rules = _load_rules()
+    account = await _resolve_account_size(risk)
+    max_risk_pct = float(rules.get("max_risk_per_trade_pct", 5))
+    stop_pct = float(rules.get("stop_loss_pct", 20))
+    tp_pct = float(rules.get("take_profit_pct", 20))
+    limit_buffer_pct = float(rules.get("limit_buffer_pct", 2))
+    broker_name = risk.get("broker") or "your broker"
+    # When Alpaca is wired up HAL places the trade itself; otherwise it hands
+    # back manual order steps for whatever broker the user named.
+    broker_ready = broker.is_ready()
 
     await websocket.send_json({"state": "processing", "text": f"Analyzing {sym}..."})
     await _emit_telemetry(websocket, "trade.start", f"trade idea: {sym}",
@@ -2562,28 +2926,45 @@ async def build_trade_reco(symbol: str, risk: dict | None, websocket: WebSocket)
         return (f"I could not pull {sym} data, Jeffery.", "")
     bias = ca.get("bias", "neutral")
 
-    # News sentiment: an LLM read of recent headlines. Informs the spoken thesis
-    # and breaks the tie on direction when the chart bias is neutral.
-    sentiment = await _news_sentiment(sym)
+    # Sentiment: fast-model reads of recent news headlines AND Reddit chatter.
+    # They inform the spoken thesis and break the tie on direction when the chart
+    # is neutral (news first, then Reddit). Both run concurrently.
+    sentiment, reddit = await asyncio.gather(
+        _news_sentiment(sym), _reddit_sentiment(sym))
     await _emit_telemetry(
         websocket, "trade.news", f"{sym} ({sentiment['count']} headlines)",
         f"News read: {sentiment['label']}"
         + (f" — {sentiment['thesis']}" if sentiment["thesis"] else ""),
     )
+    await _emit_telemetry(
+        websocket, "trade.reddit", f"{sym} ({reddit['count']} posts)",
+        f"Reddit read: {reddit['label']}"
+        + (f" — {reddit['thesis']}" if reddit["thesis"] else ""),
+    )
     if bias == "bullish":
         side = "call"
     elif bias == "bearish":
         side = "put"
-    elif sentiment["label"] == "bullish":
+    elif sentiment["label"] == "bullish" or reddit["label"] == "bullish":
         side = "call"
-    elif sentiment["label"] == "bearish":
+    elif sentiment["label"] == "bearish" or reddit["label"] == "bearish":
         side = "put"
     else:
         side = "call"
+    # Conflict: direction comes from the chart, but if either the news or Reddit
+    # read clearly opposes it, flag lower conviction instead of silently
+    # recommending against the sentiment we just cited.
+    opposing = []
+    if _opposes(side, sentiment["label"]):
+        opposing.append(f"news is {sentiment['label']}")
+    if _opposes(side, reddit["label"]):
+        opposing.append(f"Reddit is {reddit['label']}")
+    news_conflict = bool(opposing)
     await _emit_telemetry(
         websocket, "trade.bias", f"{sym} daily",
         f"Daily bias: {bias} -> {side.upper()}. Structure: {ca.get('structure','?')}. "
-        f"Last {ca.get('last','?')}, trend {ca.get('trend','?')}.",
+        f"Last {ca.get('last','?')}, trend {ca.get('trend','?')}."
+        + (f" CONFLICT: {', '.join(opposing)}." if news_conflict else ""),
     )
 
     # IV richness (informational).
@@ -2598,6 +2979,24 @@ async def build_trade_reco(symbol: str, risk: dict | None, websocket: WebSocket)
         f"IV verdict: {verdict}. ATM IV {ivc.get('atm_iv','?')} vs HV30 "
         f"{ivc.get('hv30','?')} (ratio {ivc.get('iv_over_hv30','?')}).",
     )
+
+    # Strategy playbook: if a vault Strategy/*.md matches this setup (symbol +
+    # chart bias + IV regime), its parameters override the global rules for
+    # sizing AND exits — and since exit_levels reads the same merged dict, the
+    # backtest of this same playbook would use these levels too. No match leaves
+    # the global rules in force.
+    iv_regime = {"RICH": "high", "CHEAP": "low", "FAIR": "mid"}.get(verdict, "unknown")
+    playbook = _select_strategy({"symbol": sym, "bias": bias, "iv_regime": iv_regime})
+    if playbook:
+        rules = {**rules, **playbook}
+        max_risk_pct = float(rules.get("max_risk_per_trade_pct", max_risk_pct))
+        stop_pct = float(rules.get("stop_loss_pct", stop_pct))
+        tp_pct = float(rules.get("take_profit_pct", tp_pct))
+        limit_buffer_pct = float(rules.get("limit_buffer_pct", limit_buffer_pct))
+        await _emit_telemetry(
+            websocket, "trade.playbook", f"{sym} -> {playbook['name']}",
+            f"Applied vault strategy '{playbook['name']}': stop {stop_pct:g}%, "
+            f"take-profit {tp_pct:g}%, risk {max_risk_pct:g}% per trade.")
 
     # Spot from the daily chart close (chain underlying_price is usually null),
     # needed BEFORE screening so we can bound strikes to the money.
@@ -2641,31 +3040,68 @@ async def build_trade_reco(symbol: str, risk: dict | None, websocket: WebSocket)
         f"(OI {atm.get('oi','?')}, spread {atm.get('spread_pct','?')}%).",
     )
 
-    qty, dollar_risk = _size_contracts(account, max_risk_pct, stop_pct, entry)
+    # Account-wide concurrent-risk cap (vault rule): keep new risk + what's
+    # already at risk in open positions under max_concurrent_risk_pct of the
+    # account, sizing down to whatever room is left so HAL never stacks past it.
+    concurrent_cap_pct = float(rules.get("max_concurrent_risk_pct", 6))
+    existing_risk = await _concurrent_risk_dollars(stop_pct)
+    concurrent_room = account * concurrent_cap_pct / 100.0 - existing_risk
+    per_trade_budget = account * max_risk_pct / 100.0
+    qty, dollar_risk = _size_contracts(account, max_risk_pct, stop_pct, entry,
+                                       cap_dollars=concurrent_room)
+    # True when the account cap (not the per-trade %) is what limited the size.
+    capped_by_account = account > 0 and concurrent_room < per_trade_budget
     breakeven = strike + entry if side == "call" else strike - entry
     await _emit_telemetry(
         websocket, "trade.sizing", f"acct ${account:,.0f}, {max_risk_pct:g}% risk, {stop_pct:g}% stop",
-        f"Budget ${account * max_risk_pct / 100:,.0f}; one contract risks "
-        f"${entry * 100 * (stop_pct/100 if stop_pct>0 else 1):,.0f} -> {qty} contract(s), "
-        f"${dollar_risk:,.0f} at risk.",
+        f"Per-trade budget ${per_trade_budget:,.0f}; open positions risk ${existing_risk:,.0f} "
+        f"of the {concurrent_cap_pct:g}% account cap (${concurrent_room:,.0f} room left); "
+        f"one contract risks ${entry * 100 * (stop_pct/100 if stop_pct>0 else 1):,.0f} "
+        f"-> {qty} contract(s), ${dollar_risk:,.0f} at risk.",
     )
-    # Limit = entry + a 2% fill buffer above the ask; stop = premium level where
-    # the stop-loss triggers (entry - stop%). Both shown as price (+/- percent).
-    LIMIT_BUFFER_PCT = 2.0
-    limit_price = round(entry * (1 + LIMIT_BUFFER_PCT / 100.0), 2)
-    stop_price = round(entry * (1 - stop_pct / 100.0), 2) if stop_pct > 0 else 0.0
+    # Limit = entry + a fill buffer above the ask (limit_buffer_pct); stop and
+    # take-profit are the premium levels where each exit triggers. All vault-
+    # configured, shown as price (+/- percent).
+    limit_price = money.as_float(money.round_price(entry * (1 + limit_buffer_pct / 100.0), "option"))
+    # Stop / take-profit levels from the SAME shared policy the backtest uses
+    # (strategy.exit_levels over the vault rules), then quantized to the option tick.
+    raw_stop, raw_tp = trade_strategy.exit_levels(entry, rules)
+    stop_price = money.as_float(money.round_price(raw_stop, "option")) if raw_stop > 0 else 0.0
+    tp_price = money.as_float(money.round_price(raw_tp, "option")) if raw_tp > 0 else 0.0
     # Explain a zero quantity so the table is never silently confusing.
     zero_note = ""
     if qty == 0:
         if account <= 0:
-            zero_note = "Set your account size in the Position panel so I can size this."
+            zero_note = (
+                "I couldn't read an account total — connect Alpaca (or set your "
+                "account size in the Position panel) so I can size this.")
+        elif concurrent_room <= 0:
+            zero_note = (
+                f"Your open positions already use the {concurrent_cap_pct:g}% account "
+                f"risk cap (${existing_risk:,.0f} at risk) — no room for another trade. "
+                "Close something first.")
         elif entry > 0:
-            budget = account * max_risk_pct / 100.0
+            budget = min(per_trade_budget, concurrent_room)
             per = entry * 100.0 * (stop_pct / 100.0 if stop_pct > 0 else 1.0)
             zero_note = (
                 f"One contract risks ${per:,.0f} at your {stop_pct:g}% stop, over your "
                 f"${budget:,.0f} budget — too rich. Widen risk or pick a cheaper strike."
             )
+    # Sized below the per-trade limit because the account cap was the binding
+    # constraint — surface it so the smaller size isn't a mystery.
+    cap_note = ""
+    if qty > 0 and capped_by_account:
+        cap_note = (
+            f"Sized down to ${dollar_risk:,.0f} to stay under your {concurrent_cap_pct:g}% "
+            f"account risk cap — open positions already risk ${existing_risk:,.0f}."
+        )
+    # Conflict heads-up: chart and sentiment disagree, so this is lower conviction.
+    conflict_note = ""
+    if news_conflict:
+        conflict_note = (
+            f"Lower conviction: the daily chart is {bias} ({side}), but {' and '.join(opposing)} "
+            "— they disagree, so consider passing or sizing small."
+        )
 
     # Auto-backtest (cached per-symbol on the socket).
     cache = websocket.scope.setdefault("hal_bt_cache", {})
@@ -2690,25 +3126,36 @@ async def build_trade_reco(symbol: str, risk: dict | None, websocket: WebSocket)
                               "No qualifying historical trades.", status="ok")
 
     side_label = "Call" if side == "call" else "Put"
-    limit_cell = f"${limit_price:.2f} (+{LIMIT_BUFFER_PCT:g}%)"
+    limit_cell = f"${limit_price:.2f} (+{limit_buffer_pct:g}%)"
     stop_cell = f"${stop_price:.2f} (-{stop_pct:g}%)" if stop_pct > 0 else "—"
+    tp_cell = f"${tp_price:.2f} (+{tp_pct:g}%)" if tp_pct > 0 else "—"
     table = (
-        "| Symbol | Side | Strike | Expiry | Entry | Limit | Stop Loss | Qty | Max Risk | Breakeven |\n"
-        "|---|---|---|---|---|---|---|---|---|---|\n"
+        "| Symbol | Side | Strike | Expiry | Entry | Limit | Stop Loss | Take Profit | Qty | Max Risk | Breakeven |\n"
+        "|---|---|---|---|---|---|---|---|---|---|---|\n"
         f"| {sym} | Long {side_label} | {strike:g} | {expiry} | ${entry:.2f} | {limit_cell} | "
-        f"{stop_cell} | {qty} | ${dollar_risk:,.0f} | {breakeven:.2f} |"
+        f"{stop_cell} | {tp_cell} | {qty} | ${dollar_risk:,.0f} | {breakeven:.2f} |"
     )
-    steps = (
-        f"**How to place it on {broker}:**\n"
-        f"1. Open {broker} and pull up the {sym} options chain.\n"
-        f"2. Select the {expiry} expiration.\n"
-        f"3. Choose the {strike:g} {side_label} (buy to open).\n"
-        f"4. Order type: Limit at ${limit_price:.2f} (about {LIMIT_BUFFER_PCT:g}% above the ask to fill).\n"
-        f"5. Quantity: {qty} contract{'s' if qty != 1 else ''}.\n"
-        f"6. Set a stop-loss to sell if the premium falls to ${stop_price:.2f} "
-        f"(your {stop_pct:g}% stop).\n"
-        f"7. Review — max risk about ${dollar_risk:,.0f} — then submit."
-    )
+    if broker_ready and qty > 0:
+        steps = (
+            f"**Placing it on Alpaca:** say \"place it\" and I'll submit this as a "
+            f"buy-to-open limit order — {qty} contract{'s' if qty != 1 else ''} of the "
+            f"{strike:g} {side_label} at ${limit_price:.2f} — then set exit alerts at "
+            f"${stop_price:.2f} stop (-{stop_pct:g}%) and ${tp_price:.2f} take-profit "
+            f"(+{tp_pct:g}%). Tell me to adjust size or price first if you want."
+        )
+    else:
+        steps = (
+            f"**How to place it on {broker_name}:**\n"
+            f"1. Open {broker_name} and pull up the {sym} options chain.\n"
+            f"2. Select the {expiry} expiration.\n"
+            f"3. Choose the {strike:g} {side_label} (buy to open).\n"
+            f"4. Order type: Limit at ${limit_price:.2f} (about {limit_buffer_pct:g}% above the ask to fill).\n"
+            f"5. Quantity: {qty} contract{'s' if qty != 1 else ''}.\n"
+            f"6. Set a stop-loss to sell if the premium falls to ${stop_price:.2f} "
+            f"(your {stop_pct:g}% stop), and a take-profit to sell at ${tp_price:.2f} "
+            f"(+{tp_pct:g}%).\n"
+            f"7. Review — max risk about ${dollar_risk:,.0f} — then submit."
+        )
 
     bias_phrase = {"bullish": "leaning bullish", "bearish": "leaning bearish",
                    "neutral": "no clear direction, defaulting long-call"}[bias if bias in ("bullish", "bearish") else "neutral"]
@@ -2721,17 +3168,22 @@ async def build_trade_reco(symbol: str, risk: dict | None, websocket: WebSocket)
             + (f": {sentiment['thesis']}." if sentiment["thesis"] else ".")
         )
     if qty > 0:
+        close = ("Want me to place it on Alpaca?" if broker_ready
+                 else "Want me to set stop and take-profit alerts on it, and tell me once you've placed it?")
+        cap_phrase = f" {cap_note}" if cap_note else ""
+        conflict_phrase = f" {conflict_note}" if conflict_note else ""
         spoken = (
             f"{sym} is {bias_phrase}. I'd look at {qty} of the {strike:g} {side_label.lower()}s "
             f"expiring {expiry}, a limit around ${limit_price:.2f}, stop at ${stop_price:.2f}, "
-            f"max risk ${dollar_risk:,.0f}.{iv_phrase}{news_phrase} "
-            "Want me to set a stop alert on it, and tell me once you've placed it?"
+            f"max risk ${dollar_risk:,.0f}.{iv_phrase}{news_phrase}{conflict_phrase}{cap_phrase} "
+            + close
         )
         # Stash the proposed trade so the next turn can act on a yes/placed reply.
         websocket.scope["hal_pending_trade"] = {
             "symbol": sym, "side": side, "strike": strike, "expiry": expiry,
             "entry": entry, "limit_price": limit_price, "stop_price": stop_price,
-            "qty": qty, "dollar_risk": dollar_risk, "option_ticker": option_ticker,
+            "tp_price": tp_price, "qty": qty, "dollar_risk": dollar_risk,
+            "option_ticker": option_ticker,
         }
     else:
         spoken = (
@@ -2741,6 +3193,10 @@ async def build_trade_reco(symbol: str, risk: dict | None, websocket: WebSocket)
         websocket.scope.pop("hal_pending_trade", None)
     summary = f"**{sym} trade idea** — {bias_phrase}{(', ' + verdict.lower() + ' IV') if verdict not in ('UNKNOWN','FAIR') else ''}."
     full_md = f"{summary}\n\n{table}\n\n{steps}"
+    if conflict_note:
+        full_md += f"\n\n⚠️ {conflict_note}"
+    if cap_note:
+        full_md += f"\n\n⚠️ {cap_note}"
     if zero_note:
         full_md += f"\n\n⚠️ {zero_note}"
     if bt_line:
@@ -2750,6 +3206,11 @@ async def build_trade_reco(symbol: str, risk: dict | None, websocket: WebSocket)
         if sentiment["thesis"]:
             news_md += f" — {sentiment['thesis']}"
         full_md += f"\n\n_{news_md} ({sentiment['count']} headlines)._"
+    if reddit["count"]:
+        reddit_md = f"Reddit read: {reddit['label']}"
+        if reddit["thesis"]:
+            reddit_md += f" — {reddit['thesis']}"
+        full_md += f"\n\n_{reddit_md} ({reddit['count']} posts)._"
     return spoken, full_md
 
 
@@ -2814,6 +3275,13 @@ _FOLLOWUP_DECLINE = re.compile(
     r"\b(no|nope|skip|cancel|never ?mind|forget it|don'?t)\b", re.IGNORECASE,
 )
 
+# Affirmative reply to HAL's "want a trade idea on X?" offer after a news alert.
+_OFFER_YES = re.compile(
+    r"\b(yes|yeah|yep|yup|sure|ok|okay|please|go ahead|do it|let'?s (see|hear|do) it"
+    r"|show me|size it|what'?s the (trade|idea))\b",
+    re.IGNORECASE,
+)
+
 
 def _match_trade_followup(text: str) -> str | None:
     """Classify a reply to HAL's post-trade question. 'placed' takes priority
@@ -2829,29 +3297,138 @@ def _match_trade_followup(text: str) -> str | None:
     return None
 
 
-def _set_trade_stop_alert(trade: dict) -> str:
-    """Create a real price-cross alert at the trade's stop level on the option
-    contract (falls back to the underlying). Returns a spoken confirmation."""
+# Affirmative replies that mean "submit the order you just staged". Kept apart
+# from _FOLLOWUP_ALERT because that set is about setting an alert, not firing an
+# order — "send it"/"submit"/"fire it" belong only here.
+_ORDER_CONFIRM = re.compile(
+    r"\b(send( it| that| this| the order| it through| that order)?"
+    r"|submit( it| that| the order)?|place( it| that| the order)?"
+    r"|confirm( it| that| the order)?|approve[d]?( it| that)?|execute( it| that)?"
+    r"|fire( it| away)?|pull the trigger|do it|go ahead|go for it"
+    r"|let'?s (go|do it)|yes|yeah|yep|yup|sure|okay|ok)\b",
+    re.IGNORECASE,
+)
+
+
+def _match_order_confirm(text: str) -> str | None:
+    """Classify a reply to a staged-order confirm prompt. Decline wins over
+    confirm so 'no, don't send it' cancels instead of submitting."""
+    if not text:
+        return None
+    if _FOLLOWUP_DECLINE.search(text):
+        return "cancel"
+    if _ORDER_CONFIRM.search(text):
+        return "confirm"
+    return None
+
+
+def _set_trade_exit_alerts(trade: dict) -> str:
+    """Create price-cross alerts at the trade's stop (below) and take-profit
+    (above) levels on the option contract (falls back to the underlying). HAL
+    doesn't place real broker stop/TP orders — these alerts are how it watches
+    the exits. Returns a spoken confirmation."""
     sym = trade.get("symbol", "?")
     stop = trade.get("stop_price") or 0
+    tp = trade.get("tp_price") or 0
     opt = trade.get("option_ticker") or ""
     # Prefer alerting on the option premium; fall back to the underlying.
     if opt:
-        sub = market.tool_subscribe_market("T", opt, note=f"{sym} trade stop")
-        target, level_desc = opt, f"premium hits ${stop:.2f}"
+        sub = market.tool_subscribe_market("T", opt, note=f"{sym} trade exits")
+        target = opt
+        stop_desc, tp_desc = f"premium hits ${stop:.2f}", f"premium hits ${tp:.2f}"
     else:
-        sub = market.tool_subscribe_market("T", f"O:{sym}*", note=f"{sym} trade stop")
-        target, level_desc = sym, f"${stop:.2f}"
+        sub = market.tool_subscribe_market("T", f"O:{sym}*", note=f"{sym} trade exits")
+        target = sym
+        stop_desc, tp_desc = f"${stop:.2f}", f"${tp:.2f}"
     if sub.get("error"):
-        return f"I couldn't open the feed for the alert: {sub['error']}"
-    rule = market.tool_add_alert_rule(
-        sub["subscription_id"], "price_cross",
-        {"price": stop, "direction": "below"},
-        note=f"{sym} stop", cooldown_seconds=300,
+        return f"I couldn't open the feed for the exit alerts: {sub['error']}"
+    sid = sub["subscription_id"]
+    legs = []
+    if stop > 0:
+        r = market.tool_add_alert_rule(
+            sid, "price_cross", {"price": stop, "direction": "below"},
+            note=f"{sym} stop", cooldown_seconds=300)
+        legs.append(f"stop if {target} {stop_desc}" if not r.get("error")
+                    else f"(stop alert failed: {r['error']})")
+    if tp > 0:
+        r = market.tool_add_alert_rule(
+            sid, "price_cross", {"price": tp, "direction": "above"},
+            note=f"{sym} take-profit", cooldown_seconds=300)
+        legs.append(f"take-profit if {target} {tp_desc}" if not r.get("error")
+                    else f"(take-profit alert failed: {r['error']})")
+    if not legs:
+        return ""
+    return "Alerts set — I'll shout on " + ", and ".join(legs) + "."
+
+
+async def _place_trade_idea_inner(trade: dict) -> tuple[bool, str]:
+    """Submit the long option from a build_trade_reco idea through Alpaca as a
+    limit order, then arm a HAL-managed exit (the monitor flattens it at market
+    on stop/take-profit). Returns (placed_ok, spoken_result)."""
+    # Re-check the account-wide concurrent-risk cap at placement: positions may
+    # have changed since the idea was sized, and this submits for real.
+    account = await _resolve_account_size(None)
+    entry = trade.get("entry") or 0.0
+    stop_pct = ((entry - trade["stop_price"]) / entry * 100.0) if entry > 0 else 0.0
+    existing_risk = await _concurrent_risk_dollars(stop_pct)
+    new_risk = float(trade.get("dollar_risk") or 0.0)
+    cap_pct = float(_load_rules().get("max_concurrent_risk_pct", 6))
+    if account > 0 and existing_risk + new_risk > account * cap_pct / 100.0 + 1.0:
+        return False, (
+            f"I won't place it, Jeffery — that puts account risk at "
+            f"${existing_risk + new_risk:,.0f}, over your {cap_pct:g}% cap "
+            f"(${account * cap_pct / 100.0:,.0f}). Close a position first or size down."
+        )
+    try:
+        spec = broker.prepare_order(
+            asset_class="option",
+            side="buy",
+            qty=trade["qty"],
+            order_type="limit",
+            limit_price=trade["limit_price"],
+            underlying=trade["symbol"],
+            expiration=trade["expiry"],
+            option_type=trade["side"],  # "call" / "put"
+            strike=trade["strike"],
+        )
+    except Exception as e:
+        return False, f"I couldn't build that order, Jeffery: {e}"
+    gate = await asyncio.to_thread(_broker_rules_check, spec)
+    if not gate["passed"]:
+        return False, "That order is blocked by your trading rules: " + "; ".join(gate["failures"])
+    try:
+        order = await asyncio.to_thread(broker.submit_order, spec)
+    except Exception as e:
+        return False, f"I couldn't place it, Jeffery — {type(e).__name__}: {e}"
+    qty = trade["qty"]
+    stop_price = trade.get("stop_price") or 0
+    tp_price = trade.get("tp_price") or 0
+    # Arm the HAL-managed exit: the monitor flattens this at market when the
+    # premium hits the stop or take-profit (Alpaca can't hold option brackets).
+    brackets.arm(spec["symbol"], trade["symbol"], qty, stop_price, tp_price)
+    spoken = (
+        f"Done — placed {qty} {trade['symbol']} {trade['strike']:g} "
+        f"{trade['side']}{'s' if qty != 1 else ''} at ${trade['limit_price']:.2f} limit. "
+        f"Alpaca has it as {order.get('status')}."
     )
-    if rule.get("error"):
-        return f"I couldn't set the alert: {rule['error']}"
-    return f"Alert set — I'll shout if {target} {level_desc}."
+    exits = []
+    if stop_price:
+        exits.append(f"stop ${stop_price:.2f}")
+    if tp_price:
+        exits.append(f"take-profit ${tp_price:.2f}")
+    if exits:
+        spoken += (f" I'll auto-sell at {' and '.join(exits)} — close it yourself "
+                   "from the positions panel any time to cancel that.")
+    return True, spoken
+
+
+async def _place_trade_idea(trade: dict, websocket: WebSocket) -> str:
+    """Voice "place it" entry point: submit the staged order and return the
+    spoken result. The user's "place it" reply IS the confirmation, so this
+    submits directly. (The panel button places via the place_trade command,
+    which calls _place_trade_idea_inner directly.)"""
+    _ok, spoken = await _place_trade_idea_inner(trade)
+    return spoken
 
 
 async def agent_loop(
@@ -2876,8 +3453,18 @@ async def agent_loop(
     # model — keep it light so the model doesn't blank under think:False.
     if full_user_content != user_text:
         risk = websocket.scope.get("hal_risk")
+        # Account total comes from Alpaca; risk policy (per-trade %, stop %) from
+        # the vault trading rules — the single source of truth. The panel only
+        # carries the broker name now.
+        acct = await _resolve_account_size(risk)
+        rules = _load_rules()
+        risk_ctx = {
+            "accountSize": acct,
+            "maxRiskPct": rules.get("max_risk_per_trade_pct", 5),
+            "stopLossPct": rules.get("stop_loss_pct", 20),
+        }
         try:
-            full_user_content += _format_risk_context(risk)
+            full_user_content += _format_risk_context(risk_ctx)
         except Exception:
             pass
         broker = risk.get("broker") if isinstance(risk, dict) else None
@@ -2939,19 +3526,22 @@ async def agent_loop(
         for iteration in range(MAX_AGENT_ITERATIONS):
             _check_abort(abort_event)
 
-            # Context budget. With the model tool list trimmed to _MODEL_TOOLS,
-            # the static prompt (system + tools) is ~4.5-5k tokens, so num_ctx
-            # 8192 still leaves ~3k for recent history (~15 short turns) while
-            # keeping more of the 27B on the GPU than 10240 did — fewer CPU-spilled
-            # layers means faster per-token generation (the reported slow replies).
-            # TTS is Piper on the CPU (zero VRAM). Raise toward 12288 for deeper
-            # memory at some speed cost, lower toward 6144 for max speed.
+            # Context budget. The static prompt is bigger than it looks: the base
+            # system prompt (~3.5k tokens) + the CAG vault block (rules / open
+            # trades / watchlist / theses — grows with the vault) + ~19 tool
+            # schemas already runs ~8.5k+ tokens. At num_ctx 8192 that OVERFLOWS:
+            # Ollama truncates the input to fit, leaving ~zero room to generate,
+            # so the model emits a single token and stops (done_reason='length')
+            # — the "one-word reply" bug. 16384 leaves headroom for the prompt +
+            # recent history + the actual answer. TTS is Piper on CPU (zero VRAM);
+            # the cost here is a larger KV cache (more 27B layers may spill to CPU,
+            # slightly slower) — worth it, since a truncated prompt is unusable.
             payload = {
                 "model": model,
                 "messages": messages,
                 "stream": bool(on_sentence),
                 "think": False,
-                "options": {"temperature": 0.7, "top_p": 0.9, "num_ctx": 8192,
+                "options": {"temperature": 0.7, "top_p": 0.9, "num_ctx": 16384,
                             "repeat_penalty": 1.2},
             }
             # Vision models in Ollama typically don't accept the tools param;
@@ -2980,6 +3570,7 @@ async def agent_loop(
             try:
                 if on_sentence:
                     # Stream tokens so we can pipeline TTS sentence-by-sentence.
+                    _stream_chunks = 0
                     async with client.stream("POST", OLLAMA_URL, json=payload) as r:
                         r.raise_for_status()
                         async for line in r.aiter_lines():
@@ -2989,6 +3580,7 @@ async def agent_loop(
                                 chunk = json.loads(line)
                             except json.JSONDecodeError:
                                 continue
+                            _stream_chunks += 1
                             msg_chunk = chunk.get("message") or {}
                             content_piece = msg_chunk.get("content") or ""
                             if content_piece:
@@ -3021,6 +3613,12 @@ async def agent_loop(
                                 tool_calls = tc
                             if chunk.get("done"):
                                 break
+                    # Diagnostic: if this shows chunks=1 with a short accumulated
+                    # while the model normally streams dozens, the stream is being
+                    # cut after the first token (the one-word-reply bug).
+                    print(f"[agent] stream end: chunks={_stream_chunks} "
+                          f"accumulated_len={len(accumulated)} "
+                          f"tool_calls={bool(tool_calls)} aborted={abort_event.is_set()}")
                     # Flush whatever's left in the buffer as one final chunk.
                     if spoken_buffer.strip() and not tts_muted and not _TTS_STRUCT_BOUNDARY.search(accumulated):
                         leftover = _strip_code_for_tts(_strip_thinking(spoken_buffer))
@@ -3193,6 +3791,62 @@ async def synthesize(text: str) -> bytes:
     return await asyncio.to_thread(_run)
 
 
+# --- Deterministic positions/account read ----------------------------------
+# Questions about what {USER_NAME} is holding MUST be answered from the real
+# Alpaca account, never from the model's imagination (qwen confabulates whole
+# portfolios — "you have three live trades: AVGO puts, QQQ, TSLA calls"). This
+# route intercepts those questions before the LLM and speaks the actual numbers.
+_POSITIONS_INTENT = re.compile(
+    r"\b("
+    r"my (?:open |live |current )?(?:position|trade|holding)s?"
+    r"|what(?:'s| is| are)?(?: in)? my (?:position|trade|holding|portfolio|book|account)s?"
+    r"|what (?:am i|do i) (?:holding|own|have (?:on|open|in))"
+    r"|am i (?:holding|long|short)"
+    r"|(?:open|live|current|running) (?:position|trade)s?"
+    r"|my (?:portfolio|book)"
+    r"|how (?:are|'re|is) my (?:position|trade)s?"
+    r"|buying power"
+    r"|account (?:balance|value|equity|status)"
+    r"|how much (?:buying power|cash|equity)"
+    r"|my (?:p&l|pnl|p and l|unrealized)"
+    r")\b",
+    re.IGNORECASE,
+)
+# Phrases that look like positions talk but are really a trade-idea ask or a
+# close/sizing request — let those fall through to their own routes / the LLM.
+_POSITIONS_INTENT_NEG = re.compile(
+    r"(?i)\b(should i|what (?:should|to)\b[^.?!]*\b(?:trade|buy|sell)"
+    r"|trade idea|recommend|looks? good|find me|any (?:setups?|ideas?)"
+    r"|position siz|close|flatten|liquidate|exit|dump|get out)\b"
+)
+
+
+def _match_positions_intent(text: str) -> bool:
+    if not text or _POSITIONS_INTENT_NEG.search(text):
+        return False
+    return bool(_POSITIONS_INTENT.search(text))
+
+
+def _summarize_positions(acct: dict, positions: list[dict]) -> str:
+    """Plain-language summary built straight from live Alpaca data (no LLM)."""
+    venue = "paper" if acct.get("paper") else "live"
+    if not positions:
+        bp = acct.get("buying_power")
+        bp_s = f" Buying power is ${bp:,.0f}." if bp else ""
+        return f"You have no open positions on your {venue} account.{bp_s}"
+    parts, total_pl = [], 0.0
+    for p in positions:
+        pl = p.get("unrealized_pl") or 0.0
+        total_pl += pl
+        unit = "contracts" if "option" in (p.get("asset_class") or "") else "shares"
+        sign = "up" if pl >= 0 else "down"
+        parts.append(f"{p.get('symbol')}, {p.get('qty')} {unit}, {sign} ${abs(pl):,.0f}")
+    n = len(positions)
+    net = "up" if total_pl >= 0 else "down"
+    head = f"You have {n} open position{'' if n == 1 else 's'} on your {venue} account: "
+    return head + "; ".join(parts) + f". Net unrealized {net} ${abs(total_pl):,.0f}."
+
+
 # --- WebSocket handler ------------------------------------------------------
 
 
@@ -3294,6 +3948,9 @@ async def process_turn(
         if summary:
             display_text = f"{display_text} {summary}".strip()
         await websocket.send_json({"state": "processing", "text": f"You: {display_text}"})
+        # The question that opens the Cognition flow — the origin the pulse rides
+        # out from, in the Human lane.
+        await _emit_telemetry(websocket, "human.question", "", display_text, source="human")
         _check_abort(abort_event)
 
         # Stream HAL's audio sentence-by-sentence as the LLM generates.
@@ -3317,16 +3974,21 @@ async def process_turn(
                 user_text, history, websocket, abort_event,
                 attachments=attachments, on_sentence=stream_sentence,
                 vision_mode=vision_mode, model_mode=model_mode)
-            # A news alert also proposes a position: deliver_alert stashes the
-            # symbol, and we build the sized reco here (same path the on-demand
-            # trade route uses) so HAL announces the headline THEN the trade.
+            # A news alert flags a name worth a look. Rather than silently
+            # building + pinning a sized trade (which can contradict the very
+            # headline, and doubles down on names already held), HAL just OFFERS
+            # one — the idea is built on-demand if Jeffery says yes next turn.
             _news_sym = websocket.scope.pop("hal_pending_news_position", None)
             if _news_sym:
-                spoken, full_md = await build_trade_reco(
-                    _news_sym, websocket.scope.get("hal_risk"), websocket)
-                await stream_sentence(spoken)
-                await _push_trade_idea(websocket, "trade", _news_sym, full_md)
-                nh = nh + [{"role": "assistant", "content": full_md or spoken}]
+                if await _holds_underlying(_news_sym):
+                    websocket.scope.pop("hal_news_offer", None)
+                    offer = (f"You're already in {_news_sym}, so I'll leave that "
+                             "position as-is rather than pitch a new trade.")
+                else:
+                    websocket.scope["hal_news_offer"] = _news_sym
+                    offer = f"Want me to size a trade idea on {_news_sym}?"
+                await stream_sentence(offer)
+                nh = nh + [{"role": "assistant", "content": offer}]
             if on_reply:
                 try:
                     await on_reply(nh)
@@ -3506,6 +4168,31 @@ async def process_turn(
             # No symbol and no price — probably a question about alerts; let the
             # model field it rather than mis-firing the add flow.
 
+        # Deterministic positions/account read — answers from the real Alpaca
+        # account so HAL can't invent holdings. (Runs before the LLM; see the
+        # NEVER FABRICATE PORTFOLIO STATE rule in the system prompt.)
+        if _match_positions_intent(user_text):
+            if not broker.is_ready():
+                return await _speak_and_return(
+                    "Alpaca isn't connected, so I can't see your account — add your "
+                    "API keys to the .env and restart me.", "positions.read")
+            await websocket.send_json(
+                {"state": "processing", "text": "Pulling your positions..."})
+            try:
+                acct = await asyncio.to_thread(broker.get_account)
+                positions = await asyncio.to_thread(broker.list_positions)
+            except Exception as e:
+                print(f"[positions] read failed: {type(e).__name__}: {e}")
+                return await _speak_and_return(
+                    f"I couldn't reach Alpaca to check, Jeffery — {type(e).__name__}.",
+                    "positions.read")
+            spoken = _summarize_positions(acct, positions)
+            await _emit_telemetry(
+                websocket, "positions.read", "deterministic positions read",
+                json.dumps({"account": acct, "positions": positions},
+                           default=str)[:MAX_TOOL_OUTPUT_CHARS])
+            return await _speak_and_return(spoken, "positions.read")
+
         # Index comparison sweep: "backtest the indexes" / "compare the indexes"
         # runs the set and shows a ranked table. Checked BEFORE the single-symbol
         # route (which would otherwise catch the bare "backtest" and default SPY).
@@ -3617,6 +4304,24 @@ async def process_turn(
         # drop it) instead of routing to the model.
         pending = websocket.scope.get("hal_pending_trade")
         if pending:
+            print(f"[place] pending {pending.get('symbol')} qty={pending.get('qty')} "
+                  f"broker_ready={broker.is_ready()} reply={user_text!r} "
+                  f"-> {_match_order_confirm(user_text)}")
+        # When Alpaca is wired up, a "place it" / "send it" / "yes" reply to a
+        # proposed trade submits it through the broker (HAL puts the position on
+        # itself). "set an alert" / "I placed it" still fall through below.
+        if pending and broker.is_ready():
+            decision = _match_order_confirm(user_text)
+            if decision == "confirm":
+                spoken = await _place_trade_idea(pending, websocket)
+                websocket.scope.pop("hal_pending_trade", None)
+                return await _speak_and_return(spoken, "trade.place")
+            if decision == "cancel":
+                websocket.scope.pop("hal_pending_trade", None)
+                return await _speak_and_return(
+                    f"No problem, I'll leave {pending.get('symbol', 'it')} alone.",
+                    "trade.place")
+        if pending:
             fu = _match_trade_followup(user_text)
             if fu:
                 psym = pending.get("symbol", "the trade")
@@ -3626,9 +4331,9 @@ async def process_turn(
                     f"{pending.get('side','?')} -> action: {fu}.",
                 )
                 if fu == "alert":
-                    spoken = _set_trade_stop_alert(pending)
+                    spoken = _set_trade_exit_alerts(pending)
                 elif fu == "placed":
-                    alert_msg = _set_trade_stop_alert(pending)
+                    alert_msg = _set_trade_exit_alerts(pending)
                     spoken = f"Got it — logged you in {psym}. {alert_msg}"
                     websocket.scope.pop("hal_pending_trade", None)
                 else:  # decline
@@ -3650,6 +4355,47 @@ async def process_turn(
                 if len(new_history) > MAX_HISTORY_MESSAGES:
                     new_history = new_history[-MAX_HISTORY_MESSAGES:]
                 return new_history
+
+        # News-offer follow-up: HAL offered a trade idea after a news alert. Build
+        # it on-demand only if Jeffery says yes; a clear no drops it; anything
+        # else clears the offer and routes normally.
+        offer_sym = websocket.scope.get("hal_news_offer")
+        if offer_sym:
+            if _OFFER_YES.search(user_text):
+                websocket.scope.pop("hal_news_offer", None)
+                spoken, full_md = await build_trade_reco(
+                    offer_sym, websocket.scope.get("hal_risk"), websocket)
+                await stream_sentence(spoken)
+                await _push_trade_idea(websocket, "trade", offer_sym, full_md)
+                return await _speak_and_return(spoken, "trade", full_md or spoken, speak=False)
+            if _FOLLOWUP_DECLINE.search(user_text):
+                websocket.scope.pop("hal_news_offer", None)
+                return await _speak_and_return(
+                    f"No problem — I'll leave {offer_sym} alone.", "news.offer")
+            websocket.scope.pop("hal_news_offer", None)  # unrelated reply; route normally
+
+        # Deterministic staged-order confirmation: place_order in confirm mode
+        # holds the order in broker._pending pending an explicit yes. A "send
+        # it" / "confirm" / "no" reply submits or discards it right here, so the
+        # confirmation never depends on the model — which blanks on a bare "send
+        # it" and returns the "I didn't catch a clear answer" fallback.
+        staged = broker.list_pending() if broker.is_ready() else []
+        if staged:
+            decision = _match_order_confirm(user_text)
+            if decision:
+                summary = staged[0]["summary"]
+                if decision == "cancel":
+                    broker.discard_pending()
+                    spoken = f"Cancelled, Jeffery — I won't send it. ({summary})"
+                else:
+                    try:
+                        order = await asyncio.to_thread(broker.submit_pending)
+                        spoken = (f"Done — order sent. {summary}. "
+                                  f"Alpaca has it as {order.get('status')}.")
+                    except Exception as e:
+                        spoken = (f"I couldn't send it, Jeffery — "
+                                  f"{type(e).__name__}: {e}")
+                return await _speak_and_return(spoken, f"broker.{decision}")
 
         # Deterministic hold/exit route: a "how long should I hold my <option>"
         # question. Runs BEFORE the trade route (which also matches "should i
@@ -3716,6 +4462,20 @@ async def process_turn(
             if not all(hold_contract.get(k) for k in _HOLD_FIELDS):
                 return await _ask_hold(hold_contract)
             return await _run_hold(hold_contract)
+
+        # Deterministic committee route: "deep dive on AVGO" / "what does the
+        # committee think about SPY". Runs BEFORE the trade route so a deep-dive
+        # convenes the desk instead of building a one-shot trade idea. The model
+        # narrates "I kicked off the committee" without actually calling the tool,
+        # so we convene it here and HAL speaks the real verdict.
+        if _COMMITTEE_TRIGGERS.search(user_text):
+            craw = _match_committee_intent(user_text) or ""
+            csym = (await _resolve_symbol(craw)) or (craw.upper() if craw else "")
+            if csym:
+                spoken = await run_committee_tool({"symbol": csym}, websocket)
+                return await _speak_and_return(spoken, "committee.deepdive")
+            return await _speak_and_return(
+                "Which ticker should the committee dig into, Jeffery?", "committee.ask")
 
         # Deterministic trade route: build a sized long call/put + table in
         # Python so HAL never blanks on a trade question (the model returns ''
@@ -3981,6 +4741,7 @@ async def voice_interface(websocket: WebSocket):
             "trade_mode": broker.get_mode(),
             "broker_account": None,
             "positions_error": error,
+            "risk": risk.status(),
         }
         if broker.is_ready():
             try:
@@ -4234,6 +4995,44 @@ async def voice_interface(websocket: WebSocket):
                                 model_mode=model_mode,
                             )
                         )
+                elif cmd == "place_trade":
+                    # "Place it" button — submit the staged order DIRECTLY here
+                    # (no synthetic turn / routing), so it can't get lost. Pop the
+                    # id so a second click can't double-submit, signal the button
+                    # green/red, then speak a best-effort confirmation.
+                    idea_id = command.get("id")
+                    store = websocket.scope.get("hal_placeable", {})
+                    trade = store.pop(idea_id, None) if idea_id else None
+                    if trade is None:
+                        trade = websocket.scope.get("hal_pending_trade")
+                    print(f"[place_trade] id={idea_id} trade={'yes' if trade else 'none'} "
+                          f"ready={broker.is_ready()}")
+                    ok = False
+                    if not trade:
+                        spoken = "That idea's no longer active, Jeffery — ask me for a fresh one."
+                    elif not broker.is_ready():
+                        spoken = "Alpaca isn't configured, so I can't place it."
+                    else:
+                        websocket.scope.pop("hal_pending_trade", None)
+                        try:
+                            ok, spoken = await _place_trade_idea_inner(trade)
+                        except Exception as e:
+                            ok = False
+                            spoken = f"I couldn't place it, Jeffery — {type(e).__name__}: {e}"
+                            print(f"[place_trade] inner raised: {e}")
+                    print(f"[place_trade] ok={ok}: {spoken!r}")
+                    if idea_id:  # flip the button green (ok) / red (failed)
+                        await websocket.send_json(
+                            {"trade_placed": {"id": idea_id, "ok": ok}})
+                    await _emit_telemetry(
+                        websocket, "trade.place", str(idea_id or ""), spoken,
+                        status="ok" if ok else "error", source="human")
+                    await send_positions_snapshot()
+                    # Speak the confirmation (best-effort; button already flipped).
+                    try:
+                        await _announce_exit(spoken)
+                    except Exception as e:
+                        print(f"[place_trade] announce failed: {e}")
                 elif cmd == "reset":
                     print(f"[ws] Memory wipe for conversation {current_conv['id']}")
                     abort_event.set()
@@ -4275,14 +5074,48 @@ async def voice_interface(websocket: WebSocket):
                     else:
                         try:
                             order = await asyncio.to_thread(broker.close_position_now, sym)
+                            # User closed it themselves — cancel any HAL-managed
+                            # exit so the monitor doesn't try to sell it again.
+                            brackets.disarm(sym)
                             await _emit_telemetry(
                                 websocket, "broker.position_close",
                                 f"manual close {sym}",
                                 json.dumps(order, indent=2, default=str),
+                                source="human",
                             )
                         except Exception as e:
                             err = f"{type(e).__name__}: {e}"
                             print(f"[broker] manual close {sym} failed: {e}")
+                    await send_positions_snapshot(error=err)
+                elif cmd == "scale_position":
+                    # Manual scale from the Positions panel: add (delta>0) or trim
+                    # (delta<0) contracts at market, immediately. The managed exit
+                    # auto-adapts (it always flattens the current size).
+                    sym = str(command.get("symbol", "")).strip().upper()
+                    try:
+                        delta = int(command.get("delta", 0))
+                    except (TypeError, ValueError):
+                        delta = 0
+                    err = None
+                    if not sym:
+                        err = "symbol is required"
+                    elif not delta:
+                        err = "scale amount must be non-zero"
+                    elif not broker.is_ready():
+                        err = "Alpaca isn't configured."
+                    else:
+                        try:
+                            order = await asyncio.to_thread(
+                                broker.scale_position_now, sym, delta)
+                            await _emit_telemetry(
+                                websocket, "broker.scale_position",
+                                f"{'add' if delta > 0 else 'trim'} {abs(delta)} {sym}",
+                                json.dumps(order, indent=2, default=str),
+                                source="human",
+                            )
+                        except Exception as e:
+                            err = f"{type(e).__name__}: {e}"
+                            print(f"[broker] scale {sym} by {delta} failed: {e}")
                     await send_positions_snapshot(error=err)
                 elif cmd == "set_trade_mode":
                     # HUD toggle: flip the order gate between confirm/autopilot,
@@ -4290,6 +5123,18 @@ async def voice_interface(websocket: WebSocket):
                     m = str(command.get("mode", "")).strip().lower()
                     if m in ("confirm", "autopilot"):
                         broker.set_mode(m)
+                        await _emit_telemetry(
+                            websocket, "human.set_trade_mode", f"order gate -> {m}",
+                            f"You set the order gate to {m} mode.", source="human")
+                    await send_positions_snapshot()
+                elif cmd == "reset_kill_switch":
+                    # HUD override: clear a latched daily-loss halt and re-broadcast
+                    # so the risk badge updates. Trading stays in confirm mode.
+                    risk.reset_kill_switch()
+                    await _emit_telemetry(
+                        websocket, "human.reset_kill_switch", "clear kill switch",
+                        "You cleared the daily-loss kill switch; new entries allowed.",
+                        source="human")
                     await send_positions_snapshot()
                 elif cmd == "watchlist_refresh":
                     try:

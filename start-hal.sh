@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # HAL launcher (Linux/macOS) — activate the venv and run server.py, appending
-# all output to hal.log. The Linux counterpart of start-hal.ps1.
+# all output to hal.log.
 #
 #   ./start-hal.sh            # run in the foreground
 #   ./start-hal.sh &          # or background it
@@ -68,7 +68,34 @@ warm_ollama() {
     >/dev/null 2>&1 &
 }
 
+# HAL serves the prebuilt React bundle from app/dist. Rebuild it when any source
+# under app/ (outside node_modules/dist) is newer than the last build, so UI
+# changes show up on launch without a manual `npm run build`. A failed build
+# leaves the previous bundle in place rather than blocking startup.
+ensure_frontend_build() {
+  [ -d app ] && [ -f app/package.json ] || return 0
+  if ! command -v npm >/dev/null 2>&1; then
+    echo "HAL: npm not found — skipping frontend rebuild (serving existing app/dist)." >&2
+    return 0
+  fi
+  local stale
+  if [ ! -f app/dist/index.html ]; then
+    stale="yes"
+  else
+    stale="$(find app -type d \( -name node_modules -o -name dist \) -prune -o \
+      -type f -newer app/dist/index.html -print -quit 2>/dev/null)"
+  fi
+  [ -n "$stale" ] || { echo "HAL: frontend bundle up to date." >&2; return 0; }
+  echo "HAL: rebuilding frontend (npm run build)..." >&2
+  if ( cd app && npm run build >> ../hal.log 2>&1 ); then
+    echo "HAL: frontend rebuilt." >&2
+  else
+    echo "HAL: frontend build FAILED — see hal.log. Serving previous app/dist." >&2
+  fi
+}
+
 ensure_model_drive
+ensure_frontend_build
 ensure_ollama && warm_ollama
 
 ts="$(date '+%Y-%m-%d %H:%M:%S')"

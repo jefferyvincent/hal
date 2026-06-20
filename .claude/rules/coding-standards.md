@@ -5,6 +5,7 @@ paths:
 ---
 
 # HAL Coding Standards /app
+use the project's README.md as the single source of truth. Make sure you update it with new features and new commands.
 
 ## 1. Hook / Component Separation
 

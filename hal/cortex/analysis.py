@@ -13,6 +13,7 @@ one row per candidate and returns only what's actionable.
 """
 from __future__ import annotations
 
+import asyncio
 import math
 from datetime import date
 from typing import Any, Optional
@@ -214,8 +215,6 @@ async def iv_context(underlying: str, atm_window: int = 3) -> dict:
     underlying has recently delivered?
     """
     underlying = underlying.upper().strip()
-    if not API_KEY:
-        return {"error": "MASSIVE_API_KEY not configured"}
 
     today = date.today()
     start = today.fromordinal(today.toordinal() - 365)
@@ -225,46 +224,49 @@ async def iv_context(underlying: str, atm_window: int = 3) -> dict:
     )
     snap_path = f"/v3/snapshot/options/{underlying}"
 
+    closes: list[float] = []
+    snap: dict = {}
     async with httpx.AsyncClient() as client:
-        try:
-            aggs = await _get(
-                client,
-                aggs_path,
-                {"adjusted": "true", "sort": "asc", "limit": 50000},
-            )
-        except httpx.HTTPStatusError as e:
-            return {
-                "error": f"aggregates HTTP {e.response.status_code}: "
-                f"{e.response.text[:200]}"
-            }
-        except Exception as e:
-            return {"error": f"aggregates: {type(e).__name__}: {e}"}
+        # Primary realized-vol source: Massive daily aggregates. Often 403s on
+        # underlying value data (not in our plan), so failures are non-fatal —
+        # we fall back to Alpaca below.
+        if API_KEY:
+            try:
+                aggs = await _get(
+                    client, aggs_path,
+                    {"adjusted": "true", "sort": "asc", "limit": 50000},
+                )
+                results = aggs.get("results") or []
+                closes = [r["c"] for r in results if r.get("c") is not None]
+            except Exception as e:
+                print(f"[iv_context] Massive aggregates unavailable for {underlying}: {e}")
 
-        results = aggs.get("results") or []
-        closes = [r.get("c") for r in results if r.get("c") is not None]
+        # HV fallback: Alpaca daily bars (entitled with our trading keys). This is
+        # what fixes "insufficient historical volatility data" when Massive is thin.
+        if len(closes) < 20:
+            from hal.sensory import broker
+            alpaca_closes = await asyncio.to_thread(broker.daily_closes, underlying, 260)
+            if len(alpaca_closes) >= 20:
+                closes = alpaca_closes
         if len(closes) < 20:
             return {
-                "error": f"only {len(closes)} daily bars available; need at least 20"
+                "error": f"insufficient daily bars for {underlying} "
+                f"({len(closes)} found; need 20+) — Massive and Alpaca both thin/unavailable"
             }
 
-        # Pick contracts near ATM to estimate current ATM IV. The snapshot
-        # endpoint is paginated; one page (limit=250) is enough since we'll
-        # find ATM strikes regardless.
+        # ATM implied vol still comes from the Massive options snapshot; a failure
+        # here is non-fatal (we return realized-vol context with verdict UNKNOWN).
         underlying_price = closes[-1]
-        atm_lo = underlying_price * 0.95
-        atm_hi = underlying_price * 1.05
-        try:
-            snap = await _get(
-                client,
-                snap_path,
-                {
-                    "strike_price.gte": atm_lo,
-                    "strike_price.lte": atm_hi,
-                    "limit": 250,
-                },
-            )
-        except Exception as e:
-            return {"error": f"snapshot: {type(e).__name__}: {e}"}
+        if API_KEY:
+            atm_lo = underlying_price * 0.95
+            atm_hi = underlying_price * 1.05
+            try:
+                snap = await _get(
+                    client, snap_path,
+                    {"strike_price.gte": atm_lo, "strike_price.lte": atm_hi, "limit": 250},
+                )
+            except Exception as e:
+                print(f"[iv_context] Massive options snapshot unavailable for {underlying}: {e}")
 
     # Realized vol from log returns
     log_returns: list[float] = []
@@ -282,19 +284,30 @@ async def iv_context(underlying: str, atm_window: int = 3) -> dict:
 
     hv10, hv30, hv60, hv90 = _hv(10), _hv(30), _hv(60), _hv(90)
 
-    # Pick the N closest-to-ATM contracts with valid IV; average their IV.
-    rows = snap.get("results") or []
-    near_atm: list[tuple[float, float]] = []
-    for r in rows:
+    # Normalize ATM IV contracts to {strike, iv, expiration} from whichever source
+    # is available: the Massive snapshot first, else Alpaca's option chain (IV
+    # fallback). The selection below then runs identically on either source.
+    iv_rows: list[dict] = []
+    for r in (snap.get("results") or []):
         details = r.get("details") or {}
         strike = details.get("strike_price")
         iv = r.get("implied_volatility")
-        if strike is None or iv is None or iv <= 0:
-            continue
-        dte = _dte(details.get("expiration_date") or "")
+        if strike is not None and iv and iv > 0:
+            iv_rows.append({"strike": strike, "iv": iv,
+                            "expiration": details.get("expiration_date") or ""})
+    if not iv_rows:
+        from hal.sensory import broker
+        iv_rows = await asyncio.to_thread(
+            broker.option_iv_chain, underlying,
+            underlying_price * 0.95, underlying_price * 1.05)
+
+    # Pick the N closest-to-ATM contracts with valid IV (5–60 DTE); average their IV.
+    near_atm: list[tuple[float, float]] = []
+    for row in iv_rows:
+        dte = _dte(row.get("expiration") or "")
         if dte is None or dte < 5 or dte > 60:
             continue
-        near_atm.append((abs(strike - underlying_price), iv))
+        near_atm.append((abs(row["strike"] - underlying_price), row["iv"]))
     near_atm.sort(key=lambda x: x[0])
     atm_ivs = [iv for _, iv in near_atm[: max(atm_window * 2, 4)]]
     atm_iv = sum(atm_ivs) / len(atm_ivs) if atm_ivs else None

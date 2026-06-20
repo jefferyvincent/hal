@@ -40,7 +40,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 
@@ -53,6 +53,24 @@ from hal.brainstem.config import (
 from hal.cortex import analysis
 from hal.cerebellum import option_strategy
 from hal.cortex.rules import check_trade
+
+# Optional progress callback: (step, summary, detail) -> awaitable. Lets a caller
+# (the server) surface each committee step as its own telemetry / cognition event
+# as it happens. None = silent — e.g. the backtest harness, which wants only the
+# final verdict.
+Emit = Optional[Callable[[str, str, str], Awaitable[None]]]
+
+
+async def _emit(emit: Emit, step: str, summary: str, detail: str) -> None:
+    """Fire a progress event, swallowing any callback error (never block the
+    committee on a UI hiccup)."""
+    if not emit:
+        return
+    try:
+        await emit(step, summary, detail)
+    except Exception as e:
+        print(f"[committee] emit failed ({step}): {e}")
+
 
 # Horizon → days-to-expiration window for the chain screen. Keeps the setup
 # analyst looking at contracts that match the intended holding period.
@@ -145,11 +163,15 @@ _CATALYST_SYS = (
 
 def _summarize_vol(iv: dict) -> str:
     if not iv or iv.get("error"):
-        return "No vol data available."
+        return f"No vol data available ({(iv or {}).get('error', 'none')})."
+    # Include the realized-vol (HV) ladder so the analyst can read the regime even
+    # when ATM implied vol is unavailable (e.g. options snapshot down).
+    hv = (f"hv10={iv.get('hv10')} hv30={iv.get('hv30')} "
+          f"hv60={iv.get('hv60')} hv90={iv.get('hv90')}")
     return (
         f"underlying={iv.get('underlying')} price={iv.get('underlying_price')} "
         f"atm_iv={iv.get('atm_iv')} iv/hv30={iv.get('iv_over_hv30')} "
-        f"verdict={iv.get('verdict')} ({iv.get('interpretation')})"
+        f"verdict={iv.get('verdict')} ({iv.get('interpretation')}); realized: {hv}"
     )
 
 
@@ -262,6 +284,8 @@ _JUDGE_SYS = (
     "bear case, lessons from past trades, and the available option structures. "
     "Make ONE decision. Defined-risk only — never naked short options. If the "
     "bear case is not clearly beaten, PASS; passing is a valid, common answer. "
+    "If an existing position in the name is shown, factor it in — decide whether "
+    "to add, hold, trim, or stand aside, and don't over-concentrate. "
     "Reply ONLY as JSON: "
     '{"decision":"TRADE|PASS","side":"call|put|neutral","structure":"<label '
     'from the provided list>","conviction":"high|medium|low","thesis":"one '
@@ -295,22 +319,74 @@ def _consensus_bias(analysts: list[dict]) -> str:
     return "bullish" if score > 0.3 else "bearish" if score < -0.3 else "neutral"
 
 
+# Conviction → weight for the 0-100 committee score.
+_CONV_W = {"high": 1.0, "medium": 0.6, "low": 0.3}
+
+
+def _committee_score(*, decision: str, conviction: str, bias: str,
+                     analysts: list[dict], rules_passed: bool) -> int:
+    """A single 0-100 conviction-to-trade score. Blends the judge's conviction
+    with how strongly the analysts agree on the consensus side, then hard-caps it
+    when the desk passed or the rules gate blocked it — so a high number always
+    means 'green light to trade', never just 'the model sounded confident'."""
+    conv = _CONV_W.get(conviction, 0.3)
+    if bias in ("bullish", "bearish") and analysts:
+        agree = sum(a["confidence"] for a in analysts if a["lean"] == bias) / len(analysts)
+    else:
+        agree = 0.0
+    score = round((0.55 * conv + 0.45 * min(1.0, agree)) * 100)
+    if decision != "TRADE":
+        score = min(score, 40)   # a PASS must never read as a green light
+    if not rules_passed:
+        score = min(score, 20)   # a rules-blocked trade is a hard no
+    return max(0, min(100, score))
+
+
+def _score_band(score: int) -> str:
+    return ("strong" if score >= 70 else "moderate" if score >= 50
+            else "weak" if score >= 30 else "avoid")
+
+
+def _format_positions(positions: list[dict]) -> str:
+    """Compact one-line-per-leg view of existing holdings in the name."""
+    lines = []
+    for p in positions or []:
+        qty = p.get("qty")
+        pl = p.get("unrealized_pl")
+        plpc = p.get("unrealized_plpc")
+        pl_s = (f"{'+' if (pl or 0) >= 0 else ''}{pl:.0f}" if isinstance(pl, (int, float)) else "?")
+        pct_s = (f"{plpc * 100:+.1f}%" if isinstance(plpc, (int, float)) else "")
+        lines.append(
+            f"{p.get('symbol')} {qty} @ {p.get('avg_entry_price')} → "
+            f"{p.get('current_price')} (P&L ${pl_s} {pct_s})".strip())
+    return "\n".join(lines)
+
+
 async def run_committee(
     symbol: str,
     *,
     horizon: str = "swing",
     account_size: float = 0.0,
+    emit: Emit = None,
+    open_positions: Optional[list[dict]] = None,
 ) -> dict:
     """Run the full committee on `symbol` and return a structured verdict.
 
     Pure analysis — places no orders, pushes nothing to the UI. Safe to call
     repeatedly (e.g. from a backtest harness comparing it to build_trade_reco).
+    Pass `emit` to stream each step (analysts → consensus → debate → judge →
+    rules gate) as its own progress event.
     """
     symbol = symbol.upper().strip()
 
     # 1. Analysts (evidence + reads), concurrently.
     analysts = await _gather_analysts(symbol, horizon)
     bias = _consensus_bias(analysts)
+    for a in analysts:
+        await _emit(emit, f"analyst.{a['role']}",
+                    f"{a['role']}: {a['lean']} ({a['confidence']:.0%})", a["note"])
+    await _emit(emit, "consensus", f"consensus bias: {bias}",
+                f"Weighted analyst leans → {bias}.")
 
     # 2. Candidate structures for that bias × vol regime (deterministic).
     vol_read = next((a for a in analysts if a["role"] == "vol"), {})
@@ -321,11 +397,18 @@ async def run_committee(
     # 3. Reflection: realized outcomes from past closed trades like this.
     reflection = await _journal(
         symbol, query=f"{symbol} {bias} {' '.join(structures[:2])}", status="closed", k=4)
+    if reflection:
+        await _emit(emit, "reflection", "past closed trades", reflection)
+
+    if open_positions:
+        await _emit(emit, "position", f"holds {len(open_positions)} leg(s) in {symbol}",
+                    _format_positions(open_positions))
 
     # 4-5. Debate → judge → deterministic rules gate.
     return await decide_from_evidence(
         symbol, analysts=analysts, structures=structures, iv_level=iv_level,
-        bias=bias, reflection=reflection, account_size=account_size, horizon=horizon)
+        bias=bias, reflection=reflection, account_size=account_size,
+        horizon=horizon, emit=emit, open_positions=open_positions)
 
 
 def candidate_structures(symbol: str, bias: str, iv_level: str) -> list[str]:
@@ -346,24 +429,36 @@ async def decide_from_evidence(
     reflection: str = "",
     account_size: float = 0.0,
     horizon: str = "swing",
+    emit: Emit = None,
+    open_positions: Optional[list[dict]] = None,
 ) -> dict:
     """The reasoning core: bull/bear debate → judge → deterministic rules gate →
     verdict. Deliberately separated from evidence-gathering so the backtest can
     drive it with point-in-time RECONSTRUCTED evidence instead of live tool
-    calls — same reasoning, swappable inputs."""
+    calls — same reasoning, swappable inputs. `emit` streams each step;
+    `open_positions` (already filtered to this name) lets the desk see what's
+    already on and decide to add / hold / trim / stand aside."""
     analyst_block = "\n".join(f"- {a['role']}: lean={a['lean']} conf={a['confidence']:.2f} :: {a['note']}"
                               for a in analysts)
+    position_block = _format_positions(open_positions)
     brief = (
         f"Symbol: {symbol}  | horizon: {horizon}  | consensus bias: {bias}  | vol: {iv_level}\n"
         f"Analyst reads:\n{analyst_block}\n"
         f"Available structures: {', '.join(structures) or 'none'}\n"
         f"Past trade lessons:\n{reflection or '(none on record)'}"
+        + (f"\nALREADY HELD in {symbol} (decide add/hold/trim/stand-aside, don't "
+           f"over-concentrate):\n{position_block}" if position_block else "")
     )
     debate = await _debate(brief)
+    await _emit(emit, "debate.bull", "bull case", debate["bull"])
+    await _emit(emit, "debate.bear", "bear case", debate["bear"])
     judge = await _judge(
         brief + f"\n\nBULL:\n{debate['bull']}\n\nBEAR:\n{debate['bear']}"
         + (f"\n\nUser's standing rules:\n{TRADING_RULES[:1200]}" if TRADING_RULES.strip() else "")
     )
+    await _emit(emit, "judge",
+                f"judge: {judge['decision']} {judge['side']} {judge['structure']}".strip(),
+                judge["thesis"] or judge["raw"])
 
     # Deterministic rules gate has the final word (cannot be talked out of a
     # PASS). Backstop only — account caps skip without a dollar risk estimate.
@@ -377,11 +472,22 @@ async def decide_from_evidence(
     decision = judge["decision"]
     if decision == "TRADE" and not gate["passed"]:
         decision = "PASS"
+    await _emit(emit, "rules_gate",
+                f"rules gate {'passed' if gate['passed'] else 'failed'} → {decision}",
+                "passed" if gate["passed"] else "FAILED: " + "; ".join(gate["failures"]))
+
+    score = _committee_score(decision=decision, conviction=judge["conviction"],
+                             bias=bias, analysts=analysts, rules_passed=gate["passed"])
+    band = _score_band(score)
+    await _emit(emit, "score", f"{decision} · {score}/100 ({band})",
+                f"Committee conviction score: {score}/100 — {band}.")
 
     verdict = {
         "symbol": symbol,
         "horizon": horizon,
         "decision": decision,
+        "score": score,
+        "score_band": band,
         "conviction": judge["conviction"],
         "bias": bias,
         "iv_level": iv_level,
@@ -396,6 +502,7 @@ async def decide_from_evidence(
         "debate": debate,
         "reflection": reflection,
         "candidate_structures": structures,
+        "open_positions": open_positions or [],
     }
     verdict["markdown"] = _render_markdown(verdict)
     return verdict
@@ -410,15 +517,23 @@ def _verdict_from(vol_read: dict) -> str:
 
 def _render_markdown(v: dict) -> str:
     """Human-facing summary — the body of a Trade Idea (or a documented PASS)."""
-    head = f"**Committee: {v['symbol']} — {v['decision']}**"
-    if v["decision"] == "TRADE":
-        head += f" ({v['conviction']} conviction)"
+    light = "🟢" if v["decision"] == "TRADE" else "🔴"
+    score = v.get("score")
+    band = v.get("score_band", "")
+    head = (f"### {light} {v['decision']} — {v['symbol']}"
+            + (f"  ·  score {score}/100 ({band})" if score is not None else ""))
     lines = [
         head,
         "",
+        f"- **Recommendation: {'PUT ON THE TRADE' if v['decision'] == 'TRADE' else 'DO NOT TRADE'}**"
+        + (f" — {v['conviction']} conviction" if v["decision"] == "TRADE" else ""),
         f"- Bias: {v['bias']} · Vol: {v['iv_level']} · Side: {v['side']}"
         + (f" · Structure: {v['structure']}" if v["structure"] else ""),
     ]
+    if v.get("open_positions"):
+        lines.append(f"- 📌 Already open in {v['symbol']}:")
+        for ln in _format_positions(v["open_positions"]).split("\n"):
+            lines.append(f"    - {ln}")
     if v["thesis"]:
         lines.append(f"- Thesis: {v['thesis']}")
     if v["invalidation"]:

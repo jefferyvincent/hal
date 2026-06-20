@@ -29,6 +29,9 @@ from typing import Any, Optional
 
 import httpx
 
+from hal.cerebellum import strategy
+from hal.cerebellum.execution import SimBroker
+
 
 BASE_URL: str = ""
 API_KEY: str = ""
@@ -36,8 +39,10 @@ API_KEY: str = ""
 # Strategy constants (named, not magic — see CLAUDE.md).
 RSI_PERIOD = 14
 PIVOT_K = 5                 # fractal half-window for swing pivots
-TAKE_PROFIT = 0.50         # +50% of premium
-STOP_LOSS = 0.50           # -50% of premium
+# Exit policy (stop / take-profit %) now comes from the vault trading-rules via
+# strategy.exit_levels(), so the backtest validates the SAME exit the live trader
+# runs. strategy._FALLBACK_*_PCT supplies the historical ±50% only if the vault
+# defines none.
 TARGET_DTE = 7             # aim for the nearest weekly
 DTE_MIN, DTE_MAX = 3, 12   # acceptable expiry window around TARGET_DTE
 CONTRACT_MULTIPLIER = 100  # shares per option contract
@@ -334,43 +339,59 @@ def _entry_premium(bar: dict) -> Optional[float]:
 
 def simulate_trade(
     side: str, opt_bars: list[dict], next_opp_index_date: Optional[str],
+    symbol: str = "OPT", sim: Optional[SimBroker] = None,
+    rules: Optional[dict] = None,
 ) -> Optional[dict]:
     """Walk an option's daily bars from entry to exit.
 
     Entry = first bar's close. Exit, in priority order each subsequent bar:
-      1) take-profit: close >= entry*(1+TAKE_PROFIT)
-      2) stop-loss:   close <= entry*(1-STOP_LOSS)
+      1) take-profit / 2) stop-loss at the vault-configured premium levels
+         (strategy.exit_levels — same policy the live trader runs; pass a loaded
+         `rules` dict to avoid re-reading the vault per trade)
       3) opposite signal date reached (caller passes it; handled upstream)
       4) last available bar (expiry week)
-    Long options only, so P&L = (exit - entry) * 100 - commissions (both sides).
-    Returns a trade dict or None if no usable bars.
+
+    The entry and exit are constructed via the SAME broker.prepare_order used for
+    live Alpaca orders and filled through the shared SimBroker (execution.py), so
+    P&L (= (exit - entry) * 100 - commissions both sides) comes from the same
+    order/fill path the live trader runs. Long options only. Pass a shared `sim`
+    to accumulate fills across trades; the default fresh sim scores one round
+    trip. Returns a trade dict or None if no usable bars.
     """
     bars = [b for b in opt_bars if _entry_premium(b) is not None]
     if len(bars) < 2:
         return None
     entry = bars[0]["c"]
-    tp = entry * (1 + TAKE_PROFIT)
-    sl = entry * (1 - STOP_LOSS)
+    sl, tp = strategy.exit_levels(entry, rules)
     exit_px = bars[-1]["c"]
     exit_reason = "expiry"
     exit_t = bars[-1]["t"]
     for b in bars[1:]:
-        px = b["c"]
-        if px >= tp:
+        # Same exit rule the live bracket monitor runs (strategy.exit_signal).
+        kind = strategy.exit_signal(b["c"], sl, tp)
+        if kind == "take_profit":
             exit_px, exit_reason, exit_t = tp, "take_profit", b["t"]
             break
-        if px <= sl:
+        if kind == "stop":
             exit_px, exit_reason, exit_t = sl, "stop_loss", b["t"]
             break
-    gross = (exit_px - entry) * CONTRACT_MULTIPLIER
-    net = gross - 2 * COMMISSION_PER_CONTRACT
+
+    sim = sim or SimBroker(CONTRACT_MULTIPLIER, COMMISSION_PER_CONTRACT)
+    realized_before = sim.realized_pnl
+    # Build entry/exit via the shared OrderIntent → broker.prepare_order path,
+    # then fill through SimBroker — the same construction the live trader uses.
+    sim.set_price(symbol, entry)
+    sim.submit_order(strategy.OrderIntent(side="buy", qty=1, symbol=symbol).to_spec())
+    sim.set_price(symbol, exit_px)
+    sim.submit_order(strategy.OrderIntent(side="sell", qty=1, symbol=symbol).to_spec())
+    net = round(sim.realized_pnl - realized_before, 2)
     return {
         "side": side,
         "entry_premium": round(entry, 4),
         "exit_premium": round(exit_px, 4),
         "exit_reason": exit_reason,
         "exit_t": exit_t,
-        "pnl": round(net, 2),
+        "pnl": net,
         "pnl_pct": round((exit_px - entry) / entry, 4),
         "bars_held": len(bars),
     }
@@ -397,15 +418,33 @@ def compute_metrics(trades: list[dict]) -> dict:
         peak = max(peak, cum)
         max_dd = max(max_dd, peak - cum)
         equity.append({"t": t["exit_t"], "value": round(cum, 2)})
+
+    # --- Tearsheet stats (nautilus PortfolioAnalyzer spirit) ----------------
+    # Per-trade, NOT annualized: trades aren't time-uniform, so annualizing a
+    # per-trade Sharpe would invent a cadence the data doesn't have. Read these
+    # as the distribution shape of one-contract trade P&L.
+    n = len(trades)
+    mean = sum(pnls) / n
+    std = math.sqrt(sum((p - mean) ** 2 for p in pnls) / n)
+    downside = math.sqrt(sum(min(p, 0.0) ** 2 for p in pnls) / n)
+    avg_win = round(gross_win / len(wins), 2) if wins else 0.0
+    avg_loss = round(sum(losses) / len(losses), 2) if losses else 0.0  # negative
     return {
         "trades": len(trades),
         "wins": len(wins),
         "losses": len(losses),
         "win_rate": round(len(wins) / len(trades), 4),
         "total_pnl": round(sum(pnls), 2),
-        "avg_pnl": round(sum(pnls) / len(trades), 2),
+        "avg_pnl": round(mean, 2),
         "profit_factor": round(gross_win / gross_loss, 2) if gross_loss > 0 else None,
         "max_drawdown": round(max_dd, 2),
+        "max_drawdown_pct": round(max_dd / peak, 4) if peak > 0 else None,  # give-back of peak cumulative P&L
+        "expectancy": round(mean, 2),  # avg $ per trade
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "payoff_ratio": round(avg_win / abs(avg_loss), 2) if avg_loss < 0 else None,
+        "sharpe_per_trade": round(mean / std, 3) if std > 0 else None,
+        "sortino_per_trade": round(mean / downside, 3) if downside > 0 else None,
         "best": round(max(pnls), 2),
         "worst": round(min(pnls), 2),
         "equity": equity,
@@ -464,6 +503,13 @@ async def run_backtest(underlying: str = "SPY", months: int = 24) -> dict:
             raise RuntimeError(f"only {len(bars)} daily bars for {underlying}; need 60+")
         signals = generate_signals(bars)
 
+        # Load the vault exit policy ONCE and reuse it for every trade so the
+        # backtest exits exactly where the live trader would (same stop/TP %).
+        from hal.cortex import rules as _rules
+        exit_rules = _rules.load_rules()
+        stop_pct = exit_rules.get("stop_loss_pct", 50)
+        tp_pct = exit_rules.get("take_profit_pct", 50)
+
         trades: list[dict] = []
         for sig in signals:
             entry = date.fromisoformat(sig["date"])
@@ -471,7 +517,8 @@ async def run_backtest(underlying: str = "SPY", months: int = 24) -> dict:
             if not contract:
                 continue
             opt_bars = await fetch_daily(client, contract["ticker"], entry.isoformat(), contract["expiration"])
-            trade = simulate_trade(sig["side"], opt_bars, None)
+            trade = simulate_trade(sig["side"], opt_bars, None,
+                                   symbol=contract["ticker"], rules=exit_rules)
             if not trade:
                 continue
             trade.update({
@@ -490,7 +537,8 @@ async def run_backtest(underlying: str = "SPY", months: int = 24) -> dict:
         "underlying": underlying,
         "proxy_note": proxy_note,
         "months": months,
-        "strategy": "long single (S/R break + RSI), ATM ~7DTE, +50%/-50% exit",
+        "strategy": (f"long single (S/R break + RSI), ATM ~7DTE, "
+                     f"+{tp_pct:g}%/-{stop_pct:g}% exit (vault rules)"),
         "signals_found": len(signals),
         "metrics": metrics,
         "by_regime": split_by_regime(trades),
@@ -530,6 +578,10 @@ def speak_summary(result: dict) -> str:
     ]
     if m.get("profit_factor") is not None:
         parts.append(f"Profit factor {m['profit_factor']}.")
+    if m.get("payoff_ratio") is not None:
+        parts.append(f"Payoff ratio {m['payoff_ratio']} to one.")
+    if m.get("sharpe_per_trade") is not None:
+        parts.append(f"Per-trade Sharpe {m['sharpe_per_trade']}.")
     parts.append(f"Max drawdown {m['max_drawdown']:.0f} dollars.")
     reg = result.get("by_regime") or {}
     if reg:

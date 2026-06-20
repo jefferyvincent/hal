@@ -153,12 +153,52 @@ def _init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_broker_orders_submitted
                 ON broker_orders(submitted_at DESC);
+            CREATE TABLE IF NOT EXISTS managed_exits (
+                symbol      TEXT PRIMARY KEY,
+                underlying  TEXT,
+                qty         TEXT,
+                stop_price  REAL,
+                tp_price    REAL,
+                created_at  REAL NOT NULL
+            );
             """
         )
 
 
 _init_db()
 print(f"[boot] DB: {DB_PATH}")
+
+
+def arm_managed_exit(symbol: str, underlying: str, qty, stop_price: float,
+                     tp_price: float) -> None:
+    """Register/replace a HAL-managed exit for an option position. `symbol` is
+    the OCC option symbol Alpaca reports in positions."""
+    with _db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO managed_exits "
+            "(symbol, underlying, qty, stop_price, tp_price, created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (symbol.upper(), (underlying or "").upper(), str(qty),
+             float(stop_price or 0), float(tp_price or 0), time.time()),
+        )
+
+
+def disarm_managed_exit(key: str) -> None:
+    """Remove a managed exit by OCC symbol or underlying (so a panel close on
+    the underlying clears its option exit too)."""
+    k = (key or "").upper()
+    with _db() as conn:
+        conn.execute(
+            "DELETE FROM managed_exits WHERE symbol=? OR underlying=?", (k, k))
+
+
+def list_managed_exits() -> list[dict]:
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT symbol, underlying, qty, stop_price, tp_price, created_at "
+            "FROM managed_exits"
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def log_broker_order(spec: dict, result: dict, mode: str, paper: bool) -> None:

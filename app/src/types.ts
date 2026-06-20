@@ -19,6 +19,10 @@ export interface TelemetryEvent {
   status?: "ok" | "error" | "declined" | string;
   input?: string;
   output?: string;
+  /** Which actor produced this event — drives the Cognition view's source lanes. */
+  source?: "hal" | "committee" | "broker" | "human" | "risk" | string;
+  /** Epoch milliseconds when the server emitted it. */
+  ts?: number;
 }
 
 export interface Attachment {
@@ -69,6 +73,8 @@ export interface ServerEnvelope {
   news_articles?: NewsArticle[];
   /** A trade idea / hold read to pin in the Trade Ideas pane. */
   trade_idea?: TradeIdea;
+  /** Result of a "Place it" button click, so its button can flip placed/failed. */
+  trade_placed?: { id: string; ok: boolean };
   /** Live brokerage view (reply to positions_refresh / position_close). */
   positions?: BrokerPosition[];
   broker_account?: BrokerAccount | null;
@@ -76,6 +82,31 @@ export interface ServerEnvelope {
   broker_paper?: boolean;
   trade_mode?: string; // "confirm" | "autopilot"
   positions_error?: string | null;
+  risk?: RiskStatus;
+  /** Live committee-run progress for the Cognition view's completion bar. */
+  committee_status?: CommitteeStatus;
+}
+
+/** Progress of an in-flight committee run, streamed per desk step. */
+export interface CommitteeStatus {
+  active: boolean;
+  fraction?: number; // 0..1 completion
+  label?: string; // current stage, e.g. "Bull researcher"
+  symbol?: string;
+}
+
+/** Pre-trade risk engine snapshot, from sensory.risk.status(). */
+export interface RiskStatus {
+  killed: boolean;
+  kill_reason: string;
+  orders_last_min: number;
+  baseline_equity: number | null;
+  limits: {
+    max_orders_per_min: number;
+    max_open_positions: number;
+    max_gross_exposure_pct: number;
+    daily_loss_limit_pct: number;
+  };
 }
 
 /** An open brokerage position (Alpaca), as shaped by broker.list_positions. */
@@ -113,6 +144,9 @@ export interface TradeIdea {
   /** Markdown body (the same table/read shown in chat). */
   markdown: string;
   ts: number; // unix seconds
+  /** True when Alpaca is live and HAL staged this exact order — a "Place it"
+   *  button can submit it directly (no speech). */
+  placeable?: boolean;
 }
 
 export type ImmersiveSource = "off" | "camera" | "screen" | "map" | "video" | "chart" | "backtest" | "watchlist" | "trade_ideas";

@@ -30,6 +30,22 @@ function qtyLabel(p: BrokerPosition): string {
   return `${p.side.toUpperCase()} ${p.qty} ${unit}`;
 }
 
+// OCC option symbol = underlying + YYMMDD + C/P + strike×1000 (8 digits),
+// e.g. "QQQ260626P00719000". Pull out call/put + strike + expiry for a chip.
+const OCC_RE = /^(.+?)(\d{2})(\d{2})(\d{2})([CP])(\d{8})$/;
+function parseOption(
+  symbol: string,
+): { type: "C" | "P"; strike: number; expiry: string } | null {
+  const m = OCC_RE.exec(symbol);
+  if (!m) return null;
+  const [, , yy, mm, dd, cp, strike] = m;
+  return {
+    type: cp as "C" | "P",
+    strike: Number(strike) / 1000,
+    expiry: `${Number(mm)}/${Number(dd)}/${yy}`, // M/D/YY
+  };
+}
+
 function clampScale(v: number): number {
   return Math.round(Math.min(SCALE_MAX, Math.max(SCALE_MIN, v)) * 100) / 100;
 }
@@ -48,6 +64,7 @@ export default function PositionsPanel() {
   const error = useConnection((s) => s.positionsError);
   const refresh = useConnection((s) => s.refreshPositions);
   const closePosition = useConnection((s) => s.closePosition);
+  const scalePosition = useConnection((s) => s.scalePosition);
 
   // Two-click confirm so a close is always deliberate.
   const [confirming, setConfirming] = useState<string | null>(null);
@@ -204,10 +221,28 @@ export default function PositionsPanel() {
                   className="flex items-center justify-between gap-3 border-b border-hal-red/10 px-3 py-2.5"
                 >
                   <div className="min-w-0 flex-1">
-                    <div className="flex items-baseline gap-2">
+                    <div className="flex items-center gap-2">
                       <span className="truncate text-[1.05em] font-bold text-hal-text">
                         {p.symbol}
                       </span>
+                      {(() => {
+                        const opt = parseOption(p.symbol);
+                        if (!opt) return null;
+                        const isCall = opt.type === "C";
+                        return (
+                          <span
+                            className={cn(
+                              "shrink-0 border px-1.5 py-0.5 text-[0.66em] font-bold uppercase tracking-[1px]",
+                              isCall
+                                ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-300"
+                                : "border-hal-red/50 bg-hal-red/10 text-hal-red-glow",
+                            )}
+                          >
+                            {opt.strike}
+                            {isCall ? " Call" : " Put"} · {opt.expiry}
+                          </span>
+                        );
+                      })()}
                       <span className="text-[0.72em] uppercase tracking-[1px] text-hal-text-dim">
                         {qtyLabel(p)}
                       </span>
@@ -218,7 +253,7 @@ export default function PositionsPanel() {
                     </div>
                   </div>
 
-                  <div className="min-w-[7em] shrink-0 text-right">
+                  <div className="min-w-[6em] shrink-0 text-right">
                     <div
                       className={cn(
                         "text-[1.05em] font-bold",
@@ -237,6 +272,8 @@ export default function PositionsPanel() {
                       {pct(p.unrealized_plpc)}
                     </div>
                   </div>
+
+                  <ScaleControls p={p} onScale={scalePosition} />
 
                   {confirming === p.symbol ? (
                     <div className="flex shrink-0 items-center gap-1">
@@ -272,9 +309,75 @@ export default function PositionsPanel() {
         </div>
 
         <footer className="border-t border-hal-red/15 px-3 py-2 text-[8px] uppercase tracking-[2px] text-hal-text-dim">
-          Manual close submits a market order immediately — overrides HAL.
+          Add / Trim / Close submit market orders immediately — overrides HAL.
         </footer>
       </aside>
+    </div>
+  );
+}
+
+// Per-position scale controls: a quantity stepper plus Add (buy more) and Trim
+// (sell some) — both fire a market order immediately. Trim is capped at the
+// held size; Add is bounded only by buying power (Alpaca rejects if short).
+function ScaleControls({
+  p,
+  onScale,
+}: {
+  p: BrokerPosition;
+  onScale: (symbol: string, delta: number) => void;
+}) {
+  const [qty, setQty] = useState(1);
+  const held = Math.abs(Number(p.qty)) || 0;
+  return (
+    <div className="flex shrink-0 items-center gap-1">
+      <div className="flex items-center border border-hal-text-dim/25">
+        <button
+          type="button"
+          onClick={() => setQty((q) => Math.max(1, q - 1))}
+          className="px-1.5 text-[0.85em] leading-none text-hal-text-dim hover:text-hal-text"
+        >
+          −
+        </button>
+        <input
+          type="number"
+          min={1}
+          value={qty}
+          onChange={(e) => setQty(Math.max(1, Math.floor(Number(e.target.value) || 1)))}
+          className="w-7 bg-transparent text-center text-[0.72em] text-hal-text outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none"
+        />
+        <button
+          type="button"
+          onClick={() => setQty((q) => q + 1)}
+          className="px-1.5 text-[0.85em] leading-none text-hal-text-dim hover:text-hal-text"
+        >
+          +
+        </button>
+      </div>
+      <button
+        type="button"
+        onClick={() => setQty(Math.max(1, held))}
+        title="Use the full position"
+        className="text-[0.62em] uppercase tracking-[1px] text-hal-text-dim hover:text-hal-text"
+      >
+        of {held}
+      </button>
+      <button
+        type="button"
+        onClick={() => onScale(p.symbol, qty)}
+        title={`Buy ${qty} more at market`}
+        className="border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-[0.72em] uppercase tracking-[1px] text-emerald-300 hover:bg-emerald-500/20"
+      >
+        + Add
+      </button>
+      <button
+        type="button"
+        onClick={() => onScale(p.symbol, -Math.min(qty, held))}
+        disabled={held === 0}
+        title={`Sell ${Math.min(qty, held)} at market`}
+        className="border border-hal-amber/40 bg-hal-amber/10 px-2 py-1 text-[0.72em] uppercase tracking-[1px] text-hal-amber hover:bg-hal-amber/20 disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        − Trim
+      </button>
     </div>
   );
 }

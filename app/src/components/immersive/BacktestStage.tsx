@@ -90,6 +90,7 @@ export default function BacktestStage() {
     typeof v === "number"
       ? v.toLocaleString(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 0 })
       : "—";
+  const fmtNum = (v: unknown) => (typeof v === "number" ? String(v) : "—");
 
   const noCurve = !bt.equity || bt.equity.length === 0;
 
@@ -124,6 +125,16 @@ export default function BacktestStage() {
           />
           <Stat label="Profit factor" value={m.profit_factor == null ? "—" : String(m.profit_factor)} />
           <Stat label="Max DD" value={fmtUsd(m.max_drawdown)} color={DOWN} />
+        </div>
+        {/* Tearsheet row (nautilus PortfolioAnalyzer spirit) — per-trade, not
+            annualized. Drawdown % is give-back of peak cumulative P&L. */}
+        <div className="mt-0.5 flex flex-wrap gap-x-4 gap-y-0.5">
+          <Stat label="Sharpe (per trade)" value={fmtNum(m.sharpe_per_trade)} />
+          <Stat label="Sortino" value={fmtNum(m.sortino_per_trade)} />
+          <Stat label="Payoff" value={m.payoff_ratio == null ? "—" : `${m.payoff_ratio}:1`} />
+          <Stat label="Expectancy" value={fmtUsd(m.expectancy)} color={Number(m.expectancy ?? 0) >= 0 ? UP : DOWN} />
+          <Stat label="Max DD %" value={fmtPct(m.max_drawdown_pct)} color={DOWN} />
+          <Stat label="Avg win / loss" value={`${fmtUsd(m.avg_win)} / ${fmtUsd(m.avg_loss)}`} />
         </div>
         {bt.by_regime && Object.keys(bt.by_regime).length > 0 ? (
           <div className="mt-1 flex flex-wrap gap-x-4 text-[10px] text-hal-text-dim">

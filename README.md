@@ -29,7 +29,6 @@ Two completely decoupled processes:
 hal-voice/
   server.py            FastAPI server, all AI logic
   start-hal.sh         Linux/macOS launcher: activates .venv, runs server.py, logs to hal.log
-  start-hal.ps1        Windows launcher (same job, PowerShell)
   static/              Legacy single-file UI (still served as a fallback)
   app/                 Tauri 2 + React + Vite frontend (current UI)
     src/               React components, stores, lib
@@ -209,6 +208,14 @@ via `tauri-plugin-global-shortcut`. Works even when the window is hidden.
   video as backdrop, with a "live cognition" overlay of HAL's tool calls.
 - Conversations: switch / delete / new. Opened from the HUD's `CHATS` button.
 - Telemetry panel: rolling log of tool calls (right edge, expandable).
+- **Cognition view (`MIND` button):** a full-screen, JARVIS-style map of HAL's
+  whole decision process. Each step is a floating 3D card in its actor's lane —
+  **Human / HAL / Committee / Broker / Risk** — chained in time by glowing
+  "pipes" with a pulse that carries your question from one actor to the next.
+  A committee deep-dive streams as per-step cards (analysts → consensus →
+  bull/bear → judge → rules gate), and opening it auto-triggers when the
+  committee convenes. Click any card to **zoom in** (wheel / `+` `−` / Esc) for
+  its full input/output; the newest card shimmers while HAL is mid-thought.
 - Fast / smart model toggle (lightning bolt).
 - Wipe memory (trash icon).
 - Stop button (interrupt speech/generation).
@@ -226,8 +233,10 @@ hits real money until you set it `false`). Orders go through a gate:
 
 - **Confirm mode (default):** an order is *staged*, not sent. HAL reads it back;
   you then say **"yes / send it / confirm"** to fire it, or **"cancel that"** to drop it.
-- **Autopilot mode:** orders submit immediately once they pass your rules.
-  Say **"turn on autopilot"** / **"go back to confirming"** to switch.
+- **Autopilot mode:** orders submit immediately once they pass your rules **and the
+  risk circuit breakers** (below). Switch by voice (**"turn on autopilot"** /
+  **"go back to confirming"**) or with the **TRADER** toggle in the HUD (shows
+  **MANUAL**, glows amber as **AUTOPILOT**).
 
 | Say something like… | What it does |
 | --- | --- |
@@ -236,17 +245,72 @@ hits real money until you set it `false`). Orders go through a gate:
 | "Cancel that" / "Never mind" | Discards a staged, unsent order (`cancel_pending_order`) |
 | "Turn on autopilot" / "Go back to confirming" | Flips the order gate (`set_trade_mode`) |
 | "What's my account / buying power?" | Alpaca account snapshot (`get_account`) |
-| "What am I holding?" / "How are my positions?" | Open positions + P&L (`list_positions`) |
+| "What am I holding?" / "How are my positions?" / "What's my P&L?" | Live positions + P&L, read **straight from Alpaca** (deterministic route — HAL answers from the real account, never invents holdings) |
 | "What orders are working?" / "Did it fill?" | Working/recent orders (`list_orders`) |
 | "Cancel my AAPL order" | Cancels a live resting order (`cancel_order`) |
 | "Close my AAPL" / "Flatten that" | Submits an offsetting order (gated like any order) |
+| "Are we halted?" / "What are my risk limits?" | Reports the risk circuit breakers + kill-switch state (`manage_risk` status) |
+| "Reset the kill switch" / "Re-enable trading" | Clears a latched daily-loss halt (`manage_risk` reset) |
 
 **Positions panel (UI):** the **POSITIONS** button in the HUD opens a live panel
 (equity, buying power, per-position P&L, PAPER/LIVE + gate badge). The **Close**
 button there is a *manual override* — it sells immediately, bypassing the
-confirm/autopilot gate (two-click confirm so it can't fire by accident).
+confirm/autopilot gate (two-click confirm so it can't fire by accident). Use the
+**A− / A+** control in its header to size the row text (remembered per browser);
+the HUD's **TRADER** button flips the order gate (MANUAL ⇄ AUTOPILOT) from the
+main screen.
 
 `.env` keys: `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ALPACA_PAPER`, `ALPACA_AUTOPILOT`.
+
+### Risk circuit breakers (portfolio-level safety)
+
+A second safety layer in front of **new entries** (exits/closes are never blocked —
+you can always de-risk). This is the runaway guard for autopilot: it caps the whole
+account over time, independent of any single trade's merits. Four checks, each
+disabled by setting its `.env` value to `0`:
+
+- **Order-rate throttle** — at most N entries per rolling minute (`RISK_MAX_ORDERS_PER_MIN`).
+- **Max open positions** — hard cap on concurrent holdings (`RISK_MAX_OPEN_POSITIONS`).
+- **Max gross exposure** — total position value as a % of equity (`RISK_MAX_GROSS_EXPOSURE_PCT`).
+- **Daily-loss kill switch** — once equity drops past the day's floor
+  (`RISK_DAILY_LOSS_LIMIT_PCT`), it **latches**: new entries are blocked and
+  autopilot drops back to confirm until you clear it. Resets automatically next
+  trading day.
+
+The HUD's **RISK** badge shows **ARMED**, and flips to a clickable **HALTED** when
+the kill switch trips (click → confirm → cleared). You can also say **"are we
+halted?"** / **"reset the kill switch."**
+
+`.env` keys: `RISK_MAX_ORDERS_PER_MIN`, `RISK_MAX_OPEN_POSITIONS`,
+`RISK_MAX_GROSS_EXPOSURE_PCT`, `RISK_DAILY_LOSS_LIMIT_PCT` (see `.env.example` for defaults).
+
+### Strategy playbooks (vault `Strategy/` folder)
+
+`Rules/trading-rules.md` is HAL's **global** policy. Drop markdown files in a
+`Strategy/` folder in the vault to define **per-setup playbooks** that override it
+when their conditions match. Each file is one playbook with a fenced ` ```yaml `
+block — `applies_to` conditions plus any parameter overrides:
+
+```yaml
+name: momentum-calls
+applies_to:
+  symbols: [NVDA, AAPL, MSFT]   # any of these tickers
+  bias: [bullish]               # AND a bullish chart bias
+  iv_regime: [low, mid]         # AND non-rich IV (RICH→high, FAIR→mid, CHEAP→low)
+stop_loss_pct: 30               # overrides for this setup
+take_profit_pct: 60
+max_risk_per_trade_pct: 1.0
+```
+
+**Selection is automatic and deterministic:** on each trade idea HAL matches the
+symbol, chart bias, and IV regime against every playbook; the **most specific**
+match (most conditions satisfied) wins, and its parameters override the global
+rules for sizing **and** exits. No match → the global rules stand. A playbook with
+an empty `applies_to` never auto-selects. Only the *numbers* are parsed — the prose
+is for you and HAL's reasoning, never the source of a stop level. Because the whole
+trade path reads one merged rules dict, **backtesting the same setup uses the same
+playbook levels** (single source of truth). Watch the telemetry for a
+`trade.playbook` line when one fires.
 
 ### Multi-agent committee (deep analysis)
 
@@ -264,6 +328,15 @@ The backtest defaults to the **cheap baseline arm (no LLM)** — run that first 
 see if the signals predict direction at all. Add **"the full version"** to also run
 the (slow) LLM arm. It's a *directional proxy*, not options P&L — see the module
 docstrings in `hal/cerebellum/committee_backtest.py` for the honest caveats.
+
+**Strategy backtest panel** (the equity curve HAL shows when it backtests an
+underlying's option strategy, e.g. during a deep analysis): the stats overlay now
+includes a tearsheet row — per-trade **Sharpe / Sortino**, **payoff ratio**,
+**expectancy**, **max-drawdown %**, and **avg win / loss** — alongside win rate and
+profit factor. Its **stop / take-profit exits come from the same vault rules the
+live trader uses** (`stop_loss_pct` / `take_profit_pct` in `Rules/trading-rules.md`),
+so a backtest validates the exit policy you actually run. Edit those percentages and
+both the backtest and live brackets move together.
 
 > The committee and Alpaca tools only work after the venv is rebuilt against
 > Python 3.13 and `alpaca-py` is installed (both handled by `./setup.sh`).
@@ -291,10 +364,17 @@ Key files when something breaks:
 | `server.py` | FastAPI WS server, all model invocation |
 | `start-hal.sh` | Venv activation + server launch (Linux) |
 | `hal/sensory/broker.py` | Alpaca client + confirm/autopilot order gate |
+| `hal/sensory/risk.py` | Pre-trade risk circuit breakers (throttle, exposure, daily-loss kill switch) |
+| `hal/sensory/money.py` | Decimal price/qty precision (venue tick rounding) |
+| `hal/sensory/brackets.py` | HAL-managed option stop/TP exits (synthetic brackets) |
+| `hal/cerebellum/strategy.py` | Shared exit rule + levels + `OrderIntent` (backtest ↔ live single source of truth) |
+| `hal/cerebellum/execution.py` | `Execution` protocol: `SimBroker` (backtest) + `LiveExecution` (live) |
 | `hal/cortex/committee.py` | Multi-agent trade committee (analysts → debate → judge) |
 | `hal/cerebellum/committee_backtest.py` | Committee backtest referee (baseline vs LLM) |
-| `hal/cortex/rules.py` | Deterministic trading-rules gate (`check_trade`) |
+| `hal/cortex/rules.py` | Deterministic trading-rules gate (`check_trade`) + vault exit-policy source |
+| `hal/cortex/strategies.py` | Vault `Strategy/` playbook loader + auto-match selection |
 | `app/src/components/PositionsPanel.tsx` | Live positions UI + manual close override |
+| `app/src/components/CognitionStage.tsx` | Full-screen Cognition view (decision-flow cards + pipes + zoom) |
 | `app/src/App.tsx` | Root layout, autostart hook, immersive thought mirroring |
 | `app/src/lib/ws.ts` | WS client (binary audio + JSON envelopes) |
 | `app/src/lib/audio.ts` | Gap-free WAV chunk playback queue |

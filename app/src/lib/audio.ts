@@ -4,6 +4,11 @@
 
 export class AudioPlayer {
   private ctx: AudioContext | null = null;
+  // Master gain all chunks route through, so mute can silence output without
+  // disturbing the decode/schedule timeline (drain still fires, mode machine
+  // keeps working — HAL "speaks" silently).
+  private gain: GainNode | null = null;
+  private muted = false;
   private nextChunkStart = 0;
   private isPlaying = false;
   private idleTimer: number | null = null;
@@ -27,6 +32,11 @@ export class AudioPlayer {
         (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       this.ctx = new Ctor();
     }
+    if (!this.gain) {
+      this.gain = this.ctx.createGain();
+      this.gain.gain.value = this.muted ? 0 : 1;
+      this.gain.connect(this.ctx.destination);
+    }
     if (this.ctx.state === "suspended") {
       try {
         await this.ctx.resume();
@@ -35,6 +45,17 @@ export class AudioPlayer {
       }
     }
     return this.ctx;
+  }
+
+  /** Silence/unsilence output. Keeps decoding & scheduling so the mode machine
+   *  (which keys off `playing`) is unaffected — only the audible output changes. */
+  setMuted(muted: boolean): void {
+    this.muted = muted;
+    if (this.gain) this.gain.gain.value = muted ? 0 : 1;
+  }
+
+  get isMuted(): boolean {
+    return this.muted;
   }
 
   /** Fire when the last queued chunk has finished playing. */
@@ -65,7 +86,7 @@ export class AudioPlayer {
     if (epoch !== this.epoch) return; // flushed while decoding — drop it
     const source = ctx.createBufferSource();
     source.buffer = audioBuffer;
-    source.connect(ctx.destination);
+    source.connect(this.gain ?? ctx.destination);
     const now = ctx.currentTime;
     const startAt = this.isPlaying ? this.nextChunkStart : now + 0.06;
     source.start(startAt);
@@ -101,6 +122,7 @@ export class AudioPlayer {
     if (this.ctx) {
       this.ctx.close().catch(() => {});
       this.ctx = null;
+      this.gain = null;  // rebuilt on next ensureContext, mute state preserved
     }
   }
 
