@@ -2263,6 +2263,31 @@ def _format_risk_context(risk: dict | None) -> str:
     return lines
 
 
+async def _account_state_directive() -> str:
+    """A short, authoritative grounding line of Jeffery's REAL open positions,
+    read from Alpaca this turn, injected into the model path so HAL can't invent
+    holdings or a position count (the system prompt forbids it, but the model
+    still confabulates without the facts in front of it). '' when the broker
+    isn't configured or the read fails — never block a turn on it."""
+    if not broker.is_ready():
+        return ""
+    try:
+        positions = await asyncio.to_thread(broker.list_positions)
+    except Exception as e:
+        print(f"[turn] account-state grounding read failed: {e}")
+        return ""
+    head = (
+        "\n\n[LIVE ACCOUNT STATE — authoritative, read from Alpaca THIS turn. This "
+        "is the ONLY truth about holdings: never state a different count, never "
+        "invent positions, and never carry over holdings from earlier in the chat. "
+        "For your grounding only — do not volunteer it unless Jeffery asks.]\n"
+    )
+    if not positions:
+        return head + "Open positions: NONE. He is flat."
+    syms = ", ".join((p.get("symbol") or "?") for p in positions)
+    return head + f"Open positions: {len(positions)} total — {syms}."
+
+
 async def _resolve_account_size(risk: dict | None) -> float:
     """The account total HAL sizes trades against. Prefer the live Alpaca equity
     — the integrated broker holds the real balance — and fall back to the
@@ -3467,8 +3492,11 @@ async def agent_loop(
             full_user_content += _format_risk_context(risk_ctx)
         except Exception:
             pass
-        broker = risk.get("broker") if isinstance(risk, dict) else None
-        full_user_content += _format_trade_directive(broker)
+        broker_name = risk.get("broker") if isinstance(risk, dict) else None
+        full_user_content += _format_trade_directive(broker_name)
+    # Ground EVERY model turn (not just trade-ish ones) with the real positions,
+    # so HAL can't narrate or invent holdings / a position count in free-form.
+    full_user_content += await _account_state_directive()
     if text_context:
         full_user_content = f"{full_user_content}\n\n{text_context}".strip()
 

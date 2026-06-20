@@ -306,11 +306,33 @@ max_risk_per_trade_pct: 1.0
 symbol, chart bias, and IV regime against every playbook; the **most specific**
 match (most conditions satisfied) wins, and its parameters override the global
 rules for sizing **and** exits. No match → the global rules stand. A playbook with
-an empty `applies_to` never auto-selects. Only the *numbers* are parsed — the prose
-is for you and HAL's reasoning, never the source of a stop level. Because the whole
-trade path reads one merged rules dict, **backtesting the same setup uses the same
-playbook levels** (single source of truth). Watch the telemetry for a
-`trade.playbook` line when one fires.
+an empty `applies_to` never auto-selects. Because the whole trade path reads one
+merged rules dict, **backtesting the same setup uses the same playbook levels**
+(single source of truth). Watch the telemetry for a `trade.playbook` line when one
+fires.
+
+**Two halves — deterministic numbers + RAG prose:** the ```yaml block is parsed
+*deterministically* (a stop level must never depend on an embedding score), but
+the surrounding prose ("When to use / When NOT to use") lives in the vault, which
+is HAL's RAG corpus — so the playbook's *reasoning* is retrievable when HAL thinks
+about a name, even though its *parameters* are exact. Edit a `Strategy/*.md`, then
+rebuild the RAG index (same as any vault note) to make new prose searchable.
+
+**`applies_to` keys** (a condition matches when the trade's value is in the list;
+all listed conditions must hold): `symbols` (tickers; omit to apply to any),
+`bias` (`bullish`/`bearish`/`neutral`), `iv_regime` (`high`/`mid`/`low`).
+**Override keys** (any omitted falls back to `trading-rules.md`): `stop_loss_pct`,
+`take_profit_pct`, `max_risk_per_trade_pct`, `limit_buffer_pct`, `min_reward_risk`.
+
+**Starter playbooks** ship in the vault's `Strategy/` folder — copy `_TEMPLATE.md`
+to start your own:
+
+| File | Fires when | Does |
+| --- | --- | --- |
+| `_TEMPLATE.md` | never (inert) | documented template to copy |
+| `momentum-calls.md` | bullish AI/semis large-cap, non-rich IV | long calls, wider 30/60 exits |
+| `index-etf-swing.md` | SPY/QQQ/IWM/DIA, directional | tight 20/20 index swing |
+| `high-iv-credit.md` | any name, IV RICH | sell premium (defined-risk credit) |
 
 ### Multi-agent committee (deep analysis)
 
