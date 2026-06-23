@@ -1,0 +1,24 @@
+# Husky pre-commit — runs from the git repo root.
+# 1) Block commits that introduce TypeScript errors.
+# 2) Block commits that strip the author attribution from README.md.
+
+ATTRIBUTION="Created by Jeffery Vincent"
+
+# --- 1. TypeScript type check (project lives in app/) ---------------------
+echo "▶ Type-checking app/ …"
+if ! ( cd app && npx tsc -b ); then
+  echo "✖ TypeScript errors found — commit aborted. Fix them and re-commit."
+  exit 1
+fi
+
+# --- 2. Author attribution guard -----------------------------------------
+# Check the STAGED version of README.md so a removal can't slip through.
+if git ls-files --error-unmatch README.md >/dev/null 2>&1; then
+  if ! git show :README.md | grep -qF "$ATTRIBUTION"; then
+    echo "✖ \"$ATTRIBUTION\" is missing from staged README.md — commit aborted."
+    echo "  Restore the attribution line before committing."
+    exit 1
+  fi
+fi
+
+echo "✓ pre-commit checks passed."

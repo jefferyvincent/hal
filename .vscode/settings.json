@@ -1,0 +1,11 @@
+{
+  // Launch the integrated terminal as interactive bash (not POSIX `sh`),
+  // so ~/.bashrc runs and nvm puts node/npm on PATH.
+  "terminal.integrated.defaultProfile.linux": "bash",
+  "terminal.integrated.profiles.linux": {
+    "bash": {
+      "path": "bash",
+      "args": ["-l", "-i"]
+    }
+  }
+}
