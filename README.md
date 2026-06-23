@@ -1,5 +1,7 @@
 # HAL 9000 — Voice Assistant
 
+Created by Jeffery Vincnet
+
 Local voice assistant with a HAL 9000 themed UI. Speaks via XTTS, listens via Whisper,
 thinks via Ollama. Runs entirely on the host machine — no cloud round-trips.
 
@@ -219,6 +221,13 @@ via `tauri-plugin-global-shortcut`. Works even when the window is hidden.
 - Fast / smart model toggle (lightning bolt).
 - Wipe memory (trash icon).
 - Stop button (interrupt speech/generation).
+- **"Stop listening" button:** while HAL has the mic open, a stop button on the
+  live mic visualizer stands the mic down immediately — no turn sent. One-shot,
+  separate from the privacy latch (which keeps HAL from re-opening the mic).
+- **Quiet mode (`QUIET` button):** do-not-disturb. Holds every proactive spoken
+  alert (news / earnings / price / managed-exit) **and** stops HAL volunteering
+  trade ideas, until you lift it. Bell-with-slash icon, glows amber when engaged.
+  Distinct from voice-mute, which only silences TTS while alerts still fire.
 - Fullscreen chat mode (hides the eye, expands transcript).
 
 ## Trading & committee commands to remember
@@ -284,6 +293,35 @@ halted?"** / **"reset the kill switch."**
 `.env` keys: `RISK_MAX_ORDERS_PER_MIN`, `RISK_MAX_OPEN_POSITIONS`,
 `RISK_MAX_GROSS_EXPOSURE_PCT`, `RISK_DAILY_LOSS_LIMIT_PCT` (see `.env.example` for defaults).
 
+### Pre-earnings IV-crush screener (automatic)
+
+A background monitor that flags watchlist names reporting **soon** whose options
+are **overpriced** — implied vol well above recent realized vol — the classic
+pre-earnings setup the "skip earnings" rule exists to avoid. No command needed: it
+scans your watchlist (the same list the news watcher uses) on an interval, pulls
+the earnings calendar (keyless Nasdaq feed), and when a name reports within the
+lookahead window **and** its IV reads RICH, HAL speaks a one-time heads-up — e.g.
+*"AVGO reports in 2 days and options look overpriced…"* — and records it. One flag
+per earnings event, so it won't nag. Silenced by **quiet mode** (below).
+
+`.env` keys: `EARNINGS_POLL_SECONDS` (scan interval, default hourly),
+`EARNINGS_LOOKAHEAD_DAYS` (how soon a report must fall to be in scope, default 3).
+
+### Quiet mode (do-not-disturb)
+
+One switch silences **both** things that interrupt you: every proactive spoken
+alert (news / earnings / price / managed-exit) **and** HAL's unprompted
+trade-pitching. It **latches until you lift it** (a server restart also clears it).
+Direct requests still work — quiet only suppresses what HAL starts on its own.
+
+| Say something like… | What it does |
+| --- | --- |
+| "Be quiet" / "Stand down" / "Stop the alerts" / "Do not disturb" | Engages quiet mode |
+| "Resume" / "Alerts back on" / "Noisy mode" | Lifts it |
+
+Or use the **QUIET** button in the HUD (bell-with-slash, glows amber when engaged).
+Voice and button stay in sync, so a spoken toggle updates the button and vice-versa.
+
 ### Strategy playbooks (vault `Strategy/` folder)
 
 `Rules/trading-rules.md` is HAL's **global** policy. Drop markdown files in a
@@ -334,12 +372,34 @@ to start your own:
 | `index-etf-swing.md` | SPY/QQQ/IWM/DIA, directional | tight 20/20 index swing |
 | `high-iv-credit.md` | any name, IV RICH | sell premium (defined-risk credit) |
 
+### Analysis notes (vault `Analysis/` folder)
+
+Where `Strategy/` holds reusable *playbooks*, `Analysis/` holds your **standing
+trade ideas on a specific name** — the actionable read you'd put on right now.
+Drop a markdown file per idea (copy `Templates/analysis.md`) with frontmatter HAL
+keys off:
+
+```yaml
+type: analysis
+symbol: AVGO          # the committee pulls notes by symbol
+bias: bullish         # bullish | bearish | neutral
+conviction: high      # high | med | low
+status: active        # set `archived` to retire it — the committee then ignores it
+```
+
+The prose (setup / catalyst / trade idea / invalidation) is RAG-indexed like any
+vault note, **and** the committee reads the folder directly: when an active note
+exists for the name under review, it's surfaced as a dedicated **analysis** desk
+voice (below). With nothing on file the committee is unchanged — no empty vote is
+cast. The seed `AVGO.md` is a worked example.
+
 ### Multi-agent committee (deep analysis)
 
-A heavier, slower workup than a quick trade idea: vol/setup/catalyst analysts →
-bull-vs-bear debate → head-trader judge → your deterministic rules gate. Pins a
-TRADE-or-PASS verdict (with the full desk reasoning) in the Trade Ideas pane and
-**places no orders**.
+A heavier, slower workup than a quick trade idea: vol/setup/catalyst analysts (plus
+an **analysis** voice when the vault's `Analysis/` folder has an active note on the
+name) → bull-vs-bear debate → head-trader judge → your deterministic rules gate.
+Pins a TRADE-or-PASS verdict (with the full desk reasoning) in the Trade Ideas pane
+and **places no orders**.
 
 | Say something like… | What it does |
 | --- | --- |
@@ -389,6 +449,7 @@ Key files when something breaks:
 | `hal/sensory/risk.py` | Pre-trade risk circuit breakers (throttle, exposure, daily-loss kill switch) |
 | `hal/sensory/money.py` | Decimal price/qty precision (venue tick rounding) |
 | `hal/sensory/brackets.py` | HAL-managed option stop/TP exits (synthetic brackets) |
+| `hal/sensory/earnings.py` | Pre-earnings IV-crush screener (Nasdaq calendar → IV-richness flag) |
 | `hal/cerebellum/strategy.py` | Shared exit rule + levels + `OrderIntent` (backtest ↔ live single source of truth) |
 | `hal/cerebellum/execution.py` | `Execution` protocol: `SimBroker` (backtest) + `LiveExecution` (live) |
 | `hal/cortex/committee.py` | Multi-agent trade committee (analysts → debate → judge) |

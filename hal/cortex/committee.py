@@ -5,11 +5,14 @@ The shape mirrors a trading desk, but re-specialized for what HAL actually has
 an edge in (vol regime, the chain, the user's own journal) rather than
 fundamentals/social:
 
-    1. Analysts (parallel, FAST model) — three narrow reads, each grounded in a
+    1. Analysts (parallel, FAST model) — narrow reads, each grounded in a
        real tool:
          · Vol analyst     → analysis.iv_context        (rich/cheap premium)
          · Setup analyst   → analysis.screen_options     (structure/liquidity)
          · Catalyst analyst→ rag.journal_search          (prior theses / context)
+         · Analysis analyst→ vault Analysis/ notes        (the desk's own written
+           trade ideas for this name) — only added when a note exists, so an
+           empty folder leaves the desk's scoring untouched.
     2. Researchers (parallel, SMART model) — a bull and a bear argue the tape
        from the same evidence. One round. This is the cheapest, highest-value
        guard against the model talking itself into a position.
@@ -40,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 import httpx
@@ -53,6 +57,7 @@ from hal.brainstem.config import (
 from hal.cortex import analysis
 from hal.cerebellum import option_strategy
 from hal.cortex.rules import check_trade
+from hal.hippocampus.vault import list_notes
 
 # Optional progress callback: (step, summary, detail) -> awaitable. Lets a caller
 # (the server) surface each committee step as its own telemetry / cognition event
@@ -159,6 +164,14 @@ _CATALYST_SYS = (
     "no prior context, say so and lean neutral. Reply ONLY as JSON: "
     '{"lean":"bullish|bearish|neutral","confidence":0.0-1.0,"note":"..."}.'
 )
+_ANALYSIS_SYS = (
+    "You are a research analyst. You are given the desk's OWN written analysis "
+    "notes on this symbol — actionable trade ideas the trader has documented "
+    "(direction, setup, catalyst, structure). Summarize the standing trade idea "
+    "and its direction, and weight your confidence by how specific and current "
+    "the analysis is. If the analysis is thin or stale, lean neutral. Reply ONLY "
+    'as JSON: {"lean":"bullish|bearish|neutral","confidence":0.0-1.0,"note":"..."}.'
+)
 
 
 def _summarize_vol(iv: dict) -> str:
@@ -208,8 +221,32 @@ async def _analyst(system: str, evidence: str, label: str) -> dict:
     }
 
 
+def _analysis_notes(symbol: str) -> str:
+    """Read the desk's written Analysis/ notes for `symbol` → compact text.
+    '' when the folder has nothing (active) on this name. Archived notes are
+    skipped so a retired idea stops swaying the committee."""
+    try:
+        notes = list_notes("Analysis", type="analysis", symbol=symbol.upper())
+    except Exception as e:
+        print(f"[committee] analysis notes unavailable: {e}")
+        return ""
+    blocks = []
+    for n in notes:
+        fm = n["frontmatter"]
+        if str(fm.get("status", "active")).lower() == "archived":
+            continue
+        body = " ".join(n["body"].split())[:600]
+        blocks.append(
+            f"[{fm.get('bias', '?')} / {fm.get('conviction', '?')} conviction] "
+            f"{Path(n['rel_path']).stem}: {body}"
+        )
+    return "\n\n".join(blocks)
+
+
 async def _gather_analysts(symbol: str, horizon: str) -> list[dict]:
-    """Collect evidence (tool calls) then the three analyst reads, concurrently."""
+    """Collect evidence (tool calls) then the analyst reads, concurrently. The
+    analysis analyst is only included when the vault has a written idea for this
+    name, so an empty Analysis/ folder leaves consensus and scoring untouched."""
     dte_min, dte_max = _HORIZON_DTE.get(horizon, _HORIZON_DTE["swing"])
 
     async def vol() -> dict:
@@ -235,7 +272,14 @@ async def _gather_analysts(symbol: str, horizon: str) -> list[dict]:
         evidence = notes or "No prior journal notes for this symbol."
         return await _analyst(_CATALYST_SYS, evidence, "catalyst")
 
-    return list(await asyncio.gather(vol(), setup(), catalyst()))
+    async def research() -> dict | None:
+        evidence = await asyncio.to_thread(_analysis_notes, symbol)
+        if not evidence:
+            return None
+        return await _analyst(_ANALYSIS_SYS, evidence, "analysis")
+
+    reads = await asyncio.gather(vol(), setup(), catalyst(), research())
+    return [r for r in reads if r is not None]
 
 
 # --- Reflection memory (journal RAG) ----------------------------------------

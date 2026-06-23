@@ -321,6 +321,13 @@ class ClientRegistry:
                 self._delivers.remove(deliver)
 
     async def broadcast(self, message: str, payload: dict) -> int:
+        # Quiet mode (do-not-disturb): drop every proactive spoken alert at this
+        # one chokepoint. News, earnings, price, and managed-exit announcements
+        # all funnel through here, so the single guard silences them all. Returns
+        # 0 = "not delivered", so callers leave items unspoken (they replay later
+        # once quiet is lifted) rather than marking them announced.
+        if _quiet:
+            return 0
         # Single-user app: deliver ONLY to the most recently registered client
         # (the live UI). Stale registrations linger briefly across reconnects,
         # and delivering to all of them makes HAL speak the alert more than once.
@@ -337,6 +344,21 @@ class ClientRegistry:
 
 
 clients = ClientRegistry()
+
+
+# Quiet mode (do-not-disturb) flag. Runtime-only and latches until lifted — a
+# server restart clears it. Read by ClientRegistry.broadcast (suppresses spoken
+# alerts) and by the turn loop (suppresses HAL's proactive trade-pitching).
+_quiet = False
+
+
+def set_quiet(on: bool) -> None:
+    global _quiet
+    _quiet = bool(on)
+
+
+def is_quiet() -> bool:
+    return _quiet
 
 
 # --- Subscription manager --------------------------------------------------

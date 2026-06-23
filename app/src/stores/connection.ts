@@ -65,6 +65,10 @@ interface ConnectionState {
    *  a question, and keep hands-free immersive going). False = privacy mode.
    *  Persisted across restarts. */
   halListen: boolean;
+  /** Quiet mode (do-not-disturb): server-authoritative. When on, HAL holds all
+   *  proactive spoken alerts and stops volunteering trade ideas until lifted.
+   *  Synced from the server (echoed on connect + on every toggle). */
+  quiet: boolean;
   // MCP servers + market subscriptions (server-authoritative).
   mcpServers: McpServer[];
   subscriptions: Subscription[];
@@ -105,6 +109,7 @@ interface ConnectionActions {
   toggleFastMode: () => void;
   toggleMute: () => void;
   toggleHalListen: () => void;
+  toggleQuiet: () => void;
   clearTelemetry: () => void;
   appendOptimisticUser: (content: string) => void;
   listMcp: () => void;
@@ -308,6 +313,10 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
         });
         return;
       }
+      if (msg.quiet !== undefined) {
+        set({ quiet: msg.quiet });
+        return;
+      }
       if (msg.broker_ready !== undefined) {
         set({
           positions: msg.positions ?? [],
@@ -499,6 +508,8 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
       liveVision: false,
       muted: loadMuted(),
       halListen: loadHalListen(),
+      quiet: false, // server-authoritative; synced on connect via onJson
+
       mcpServers: [],
       subscriptions: [],
       subscriptionsConnected: false,
@@ -767,6 +778,14 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
         audio.setMuted(muted);
         saveMuted(muted);
         set({ muted });
+      },
+
+      toggleQuiet() {
+        // Server owns the flag; toggle optimistically and let the server echo
+        // confirm it (also keeps the button in sync with voice-driven toggles).
+        const quiet = !get().quiet;
+        set({ quiet });
+        void getSocket().sendCommand({ command: "set_quiet", on: quiet });
       },
 
       toggleHalListen() {

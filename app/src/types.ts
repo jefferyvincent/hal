@@ -83,6 +83,9 @@ export interface ServerEnvelope {
   trade_mode?: string; // "confirm" | "autopilot"
   positions_error?: string | null;
   risk?: RiskStatus;
+  /** Quiet mode (do-not-disturb) state — echoed by the server on connect and
+   *  whenever it's toggled by voice or the HUD button. */
+  quiet?: boolean;
   /** Live committee-run progress for the Cognition view's completion bar. */
   committee_status?: CommitteeStatus;
 }

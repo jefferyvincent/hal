@@ -85,6 +85,8 @@ export default function Hud() {
   const toggleMute = useConnection((s) => s.toggleMute);
   const halListen = useConnection((s) => s.halListen);
   const toggleHalListen = useConnection((s) => s.toggleHalListen);
+  const quiet = useConnection((s) => s.quiet);
+  const toggleQuiet = useConnection((s) => s.toggleQuiet);
   const autopilot = tradeMode === "autopilot";
 
   // The HUD controls rest collapsed — just the chevron handle on the right.
@@ -176,6 +178,27 @@ export default function Hud() {
                       <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
                     </>
                   )}
+                </svg>
+              </HudBtn>
+
+              {/* Quiet mode (do-not-disturb). Holds every proactive spoken alert
+                  (news / earnings / price / managed-exit) AND stops HAL
+                  volunteering trade ideas, until lifted. Amber when engaged =
+                  active override. Distinct from VOICE mute, which only silences
+                  TTS while alerts still fire. */}
+              <HudBtn
+                onClick={toggleQuiet}
+                active={quiet}
+                title={
+                  quiet
+                    ? "QUIET — do-not-disturb is ON. HAL is holding all alerts and ideas. Click to resume."
+                    : "QUIET — alerts and ideas are live. Click for do-not-disturb (hold all alerts + suggestions)."
+                }
+              >
+                <svg className={SVG_ICON} {...strokeProps}>
+                  <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" />
+                  <path d="M13.73 21a2 2 0 0 1-3.46 0" />
+                  {quiet ? <line x1="3" y1="3" x2="21" y2="21" /> : null}
                 </svg>
               </HudBtn>
 

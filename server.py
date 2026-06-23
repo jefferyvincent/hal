@@ -67,7 +67,7 @@ from hal.peripheral.attachments import (
     _attachment_summary,
 )
 
-from hal.cortex.prompts import HAL_SYSTEM_PROMPT, TOOLS
+from hal.cortex.prompts import HAL_SYSTEM_PROMPT, QUIET_MODE_DIRECTIVE, TOOLS
 from hal.hippocampus import vault as _vault
 from hal.cortex import rag as _rag
 from hal.cortex import cag as _cag
@@ -1864,6 +1864,36 @@ def _match_news_watch_intent(text: str) -> str | None:
     return _extract_news_symbol(text)
 
 
+# --- Quiet-mode (do-not-disturb) intents -----------------------------------
+# Lift phrases are checked first because several share words with the engage
+# set ("alerts on" vs "stop alerts"). Engage must beat the price-alert route,
+# so its dispatch runs before _match_alert_intent (see the turn loop).
+_QUIET_OFF = re.compile(
+    r"\b(?:turn off quiet|quiet mode off|end quiet|exit quiet|lift (?:the )?quiet|"
+    r"stop being quiet|un-?quiet|resume(?: alerts| talking)?|"
+    r"you can (?:talk|speak|resume)|alerts? back on|turn alerts? (?:back )?on|"
+    r"start (?:alerting|talking)|noisy mode|i'?m back)\b",
+    re.IGNORECASE)
+_QUIET_ON = re.compile(
+    r"\b(?:quiet mode|be quiet|stay quiet|go quiet|stand down|do not disturb|"
+    r"don'?t disturb|\bdnd\b|stop (?:the )?alerts?|no more alerts?|"
+    r"mute (?:the )?alerts?|silence (?:the )?alerts?|stop alerting|stop talking|"
+    r"stop pitching|stop suggesting|shut off (?:the )?alerts?|leave me alone|"
+    r"knock it off)\b",
+    re.IGNORECASE)
+
+
+def _match_quiet_intent(text: str) -> str | None:
+    """'be quiet' / 'stop the alerts' → 'on'; 'resume' / 'alerts back on' → 'off'."""
+    if not text:
+        return None
+    if _QUIET_OFF.search(text):
+        return "off"
+    if _QUIET_ON.search(text):
+        return "on"
+    return None
+
+
 # --- Price-alert intents (deterministic, before the LLM) -------------------
 # Qwen3 with think:False won't reliably call add_alert_rule, so price alerts are
 # intercepted here like the chart/news routes. The alert itself fires from the
@@ -3629,6 +3659,10 @@ async def agent_loop(
     mcp_tools = [] if images else mcp_client.tools_for_agent()
 
     system_content = f"{HAL_SYSTEM_PROMPT}\n\n{_options_date_context()}"
+    # Quiet mode: stop HAL volunteering trade ideas/alerts this turn. The spoken
+    # alert stream is silenced separately at market.clients.broadcast.
+    if market.is_quiet():
+        system_content += f"\n\n{QUIET_MODE_DIRECTIVE}"
     # CAG: inject stable vault context (rules + open trades + watchlist + theses).
     # Ollama reuses cached KV for any unchanged prefix, so this is a cache hit
     # on every turn where the vault hasn't changed.
@@ -4197,6 +4231,25 @@ async def process_turn(
                         f"{cond['price']:g}?", "alert.ask")
                 cond = {**cond, "direction": "above" if cond["price"] >= cur else "below"}
             return await _alert_finalize(sym, cond)
+
+        # Quiet mode (do-not-disturb): toggle by voice. Checked before the alert
+        # routes because "stop alerts" also matches the price-alert verb. Engaging
+        # silences proactive spoken alerts (at market.clients.broadcast) and HAL's
+        # trade-pitching (via the directive injected into the turn's system prompt).
+        quiet_cmd = _match_quiet_intent(user_text)
+        if quiet_cmd is not None:
+            want_on = quiet_cmd == "on"
+            already = market.is_quiet() == want_on
+            market.set_quiet(want_on)
+            await websocket.send_json({"quiet": want_on})
+            if want_on:
+                spoken = (f"Quiet mode's already on, {USER_NAME}." if already
+                          else f"Going quiet, {USER_NAME}. I'll hold all alerts and "
+                               "suggestions until you tell me to resume.")
+            else:
+                spoken = (f"Quiet mode's already off, {USER_NAME}." if already
+                          else f"Back on, {USER_NAME}. Alerts and ideas are live again.")
+            return await _speak_and_return(spoken, f"quiet.{'on' if want_on else 'off'}")
 
         # Complete a pending alert from a short follow-up answer ("above 250").
         pending_alert = websocket.scope.get("pending_alert")
@@ -4967,6 +5020,9 @@ async def voice_interface(websocket: WebSocket):
     await send_mcp_snapshot()
     await send_subscriptions_snapshot()
     await send_positions_snapshot()
+    # Initialize the HUD quiet-mode toggle from server state (it latches across
+    # reconnects until lifted).
+    await websocket.send_json({"quiet": market.is_quiet()})
 
     async def deliver_alert(message: str, payload: dict):
         """Called by market.SubscriptionManager when a rule fires. Aborts any
@@ -5072,6 +5128,10 @@ async def voice_interface(websocket: WebSocket):
         """Announce any alerts that fired while no app session was connected, so
         nothing is silently lost. Marks them spoken so reconnects don't repeat."""
         nonlocal current_task, abort_event
+        # Quiet mode: no proactive briefing. Leave them unspoken so they replay
+        # once quiet is lifted.
+        if market.is_quiet():
+            return
         try:
             pending = await asyncio.to_thread(market.list_unspoken_alerts)
         except Exception as e:
@@ -5339,6 +5399,18 @@ async def voice_interface(websocket: WebSocket):
                             websocket, "human.set_trade_mode", f"order gate -> {m}",
                             f"You set the order gate to {m} mode.", source="human")
                     await send_positions_snapshot()
+                elif cmd == "set_quiet":
+                    # HUD toggle: engage/lift quiet mode (do-not-disturb), then
+                    # echo the state back so the button reflects server truth
+                    # (and stays in sync with voice-driven toggles).
+                    on = bool(command.get("on"))
+                    market.set_quiet(on)
+                    await websocket.send_json({"quiet": on})
+                    await _emit_telemetry(
+                        websocket, "human.set_quiet",
+                        f"quiet -> {'on' if on else 'off'}",
+                        f"You turned quiet mode {'on' if on else 'off'}.",
+                        source="human")
                 elif cmd == "reset_kill_switch":
                     # HUD override: clear a latched daily-loss halt and re-broadcast
                     # so the risk badge updates. Trading stays in confirm mode.

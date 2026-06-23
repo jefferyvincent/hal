@@ -66,6 +66,7 @@ def _env_path(key: str, default) -> Path:
 USER_NAME = _env_str("HAL_USER_NAME", "User")
 HAL_NAME = _env_str("HAL_NAME", "HAL")
 HAL_VERSION = _env_str("HAL_VERSION", "9000")
+HAL_CREATOR = _env_str("HAL_CREATOR", "Jeffery Vincent")  # who built HAL
 HAL_DESIGNATION = f"{HAL_NAME} {HAL_VERSION}".strip()  # e.g. "HAL 9000"
 
 # --- Scratch root: HAL's derived, fully-rebuildable data (RAG index, SQLite, --
