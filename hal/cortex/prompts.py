@@ -362,8 +362,8 @@ TOOLS = [
         "function": {
             "name": "open_webull",
             "description": (
-                "Open Webull in Jeffery's default browser at a specific page. "
-                "Use this after recommending a trade so Jeffery can review and "
+                f"Open Webull in {USER_NAME}'s default browser at a specific page. "
+                f"Use this after recommending a trade so {USER_NAME} can review and "
                 "execute in Webull itself — HAL does NOT place orders directly. "
                 "Also use when he asks 'show me my positions', 'pull up SPY on "
                 "Webull', or wants to see the options chain in the UI.\n"
@@ -377,7 +377,7 @@ TOOLS = [
                 "- 'account' — account info\n"
                 "- 'quote' — quote page for the given ticker (requires ticker)\n"
                 "- 'option_chain' — options chain for the given ticker (requires ticker)\n"
-                "Web app pages require Jeffery to be logged in; the browser "
+                f"Web app pages require {USER_NAME} to be logged in; the browser "
                 "session handles that."
             ),
             "parameters": {
@@ -437,7 +437,7 @@ TOOLS = [
                 "Recommend ranked option strategies for a directional bias and an "
                 "implied-vol regime, with plain-English rationale, risk level, and "
                 "(when current_price is given) the concrete legs to structure each. "
-                "Ported from Jeffery's TradeScan strategy screener — purely "
+                f"Ported from {USER_NAME}'s TradeScan strategy screener — purely "
                 "algorithmic, no API call.\n"
                 "WORKFLOW: this is the 'what should I trade and how do I build it' "
                 "brain. Get the vol read from iv_context first, then call this with "
@@ -488,11 +488,11 @@ TOOLS = [
         "function": {
             "name": "open_view",
             "description": (
-                "Open a view inside Jeffery's HAL interface (the immersive backdrop). "
+                f"Open a view inside {USER_NAME}'s HAL interface (the immersive backdrop). "
                 "Use this to ACTIVELY SHOW him things instead of just describing — when "
                 "he asks 'show me a map of X', 'what does X look like', 'pull up the "
                 "camera', 'share my screen', etc., call this instead of describing. "
-                "Once opened, Jeffery sees it directly; do not describe what it looks "
+                f"Once opened, {USER_NAME} sees it directly; do not describe what it looks "
                 "like — he is looking at it.\n"
                 "Kinds:\n"
                 "- 'map'    — opens Google Maps embed. Requires 'query' (address, place, or 'lat,lng').\n"
@@ -526,7 +526,7 @@ TOOLS = [
         "function": {
             "name": "show_chart",
             "description": (
-                "Render an interactive candlestick chart INSIDE Jeffery's HAL "
+                f"Render an interactive candlestick chart INSIDE {USER_NAME}'s HAL "
                 "interface so he can see a technical setup instead of just hearing "
                 "it described. Use this whenever you reference a chart, a level, a "
                 "trend, a breakout, or 'what X looks like' on a ticker — pull it up "

@@ -61,6 +61,10 @@ interface ConnectionState {
   /** Mute HAL's voice output. Speech still streams + drives the state machine,
    *  it's just silenced. Persisted across restarts. */
   muted: boolean;
+  /** Whether HAL may open the mic on his own (listen for a reply after asking
+   *  a question, and keep hands-free immersive going). False = privacy mode.
+   *  Persisted across restarts. */
+  halListen: boolean;
   // MCP servers + market subscriptions (server-authoritative).
   mcpServers: McpServer[];
   subscriptions: Subscription[];
@@ -100,6 +104,7 @@ interface ConnectionActions {
   deleteConversation: (id: string) => Promise<void>;
   toggleFastMode: () => void;
   toggleMute: () => void;
+  toggleHalListen: () => void;
   clearTelemetry: () => void;
   appendOptimisticUser: (content: string) => void;
   listMcp: () => void;
@@ -162,6 +167,29 @@ function saveMuted(muted: boolean): void {
   }
 }
 
+// Whether HAL may open the mic on his own — after asking a question, and to
+// keep hands-free immersive going. Turning this off is the "privacy" /
+// stop-listening switch. Persisted, defaults on.
+const LISTEN_KEY = "hal.listen";
+function loadHalListen(): boolean {
+  try {
+    return localStorage.getItem(LISTEN_KEY) !== "0";
+  } catch {
+    return true;
+  }
+}
+function saveHalListen(listen: boolean): void {
+  try {
+    localStorage.setItem(LISTEN_KEY, listen ? "1" : "0");
+  } catch {
+    /* ignore quota / unavailable storage */
+  }
+}
+
+// How long HAL keeps the mic open waiting for a reply to his question before
+// standing down (no speech detected). Cancelled the moment the user speaks.
+const QUESTION_LISTEN_MS = 10_000;
+
 // Module-scoped infra. We keep this OUT of zustand state to avoid React
 // trying to compare deep media-stream objects between renders.
 const audio = new AudioPlayer();
@@ -171,6 +199,14 @@ let micStream: MediaStream | null = null;
 let recorder: MediaRecorder | null = null;
 let vad: Vad | null = null;
 let streamDone = false;
+// Patience timer for the post-question listen window (see armQuestionListen).
+let questionListenTimer: number | null = null;
+function clearQuestionListen() {
+  if (questionListenTimer !== null) {
+    clearTimeout(questionListenTimer);
+    questionListenTimer = null;
+  }
+}
 
 export const useConnection = create<ConnectionState & ConnectionActions>(
   (set, get) => {
@@ -200,20 +236,54 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
       }
     }
 
+    // True when HAL's most recent reply ended on a question — our cue to open
+    // the mic and wait for an answer.
+    function halJustAskedQuestion(): boolean {
+      const h = get().history;
+      for (let i = h.length - 1; i >= 0; i--) {
+        if (h[i].role === "assistant") {
+          return h[i].content.trim().endsWith("?");
+        }
+      }
+      return false;
+    }
+
+    // After HAL asks a question (outside hands-free immersive), open the mic
+    // and listen for a reply. VAD's silence cutoff sends the turn once the user
+    // speaks; if no one does, we stand down after QUESTION_LISTEN_MS so the mic
+    // doesn't sit open indefinitely. The patience timer is cancelled the moment
+    // speech starts (Vad.onSpeechStart, wired in startRecording).
+    function armQuestionListen() {
+      clearQuestionListen();
+      void get().startRecording(false);
+      questionListenTimer = window.setTimeout(() => {
+        questionListenTimer = null;
+        if (get().mode === "listening" && get().recording) {
+          get().cancelRecording();
+        }
+      }, QUESTION_LISTEN_MS);
+    }
+
     function maybeReturnToIdle() {
       if (!streamDone || audio.playing) return;
       setMode("idle", "DORMANT");
-      // Hands-free immersive: re-arm the mic after each turn so listening
-      // continues until the user exits immersive. Outside immersive we stay
-      // push-to-talk and never re-open the mic on our own. The delay is a
-      // post-speech cooldown so the speaker's audio tail / room reverb doesn't
-      // instantly re-trigger the VAD the moment HAL stops.
+      // Privacy: when HAL is told to stop listening, never re-open the mic.
+      if (!get().halListen) return;
+      const immersive = useImmersive.getState().active;
+      const questionAsked = !immersive && halJustAskedQuestion();
+      // Hands-free immersive re-arms after every turn; outside immersive we only
+      // re-open the mic when HAL just asked something. The delay is a post-speech
+      // cooldown so the speaker's audio tail / room reverb doesn't instantly
+      // re-trigger the VAD the moment HAL stops.
+      if (!immersive && !questionAsked) return;
       try {
         window.setTimeout(() => {
-          const stillImmersive = useImmersive.getState().active;
-          const stillIdle = get().mode === "idle";
-          if (stillImmersive && stillIdle && !get().recording && !audio.playing) {
+          if (get().mode !== "idle" || get().recording || audio.playing) return;
+          if (!get().halListen) return;
+          if (useImmersive.getState().active) {
             void get().startRecording(false);
+          } else if (questionAsked) {
+            armQuestionListen();
           }
         }, 700);
       } catch {
@@ -428,6 +498,7 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
       micStream: null,
       liveVision: false,
       muted: loadMuted(),
+      halListen: loadHalListen(),
       mcpServers: [],
       subscriptions: [],
       subscriptionsConnected: false,
@@ -562,7 +633,13 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
                 }
                 get().stopRecording();
               },
-              { rmsThreshold: 0.018, silenceMs: 1200 },
+              {
+                rmsThreshold: 0.018,
+                silenceMs: 1200,
+                // User started talking — commit to this turn; the post-question
+                // patience timeout no longer applies.
+                onSpeechStart: clearQuestionListen,
+              },
             );
             vad.start(micStream);
           }
@@ -573,6 +650,7 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
       },
 
       stopRecording() {
+        clearQuestionListen();
         vad?.stop();
         vad = null;
         if (recorder && recorder.state === "recording") {
@@ -586,6 +664,7 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
       cancelRecording() {
         // Tear down the mic without sending a turn. Detach onstop first so the
         // normal send-on-stop handler doesn't fire, then stop the tracks.
+        clearQuestionListen();
         vad?.stop();
         vad = null;
         const r = recorder;
@@ -688,6 +767,21 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
         audio.setMuted(muted);
         saveMuted(muted);
         set({ muted });
+      },
+
+      toggleHalListen() {
+        const halListen = !get().halListen;
+        saveHalListen(halListen);
+        set({ halListen });
+        // Engaging privacy mid-listen: stand the mic down now, don't wait for
+        // the next turn. Only tears down a HAL-opened listen (mode "listening"),
+        // never an in-flight user turn.
+        if (!halListen) {
+          clearQuestionListen();
+          if (get().recording && get().mode === "listening") {
+            get().cancelRecording();
+          }
+        }
       },
 
       clearTelemetry() {

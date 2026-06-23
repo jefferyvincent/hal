@@ -1,8 +1,8 @@
 """Options strategy backtester for HAL.
 
 Simulates a long single-option (call/put) strategy over historical data so
-Jeffery can see how a trade idea would have performed before risking real
-money. Design decisions (agreed with Jeffery):
+the user can see how a trade idea would have performed before risking real
+money. Design decisions (agreed with the user):
 
 - The price-action signal is a DIRECTION FILTER only: a break of a pivot-based
   support/resistance level, confirmed by RSI. It decides long-call vs long-put;
@@ -29,6 +29,7 @@ from typing import Any, Optional
 
 import httpx
 
+from hal.brainstem.config import USER_NAME
 from hal.cerebellum import strategy
 from hal.cerebellum.execution import SimBroker
 
@@ -452,7 +453,7 @@ def compute_metrics(trades: list[dict]) -> dict:
 
 
 def split_by_regime(trades: list[dict]) -> dict:
-    """Per-regime win rate and avg P&L (Jeffery's 'check the weather' point)."""
+    """Per-regime win rate and avg P&L (the user's 'check the weather' point)."""
     out: dict[str, dict] = {}
     for label in ("low-vol", "mid-vol", "high-vol", "unknown"):
         sub = [t for t in trades if t.get("regime") == label]
@@ -636,7 +637,7 @@ def primer_stats(result: dict) -> str:
         f"{m['trades']} trades, {int(m['win_rate']*100)}% win rate, total {m['total_pnl']:+.0f}, "
         f"profit factor {m.get('profit_factor')}, max drawdown {m['max_drawdown']:.0f}. "
         f"By volatility regime: {reg_s}.\n"
-        "Cite these numbers so Jeffery sees the historical edge (or lack of one) before placing the trade."
+        f"Cite these numbers so {USER_NAME} sees the historical edge (or lack of one) before placing the trade."
     )
 
 

@@ -114,6 +114,23 @@ def _init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_news_articles_watch
                 ON news_articles(watch_id, seen_at DESC);
 
+            CREATE TABLE IF NOT EXISTS earnings_iv_alerts (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol        TEXT NOT NULL,
+                earnings_date TEXT NOT NULL,
+                earnings_when TEXT,
+                atm_iv        REAL,
+                hv30          REAL,
+                iv_over_hv30  REAL,
+                verdict       TEXT,
+                message       TEXT NOT NULL,
+                fired_at      REAL NOT NULL,
+                spoken        INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(symbol, earnings_date)
+            );
+            CREATE INDEX IF NOT EXISTS idx_earnings_iv_alerts_fired
+                ON earnings_iv_alerts(fired_at DESC);
+
             CREATE TABLE IF NOT EXISTS mcp_servers (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 name        TEXT NOT NULL,

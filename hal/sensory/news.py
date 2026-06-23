@@ -14,7 +14,7 @@ Feeds (no API key required):
   - Google News RSS (fallback):   news.google.com/rss/search?q=SYM+stock
 
 The first poll of a brand-new watch seeds whatever headlines already exist as
-"seen" silently, so Jeffery only ever hears genuinely new news, never a backlog
+"seen" silently, so the user only ever hears genuinely new news, never a backlog
 dump.
 """
 from __future__ import annotations

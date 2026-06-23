@@ -63,7 +63,7 @@ def _env_path(key: str, default) -> Path:
 
 
 # --- Identity (configurable via .env; defaults preserve current behavior) --
-USER_NAME = _env_str("HAL_USER_NAME", "Jeffery")
+USER_NAME = _env_str("HAL_USER_NAME", "User")
 HAL_NAME = _env_str("HAL_NAME", "HAL")
 HAL_VERSION = _env_str("HAL_VERSION", "9000")
 HAL_DESIGNATION = f"{HAL_NAME} {HAL_VERSION}".strip()  # e.g. "HAL 9000"
@@ -111,6 +111,17 @@ RISK_DAILY_LOSS_LIMIT_PCT = float(os.environ.get("RISK_DAILY_LOSS_LIMIT_PCT", "1
 # ("yahoo" or "google"). Both feeds are keyless; Yahoo is per-symbol headlines.
 NEWS_POLL_SECONDS = float(os.environ.get("NEWS_POLL_SECONDS", "300"))
 NEWS_PRIMARY_FEED = os.environ.get("NEWS_PRIMARY_FEED", "yahoo")
+
+# Pre-earnings IV-crush screener: how often to scan the watchlist (seconds) and
+# how many calendar days ahead an earnings report must fall to be in scope.
+# Backs the "skip earnings" rule — flags watchlist names that report soon AND
+# carry rich option premium (IV well above recent realized vol), so they can be
+# avoided/faded before the post-report IV crush. The earnings calendar comes
+# from Nasdaq's keyless endpoint (same no-key spirit as the news feeds); IV
+# richness reuses analysis.iv_context. Hourly default — dates and IV regime move
+# slowly relative to a 5-minute news poll, and each scan runs live IV pulls.
+EARNINGS_POLL_SECONDS = float(os.environ.get("EARNINGS_POLL_SECONDS", "3600"))
+EARNINGS_LOOKAHEAD_DAYS = _env_int("EARNINGS_LOOKAHEAD_DAYS", 3)
 
 # Chart bar source: "yahoo" (free, keyless, near-real-time for US equities) or
 # "massive" (REST aggregates; freshness depends on the stock-data entitlement).
