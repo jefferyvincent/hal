@@ -1,0 +1,16 @@
+# Block direct pushes to main — use a feature branch + PR instead.
+# Bypass intentionally with:  git push --no-verify
+protected="main"
+
+while read local_ref local_sha remote_ref remote_sha; do
+  case "$remote_ref" in
+    refs/heads/"$protected")
+      echo "✋ Direct push to '$protected' is blocked." >&2
+      echo "   Push a branch and open a PR:" >&2
+      echo "     git switch -c my-change && git push -u origin my-change" >&2
+      echo "   (Override with --no-verify if you really mean it.)" >&2
+      exit 1
+      ;;
+  esac
+done
+exit 0

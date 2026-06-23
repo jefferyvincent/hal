@@ -1,0 +1,25 @@
+{
+  "name": "hal",
+  "version": "1.0.0",
+  "description": "Created by Jeffery Vincent",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "prepare": "husky"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jefferyvincent/hal.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/jefferyvincent/hal/issues"
+  },
+  "homepage": "https://github.com/jefferyvincent/hal#readme",
+  "devDependencies": {
+    "husky": "^9.1.7"
+  }
+}
