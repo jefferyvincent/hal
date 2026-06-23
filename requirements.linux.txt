@@ -2,6 +2,7 @@ absl-py==2.4.0
 aiohappyeyeballs==2.6.2
 aiohttp==3.13.5
 aiosignal==1.4.0
+alpaca-py==0.43.4
 annotated-doc==0.0.4
 annotated-types==0.7.0
 anyascii==0.3.3

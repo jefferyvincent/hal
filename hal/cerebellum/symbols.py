@@ -1,6 +1,6 @@
 """Company-name -> ticker resolution.
 
-Lets Jeffery speak a company name ("chart Apple", "backtest Tesla") and have it
+Lets the user speak a company name ("chart Apple", "backtest Tesla") and have it
 resolve to a ticker (AAPL, TSLA). Used by the deterministic chart/backtest
 routes and by render_chart so the model's show_chart calls accept names too.
 """
@@ -11,7 +11,7 @@ import re
 import httpx
 
 
-# Spoken company name -> ticker. Lets Jeffery say "chart Apple" / "backtest
+# Spoken company name -> ticker. Lets the user say "chart Apple" / "backtest
 # Tesla" and have it resolve to AAPL / TSLA, the same way the index aliases
 # resolve "the Dow" -> DIA. Keys are lowercase, single-spaced; include the
 # obvious spoken variants (with/without "inc", possessives, "coca cola" and
@@ -97,7 +97,7 @@ _COMPANY_NAME_RE = re.compile(
 _TICKER_SHAPE = re.compile(r"[A-Z]{1,5}([.\-][A-Z]{1,2})?$")
 
 # Cache name -> resolved ticker for the online fallback so we don't re-hit the
-# search API for a name Jeffery repeats.
+# search API for a name the user repeats.
 _NAME_SYMBOL_CACHE: dict[str, str] = {}
 
 

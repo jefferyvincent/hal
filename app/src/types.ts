@@ -19,6 +19,10 @@ export interface TelemetryEvent {
   status?: "ok" | "error" | "declined" | string;
   input?: string;
   output?: string;
+  /** Which actor produced this event — drives the Cognition view's source lanes. */
+  source?: "hal" | "committee" | "broker" | "human" | "risk" | string;
+  /** Epoch milliseconds when the server emitted it. */
+  ts?: number;
 }
 
 export interface Attachment {
@@ -69,6 +73,70 @@ export interface ServerEnvelope {
   news_articles?: NewsArticle[];
   /** A trade idea / hold read to pin in the Trade Ideas pane. */
   trade_idea?: TradeIdea;
+  /** Result of a "Place it" button click, so its button can flip placed/failed. */
+  trade_placed?: { id: string; ok: boolean };
+  /** Live brokerage view (reply to positions_refresh / position_close). */
+  positions?: BrokerPosition[];
+  broker_account?: BrokerAccount | null;
+  broker_ready?: boolean;
+  broker_paper?: boolean;
+  trade_mode?: string; // "confirm" | "autopilot"
+  positions_error?: string | null;
+  risk?: RiskStatus;
+  /** Quiet mode (do-not-disturb) state — echoed by the server on connect and
+   *  whenever it's toggled by voice or the HUD button. */
+  quiet?: boolean;
+  /** Live committee-run progress for the Cognition view's completion bar. */
+  committee_status?: CommitteeStatus;
+}
+
+/** Progress of an in-flight committee run, streamed per desk step. */
+export interface CommitteeStatus {
+  active: boolean;
+  fraction?: number; // 0..1 completion
+  label?: string; // current stage, e.g. "Bull researcher"
+  symbol?: string;
+}
+
+/** Pre-trade risk engine snapshot, from sensory.risk.status(). */
+export interface RiskStatus {
+  killed: boolean;
+  kill_reason: string;
+  orders_last_min: number;
+  baseline_equity: number | null;
+  limits: {
+    max_orders_per_min: number;
+    max_open_positions: number;
+    max_gross_exposure_pct: number;
+    daily_loss_limit_pct: number;
+  };
+}
+
+/** An open brokerage position (Alpaca), as shaped by broker.list_positions. */
+export interface BrokerPosition {
+  symbol: string;
+  asset_class: string; // "us_equity" | "us_option" | ...
+  qty: string;
+  side: string; // "long" | "short"
+  avg_entry_price: number | null;
+  current_price: number | null;
+  market_value: number | null;
+  unrealized_pl: number | null;
+  unrealized_plpc: number | null; // fraction, e.g. 0.0125 = +1.25%
+}
+
+/** Alpaca account snapshot (subset), from broker.get_account. */
+export interface BrokerAccount {
+  account_number: string;
+  status: string;
+  currency: string;
+  cash: number | null;
+  equity: number | null;
+  buying_power: number | null;
+  options_buying_power: number | null;
+  options_trading_level: number | null;
+  pattern_day_trader: boolean;
+  paper: boolean;
 }
 
 /** A pinned trade recommendation or hold/exit read for the Trade Ideas pane. */
@@ -79,6 +147,9 @@ export interface TradeIdea {
   /** Markdown body (the same table/read shown in chat). */
   markdown: string;
   ts: number; // unix seconds
+  /** True when Alpaca is live and HAL staged this exact order — a "Place it"
+   *  button can submit it directly (no speech). */
+  placeable?: boolean;
 }
 
 export type ImmersiveSource = "off" | "camera" | "screen" | "map" | "video" | "chart" | "backtest" | "watchlist" | "trade_ideas";

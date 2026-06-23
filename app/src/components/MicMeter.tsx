@@ -10,6 +10,7 @@ const FFT_SIZE = 128; // smallest valid; gives 64 bins, we sample down to BAR_CO
 export default function MicMeter() {
   const stream = useConnection((s) => s.micStream);
   const recording = useConnection((s) => s.recording);
+  const cancelRecording = useConnection((s) => s.cancelRecording);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -93,10 +94,35 @@ export default function MicMeter() {
 
   return (
     <div className="immersive-fade fixed bottom-[240px] left-1/2 z-30 -translate-x-1/2">
-      <canvas
-        ref={canvasRef}
-        className="block h-10 w-[300px] border border-hal-red/40 bg-black/70 shadow-[0_0_18px_rgba(255,30,30,0.35)] backdrop-blur-sm"
-      />
+      <div className="relative">
+        <canvas
+          ref={canvasRef}
+          className="block h-10 w-[300px] border border-hal-red/40 bg-black/70 shadow-[0_0_18px_rgba(255,30,30,0.35)] backdrop-blur-sm"
+        />
+        {/* Stop listening: stands the mic down immediately without sending a
+            turn. Pinned just right of the graph so it stays clear of the
+            centered spectrum. */}
+        <button
+          type="button"
+          onClick={() => cancelRecording()}
+          data-tauri-drag-region="false"
+          title="Stop listening"
+          aria-label="Stop listening"
+          className="absolute left-full top-1/2 ml-2 flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full border border-hal-red/45 bg-hal-red/[0.08] text-hal-text transition-all hover:border-hal-red hover:bg-hal-red/25 hover:text-white hover:shadow-[0_0_14px_rgba(255,30,30,0.45)]"
+        >
+          <svg
+            className="h-[18px] w-[18px]"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth={2}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <rect x="6" y="6" width="12" height="12" rx="1.5" fill="currentColor" />
+          </svg>
+        </button>
+      </div>
     </div>
   );
 }

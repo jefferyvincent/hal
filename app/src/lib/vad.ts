@@ -8,6 +8,9 @@ export interface VadOptions {
   rmsThreshold?: number;
   /** Milliseconds of trailing silence required to call EOS. */
   silenceMs?: number;
+  /** Fired once, the first time a speech burst is confirmed. Lets callers
+   *  cancel a "patience" timeout once the user has actually started talking. */
+  onSpeechStart?: () => void;
   /** AudioContext to attach to (we'll reuse one if you pass it). */
   ctx?: AudioContext;
 }
@@ -20,11 +23,13 @@ export class Vad {
   private threshold: number;
   private silenceMs: number;
   private onEnd: () => void;
+  private onSpeechStart: (() => void) | null;
   private hadSpeech = false;
   private silenceStart: number | null = null;
 
   constructor(onEndOfSpeech: () => void, opts: VadOptions = {}) {
     this.onEnd = onEndOfSpeech;
+    this.onSpeechStart = opts.onSpeechStart ?? null;
     this.threshold = opts.rmsThreshold ?? 0.018;
     this.silenceMs = opts.silenceMs ?? 1200;
     this.ctx =
@@ -52,6 +57,7 @@ export class Vad {
       const rms = Math.sqrt(sum / buf.length);
       const now = performance.now();
       if (rms > this.threshold) {
+        if (!this.hadSpeech) this.onSpeechStart?.();
         this.hadSpeech = true;
         this.silenceStart = null;
       } else if (this.hadSpeech) {

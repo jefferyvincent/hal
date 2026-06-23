@@ -114,6 +114,23 @@ def _init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_news_articles_watch
                 ON news_articles(watch_id, seen_at DESC);
 
+            CREATE TABLE IF NOT EXISTS earnings_iv_alerts (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol        TEXT NOT NULL,
+                earnings_date TEXT NOT NULL,
+                earnings_when TEXT,
+                atm_iv        REAL,
+                hv30          REAL,
+                iv_over_hv30  REAL,
+                verdict       TEXT,
+                message       TEXT NOT NULL,
+                fired_at      REAL NOT NULL,
+                spoken        INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(symbol, earnings_date)
+            );
+            CREATE INDEX IF NOT EXISTS idx_earnings_iv_alerts_fired
+                ON earnings_iv_alerts(fired_at DESC);
+
             CREATE TABLE IF NOT EXISTS mcp_servers (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 name        TEXT NOT NULL,
@@ -134,12 +151,100 @@ def _init_db() -> None:
                 tokens      TEXT,
                 updated_at  REAL NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS broker_orders (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_order_id TEXT,
+                broker_order_id TEXT,
+                symbol          TEXT NOT NULL,
+                asset_class     TEXT NOT NULL,
+                side            TEXT NOT NULL,
+                qty             TEXT,
+                order_type      TEXT,
+                limit_price     REAL,
+                status          TEXT,
+                mode            TEXT,
+                paper           INTEGER NOT NULL DEFAULT 1,
+                submitted_at    REAL NOT NULL,
+                detail          TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_broker_orders_submitted
+                ON broker_orders(submitted_at DESC);
+            CREATE TABLE IF NOT EXISTS managed_exits (
+                symbol      TEXT PRIMARY KEY,
+                underlying  TEXT,
+                qty         TEXT,
+                stop_price  REAL,
+                tp_price    REAL,
+                created_at  REAL NOT NULL
+            );
             """
         )
 
 
 _init_db()
 print(f"[boot] DB: {DB_PATH}")
+
+
+def arm_managed_exit(symbol: str, underlying: str, qty, stop_price: float,
+                     tp_price: float) -> None:
+    """Register/replace a HAL-managed exit for an option position. `symbol` is
+    the OCC option symbol Alpaca reports in positions."""
+    with _db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO managed_exits "
+            "(symbol, underlying, qty, stop_price, tp_price, created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (symbol.upper(), (underlying or "").upper(), str(qty),
+             float(stop_price or 0), float(tp_price or 0), time.time()),
+        )
+
+
+def disarm_managed_exit(key: str) -> None:
+    """Remove a managed exit by OCC symbol or underlying (so a panel close on
+    the underlying clears its option exit too)."""
+    k = (key or "").upper()
+    with _db() as conn:
+        conn.execute(
+            "DELETE FROM managed_exits WHERE symbol=? OR underlying=?", (k, k))
+
+
+def list_managed_exits() -> list[dict]:
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT symbol, underlying, qty, stop_price, tp_price, created_at "
+            "FROM managed_exits"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def log_broker_order(spec: dict, result: dict, mode: str, paper: bool) -> None:
+    """Record a submitted Alpaca order. `spec` is the prepared order, `result`
+    is the broker's response (see broker._order_to_dict)."""
+    with _db() as conn:
+        conn.execute(
+            """
+            INSERT INTO broker_orders
+                (client_order_id, broker_order_id, symbol, asset_class, side, qty,
+                 order_type, limit_price, status, mode, paper, submitted_at, detail)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                result.get("client_order_id"),
+                result.get("id"),
+                spec.get("symbol"),
+                spec.get("asset_class"),
+                spec.get("side"),
+                str(spec.get("qty")),
+                spec.get("type"),
+                spec.get("limit_price"),
+                result.get("status"),
+                mode,
+                1 if paper else 0,
+                time.time(),
+                json.dumps(result, default=str),
+            ),
+        )
 
 
 def _new_conversation_obj(title: str = "New conversation") -> dict:

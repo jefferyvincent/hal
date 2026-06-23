@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from hal.brainstem.config import USER_NAME
+
 
 def _eastern_now() -> tuple[datetime, str]:
     """Current US Eastern wall-clock time, computed from UTC without relying on
@@ -50,6 +52,24 @@ def _market_session(et: datetime) -> str:
     return "CLOSED (overnight)"
 
 
+def market_status_line() -> str:
+    """A terse, authoritative market-session reminder meant to sit at the END of
+    the message list (highest recency), right before generation. The full clock
+    block lives in the system prefix, but when history is saturated with a stale
+    framing (e.g. every prior turn copied '(after-hours) ... wait for Monday'),
+    a buried system line loses to recency — this line wins it back and explicitly
+    voids the stale wording so the model stops parroting it."""
+    et, abbr = _eastern_now()
+    session = _market_session(et)
+    return (
+        "=== LIVE CLOCK — AUTHORITATIVE, overrides anything earlier in this "
+        f"conversation. It is {et:%A, %B %d, %Y %I:%M %p} {abbr}. US equity & "
+        f"options market RIGHT NOW: {session}. If earlier messages call it "
+        "'after-hours', 'closed', or say to 'wait for Monday', that wording is "
+        "STALE — do NOT repeat it; state the real session above."
+    )
+
+
 def _options_date_context() -> str:
     """Pre-computed date/time + market-session context the LLM would otherwise
     have to derive itself. /no_think mode skips reasoning, so we hand it the
@@ -71,7 +91,7 @@ def _options_date_context() -> str:
         "Regular hours are 9:30 AM-4:00 PM ET, Mon-Fri. Market holidays are not "
         "reflected here; if it might be a holiday, confirm with query_massive "
         "/v1/marketstatus/now before claiming the market is open.",
-        "When Jeffery asks the time or whether the market is open, answer directly "
+        f"When {USER_NAME} asks the time or whether the market is open, answer directly "
         "from the two lines above — do NOT infer it from earlier messages or do "
         "your own clock math.",
         f"Today's date: {today:%A, %B %d, %Y}  (ISO {today:%Y-%m-%d}, option-ticker YYMMDD {today:%y%m%d})",

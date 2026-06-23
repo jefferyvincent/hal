@@ -1,6 +1,7 @@
 import { useConnection } from "@/stores/connection";
 import { useImmersive } from "@/stores/immersive";
 import { renderMessage } from "@/lib/markdown";
+import { cn } from "@/lib/cn";
 
 function fmtTime(t: number): string {
   return new Date(t * 1000).toLocaleTimeString([], {
@@ -18,6 +19,8 @@ export default function TradeIdeasStage() {
   const exit = useImmersive((s) => s.exit);
   const ideas = useConnection((s) => s.tradeIdeas);
   const clear = useConnection((s) => s.clearTradeIdeas);
+  const placeTrade = useConnection((s) => s.placeTrade);
+  const placements = useConnection((s) => s.tradePlacements);
 
   if (!active) return null;
 
@@ -67,6 +70,36 @@ export default function TradeIdeasStage() {
                 __html: renderMessage(idea.markdown).html,
               }}
             />
+            {idea.placeable ? (
+              (() => {
+                const state = placements[idea.id]; // undefined | placing | placed | failed
+                const label =
+                  state === "placed"
+                    ? "✓ Placed on Alpaca"
+                    : state === "placing"
+                      ? "Placing…"
+                      : state === "failed"
+                        ? "✕ Failed — see chat"
+                        : "▸ Place it on Alpaca";
+                return (
+                  <button
+                    type="button"
+                    disabled={state !== undefined}
+                    onClick={() => placeTrade(idea.id)}
+                    className={cn(
+                      "mt-3 border px-3 py-1.5 text-[11px] uppercase tracking-[2px] disabled:cursor-not-allowed",
+                      state === "placed"
+                        ? "border-emerald-400/60 bg-emerald-400/15 text-emerald-300"
+                        : state === "failed"
+                          ? "border-hal-red/60 bg-hal-red/15 text-hal-red"
+                          : "border-hal-amber/50 bg-hal-amber/10 text-hal-amber hover:bg-hal-amber/20 hover:text-white disabled:opacity-50",
+                    )}
+                  >
+                    {label}
+                  </button>
+                );
+              })()
+            ) : null}
           </article>
         ))}
       </div>

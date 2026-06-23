@@ -1813,7 +1813,7 @@
         </div>
         <div class="hud-item">
           <div class="label">UNIT</div>
-          <div class="value">HAL 9000</div>
+          <div class="value" id="hud-unit">HAL 9000</div>
         </div>
       </div>
       <div class="hud-row">
@@ -2106,6 +2106,10 @@
     </footer>
 
     <script>
+      // HAL's designation is injected by server.py as window.HAL_DESIGNATION
+      // (composed from HAL_NAME/HAL_VERSION in .env); never hardcode a version.
+      const hudUnit = document.getElementById("hud-unit");
+      if (hudUnit && window.HAL_DESIGNATION) hudUnit.textContent = window.HAL_DESIGNATION;
       const btn = document.getElementById("btn");
       const stateLabel = document.getElementById("stateLabel");
       const transcript = document.getElementById("transcript");
@@ -2280,7 +2284,8 @@
         wrap.className = `chat-msg ${role}`;
         const roleEl = document.createElement("div");
         roleEl.className = "chat-role";
-        roleEl.textContent = role === "user" ? "JEFFERY" : "HAL";
+        roleEl.textContent =
+          role === "user" ? (window.HAL_USER_NAME || "YOU").toUpperCase() : "HAL";
         wrap.appendChild(roleEl);
         const contentEl = document.createElement("div");
         contentEl.className = "chat-content";
@@ -2765,7 +2770,7 @@
         setMode("idle", "DORMANT");
         btn.disabled = false;
         textSend.disabled = false;
-        // In live mode, immediately re-arm the mic so Jeffery can speak again
+        // In live mode, immediately re-arm the mic so the user can speak again
         // without tapping anything. Hands-free loop.
         if (liveVisionActive && state === "idle") {
           connectAndRecord().catch((err) =>

@@ -13,12 +13,16 @@ import { usePositionSizing } from "@/stores/positionSizing";
 import type {
   AlertEvent,
   Attachment,
+  BrokerAccount,
+  BrokerPosition,
   ChatMessage,
   ConversationSummary,
   McpServer,
   Mode,
+  CommitteeStatus,
   NewsArticle,
   NewsWatch,
+  RiskStatus,
   ServerEnvelope,
   Subscription,
   TelemetryEvent,
@@ -54,6 +58,17 @@ interface ConnectionState {
    *  their own AnalyserNode. Null when not recording. */
   micStream: MediaStream | null;
   liveVision: boolean;
+  /** Mute HAL's voice output. Speech still streams + drives the state machine,
+   *  it's just silenced. Persisted across restarts. */
+  muted: boolean;
+  /** Whether HAL may open the mic on his own (listen for a reply after asking
+   *  a question, and keep hands-free immersive going). False = privacy mode.
+   *  Persisted across restarts. */
+  halListen: boolean;
+  /** Quiet mode (do-not-disturb): server-authoritative. When on, HAL holds all
+   *  proactive spoken alerts and stops volunteering trade ideas until lifted.
+   *  Synced from the server (echoed on connect + on every toggle). */
+  quiet: boolean;
   // MCP servers + market subscriptions (server-authoritative).
   mcpServers: McpServer[];
   subscriptions: Subscription[];
@@ -65,6 +80,19 @@ interface ConnectionState {
   // Pinned trade ideas / hold reads (newest first), so they don't scroll away
   // in the chat. Populated by the server's trade_idea messages.
   tradeIdeas: TradeIdea[];
+  // "Place it" button state per trade-idea id: optimistic "placing" on click,
+  // then "placed"/"failed" from the server's trade_placed message.
+  tradePlacements: Record<string, "placing" | "placed" | "failed">;
+  // Live brokerage view (Alpaca), for the Positions panel.
+  positions: BrokerPosition[];
+  brokerAccount: BrokerAccount | null;
+  brokerReady: boolean;
+  brokerPaper: boolean;
+  tradeMode: string; // "confirm" | "autopilot"
+  risk: RiskStatus | null;
+  positionsError: string | null;
+  // In-flight committee run progress (null when idle). startedAt is client-stamped.
+  committeeStatus: (CommitteeStatus & { startedAt: number }) | null;
 }
 
 interface ConnectionActions {
@@ -79,6 +107,9 @@ interface ConnectionActions {
   switchConversation: (id: string) => Promise<void>;
   deleteConversation: (id: string) => Promise<void>;
   toggleFastMode: () => void;
+  toggleMute: () => void;
+  toggleHalListen: () => void;
+  toggleQuiet: () => void;
   clearTelemetry: () => void;
   appendOptimisticUser: (content: string) => void;
   listMcp: () => void;
@@ -92,6 +123,12 @@ interface ConnectionActions {
   clearTradeIdeas: () => void;
   refreshWatchlist: () => void;
   refreshChart: () => void;
+  refreshPositions: () => void;
+  closePosition: (symbol: string) => void;
+  scalePosition: (symbol: string, delta: number) => void;
+  placeTrade: (id: string) => void;
+  setTradeMode: (mode: "confirm" | "autopilot") => void;
+  resetKillSwitch: () => void;
 }
 
 const STATE_LABELS: Record<Mode, string[]> = {
@@ -107,26 +144,74 @@ function pickLabel(mode: Mode): string {
   return opts[Math.floor(Math.random() * opts.length)];
 }
 
-// Current position-sizing settings, sent with each turn so HAL can size
-// trades to Jeffery's account and risk rules.
+// Sent with each turn so HAL tailors order steps to the chosen broker. Account
+// total comes from Alpaca and risk policy from the vault trading rules, both
+// read server-side — so only the broker rides along here.
 function riskPayload() {
   const s = usePositionSizing.getState();
   return {
-    accountSize: s.accountSize,
-    maxRiskPct: s.maxRiskPct,
-    stopLossPct: s.stopLossPct,
     broker: s.broker,
   };
 }
 
+// Mute preference persists across restarts (localStorage). Read once at module
+// load so the AudioPlayer starts in the right state before the first chunk.
+const MUTE_KEY = "hal.muted";
+function loadMuted(): boolean {
+  try {
+    return localStorage.getItem(MUTE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+function saveMuted(muted: boolean): void {
+  try {
+    localStorage.setItem(MUTE_KEY, muted ? "1" : "0");
+  } catch {
+    /* ignore quota / unavailable storage */
+  }
+}
+
+// Whether HAL may open the mic on his own — after asking a question, and to
+// keep hands-free immersive going. Turning this off is the "privacy" /
+// stop-listening switch. Persisted, defaults on.
+const LISTEN_KEY = "hal.listen";
+function loadHalListen(): boolean {
+  try {
+    return localStorage.getItem(LISTEN_KEY) !== "0";
+  } catch {
+    return true;
+  }
+}
+function saveHalListen(listen: boolean): void {
+  try {
+    localStorage.setItem(LISTEN_KEY, listen ? "1" : "0");
+  } catch {
+    /* ignore quota / unavailable storage */
+  }
+}
+
+// How long HAL keeps the mic open waiting for a reply to his question before
+// standing down (no speech detected). Cancelled the moment the user speaks.
+const QUESTION_LISTEN_MS = 10_000;
+
 // Module-scoped infra. We keep this OUT of zustand state to avoid React
 // trying to compare deep media-stream objects between renders.
 const audio = new AudioPlayer();
+audio.setMuted(loadMuted());
 let socket: HalSocket | null = null;
 let micStream: MediaStream | null = null;
 let recorder: MediaRecorder | null = null;
 let vad: Vad | null = null;
 let streamDone = false;
+// Patience timer for the post-question listen window (see armQuestionListen).
+let questionListenTimer: number | null = null;
+function clearQuestionListen() {
+  if (questionListenTimer !== null) {
+    clearTimeout(questionListenTimer);
+    questionListenTimer = null;
+  }
+}
 
 export const useConnection = create<ConnectionState & ConnectionActions>(
   (set, get) => {
@@ -156,20 +241,56 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
       }
     }
 
+    // True when HAL's most recent reply ended on a question — our cue to open
+    // the mic and wait for an answer.
+    function halJustAskedQuestion(): boolean {
+      const h = get().history;
+      for (let i = h.length - 1; i >= 0; i--) {
+        if (h[i].role === "assistant") {
+          return h[i].content.trim().endsWith("?");
+        }
+      }
+      return false;
+    }
+
+    // After HAL asks a question (outside hands-free immersive), open the mic
+    // and listen for a reply. VAD's silence cutoff sends the turn once the user
+    // speaks; if no one does, we stand down after QUESTION_LISTEN_MS so the mic
+    // doesn't sit open indefinitely. The patience timer is cancelled the moment
+    // speech starts (Vad.onSpeechStart, wired in startRecording).
+    function armQuestionListen() {
+      clearQuestionListen();
+      void get().startRecording(false);
+      questionListenTimer = window.setTimeout(() => {
+        questionListenTimer = null;
+        if (get().mode === "listening" && get().recording) {
+          get().cancelRecording();
+        }
+      }, QUESTION_LISTEN_MS);
+    }
+
     function maybeReturnToIdle() {
       if (!streamDone || audio.playing) return;
       setMode("idle", "DORMANT");
-      // Hands-free immersive: re-arm the mic after each turn so listening
-      // continues until the user exits immersive. Outside immersive we stay
-      // push-to-talk and never re-open the mic on our own.
+      // Privacy: when HAL is told to stop listening, never re-open the mic.
+      if (!get().halListen) return;
+      const immersive = useImmersive.getState().active;
+      const questionAsked = !immersive && halJustAskedQuestion();
+      // Hands-free immersive re-arms after every turn; outside immersive we only
+      // re-open the mic when HAL just asked something. The delay is a post-speech
+      // cooldown so the speaker's audio tail / room reverb doesn't instantly
+      // re-trigger the VAD the moment HAL stops.
+      if (!immersive && !questionAsked) return;
       try {
         window.setTimeout(() => {
-          const stillImmersive = useImmersive.getState().active;
-          const stillIdle = get().mode === "idle";
-          if (stillImmersive && stillIdle && !get().recording) {
+          if (get().mode !== "idle" || get().recording || audio.playing) return;
+          if (!get().halListen) return;
+          if (useImmersive.getState().active) {
             void get().startRecording(false);
+          } else if (questionAsked) {
+            armQuestionListen();
           }
-        }, 250);
+        }, 700);
       } catch {
         /* ignore */
       }
@@ -192,9 +313,34 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
         });
         return;
       }
+      if (msg.quiet !== undefined) {
+        set({ quiet: msg.quiet });
+        return;
+      }
+      if (msg.broker_ready !== undefined) {
+        set({
+          positions: msg.positions ?? [],
+          brokerAccount: msg.broker_account ?? null,
+          brokerReady: !!msg.broker_ready,
+          brokerPaper: msg.broker_paper ?? true,
+          tradeMode: msg.trade_mode ?? "confirm",
+          risk: msg.risk ?? null,
+          positionsError: msg.positions_error ?? null,
+        });
+        return;
+      }
       if (msg.telemetry) {
         set((s) => ({
-          telemetry: [...s.telemetry, msg.telemetry!].slice(-25),
+          telemetry: [...s.telemetry, msg.telemetry!].slice(-300),
+        }));
+        return;
+      }
+      if (msg.committee_status) {
+        const cs = msg.committee_status;
+        set((s) => ({
+          committeeStatus: cs.active
+            ? { ...cs, startedAt: s.committeeStatus?.startedAt ?? Date.now() }
+            : null,
         }));
         return;
       }
@@ -209,6 +355,13 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
           await immersive.setSource("trade_ideas");
           if (!immersive.active) await immersive.enter();
         })().catch((err) => console.warn("trade_idea open:", err));
+        return;
+      }
+      if (msg.trade_placed) {
+        const { id, ok } = msg.trade_placed;
+        set((s) => ({
+          tradePlacements: { ...s.tradePlacements, [id]: ok ? "placed" : "failed" },
+        }));
         return;
       }
       if (msg.conversations) {
@@ -296,6 +449,16 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
         });
         return;
       }
+      // Half-duplex: when HAL takes the floor (a reply or an injected alert)
+      // while the hands-free mic is still armed, tear the mic down WITHOUT
+      // sending — otherwise his own voice through the speakers (and room audio)
+      // trips the VAD, which would preempt his turn and cut him off mid-sentence.
+      // It re-arms via maybeReturnToIdle once he's done. (On a normal user turn
+      // the recorder is already null here — onstop sent the turn first — so this
+      // only fires when HAL starts talking on his own.)
+      if ((msg.state === "processing" || msg.state === "speaking") && recorder) {
+        get().cancelRecording();
+      }
       if (msg.state === "listening") return;
       if (msg.state === "processing") {
         streamDone = false;
@@ -343,6 +506,10 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
       recording: false,
       micStream: null,
       liveVision: false,
+      muted: loadMuted(),
+      halListen: loadHalListen(),
+      quiet: false, // server-authoritative; synced on connect via onJson
+
       mcpServers: [],
       subscriptions: [],
       subscriptionsConnected: false,
@@ -351,6 +518,15 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
       newsWatches: [],
       newsArticles: [],
       tradeIdeas: [],
+      tradePlacements: {},
+      positions: [],
+      brokerAccount: null,
+      brokerReady: false,
+      brokerPaper: true,
+      tradeMode: "confirm",
+      risk: null,
+      positionsError: null,
+      committeeStatus: null,
 
       // -- actions -----------------------------------------------------
       async init() {
@@ -455,10 +631,27 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
           // button's onPointerUp calls stopRecording(). Click-toggle / immersive
           // hands-free mode keeps the silence-based VAD cutoff.
           if (!pushToTalk) {
-            vad = new Vad(() => get().stopRecording(), {
-              rmsThreshold: 0.018,
-              silenceMs: 1200,
-            });
+            vad = new Vad(
+              () => {
+                // Half-duplex guard: if HAL is mid-turn (audio playing or
+                // processing/speaking), a detected utterance is his own voice or
+                // room noise — discard it instead of sending, so it can't cut
+                // him off. Real barge-in is via the Stop button.
+                const m = get().mode;
+                if (audio.playing || m === "speaking" || m === "processing") {
+                  get().cancelRecording();
+                  return;
+                }
+                get().stopRecording();
+              },
+              {
+                rmsThreshold: 0.018,
+                silenceMs: 1200,
+                // User started talking — commit to this turn; the post-question
+                // patience timeout no longer applies.
+                onSpeechStart: clearQuestionListen,
+              },
+            );
             vad.start(micStream);
           }
         } catch (err) {
@@ -468,6 +661,7 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
       },
 
       stopRecording() {
+        clearQuestionListen();
         vad?.stop();
         vad = null;
         if (recorder && recorder.state === "recording") {
@@ -481,6 +675,7 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
       cancelRecording() {
         // Tear down the mic without sending a turn. Detach onstop first so the
         // normal send-on-stop handler doesn't fire, then stop the tracks.
+        clearQuestionListen();
         vad?.stop();
         vad = null;
         const r = recorder;
@@ -578,6 +773,36 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
         set((s) => ({ fastMode: !s.fastMode }));
       },
 
+      toggleMute() {
+        const muted = !get().muted;
+        audio.setMuted(muted);
+        saveMuted(muted);
+        set({ muted });
+      },
+
+      toggleQuiet() {
+        // Server owns the flag; toggle optimistically and let the server echo
+        // confirm it (also keeps the button in sync with voice-driven toggles).
+        const quiet = !get().quiet;
+        set({ quiet });
+        void getSocket().sendCommand({ command: "set_quiet", on: quiet });
+      },
+
+      toggleHalListen() {
+        const halListen = !get().halListen;
+        saveHalListen(halListen);
+        set({ halListen });
+        // Engaging privacy mid-listen: stand the mic down now, don't wait for
+        // the next turn. Only tears down a HAL-opened listen (mode "listening"),
+        // never an in-flight user turn.
+        if (!halListen) {
+          clearQuestionListen();
+          if (get().recording && get().mode === "listening") {
+            get().cancelRecording();
+          }
+        }
+      },
+
       clearTelemetry() {
         set({ telemetry: [] });
       },
@@ -617,6 +842,28 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
       },
       refreshChart() {
         void getSocket().sendCommand({ command: "chart_refresh" });
+      },
+      refreshPositions() {
+        void getSocket().sendCommand({ command: "positions_refresh" });
+      },
+      closePosition(symbol) {
+        void getSocket().sendCommand({ command: "position_close", symbol });
+      },
+      scalePosition(symbol, delta) {
+        if (!delta) return;
+        void getSocket().sendCommand({ command: "scale_position", symbol, delta });
+      },
+      placeTrade(id) {
+        set((s) => ({
+          tradePlacements: { ...s.tradePlacements, [id]: "placing" },
+        }));
+        void getSocket().sendCommand({ command: "place_trade", id });
+      },
+      setTradeMode(mode) {
+        void getSocket().sendCommand({ command: "set_trade_mode", mode });
+      },
+      resetKillSwitch() {
+        void getSocket().sendCommand({ command: "reset_kill_switch" });
       },
     };
   },

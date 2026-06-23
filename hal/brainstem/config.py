@@ -4,8 +4,7 @@ IMPORTANT — import order: importing this module performs environment bootstrap
 that MUST run before torch / torchcodec / Piper / faster-whisper are imported:
   1. COQUI_TOS_AGREED
   2. loading .env (so every step + constant below can be configured by it)
-  3. registering the FFmpeg shared-DLL directory (Windows DLL resolution)
-  4. forcing UTF-8 on stdout/stderr
+  3. forcing UTF-8 on stdout/stderr
 server.py therefore imports config FIRST, before any heavy third-party import.
 """
 import os
@@ -36,28 +35,13 @@ if _ENV_PATH.exists():
                 _v = _v[:_c].rstrip()
         os.environ.setdefault(_k.strip(), _v)
 
-# torchcodec (required by TTS as of recent versions) loads the FFmpeg shared
-# libraries via Windows DLL resolution. Python 3.8+ no longer searches PATH for
-# DLLs — we register the directory explicitly. Windows-only: on Linux
-# os.add_dll_directory doesn't exist and ffmpeg is found via the system libs.
-# Default points at a `winget install Gyan.FFmpeg.Shared` install.
-_FFMPEG_DLL_DIR = os.environ.get(
-    "HAL_FFMPEG_DLL_DIR",
-    os.path.expandvars(
-        r"%LOCALAPPDATA%\Microsoft\WinGet\Packages"
-        r"\Gyan.FFmpeg.Shared_Microsoft.Winget.Source_8wekyb3d8bbwe"
-        r"\ffmpeg-8.1.1-full_build-shared\bin"
-    ),
-)
-if hasattr(os, "add_dll_directory") and os.path.isdir(_FFMPEG_DLL_DIR):
-    os.add_dll_directory(_FFMPEG_DLL_DIR)
-
 import sys
 
 # Force UTF-8 on stdout/stderr. We launch with output redirected to log files,
-# which makes Python fall back to Windows cp1252 — that throws UnicodeEncodeError
-# and crashes the turn whenever a reply contains a character like → or a curly
-# quote. errors="replace" keeps logging non-fatal even for stray glyphs.
+# so without a UTF-8 locale Python can fall back to ASCII — that throws
+# UnicodeEncodeError and crashes the turn whenever a reply contains a character
+# like → or a curly quote. errors="replace" keeps logging non-fatal even for
+# stray glyphs.
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
@@ -79,9 +63,10 @@ def _env_path(key: str, default) -> Path:
 
 
 # --- Identity (configurable via .env; defaults preserve current behavior) --
-USER_NAME = _env_str("HAL_USER_NAME", "Jeffery")
+USER_NAME = _env_str("HAL_USER_NAME", "User")
 HAL_NAME = _env_str("HAL_NAME", "HAL")
 HAL_VERSION = _env_str("HAL_VERSION", "9000")
+HAL_CREATOR = _env_str("HAL_CREATOR", "Jeffery Vincent")  # who built HAL
 HAL_DESIGNATION = f"{HAL_NAME} {HAL_VERSION}".strip()  # e.g. "HAL 9000"
 
 # --- Scratch root: HAL's derived, fully-rebuildable data (RAG index, SQLite, --
@@ -102,14 +87,52 @@ except OSError:
 MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY", "")
 MASSIVE_BASE_URL = "https://api.massive.com"
 
+# --- Alpaca brokerage (order execution) -------------------------------------
+# HAL places orders through Alpaca via the official alpaca-py SDK. ALPACA_PAPER
+# decides paper vs live: true (default) routes every order to the paper account
+# so nothing can touch real money until it's deliberately set false. The SDK
+# selects the right API host from that flag. ALPACA_AUTOPILOT flips the order
+# gate — false (default) stages each order for an explicit confirm; true submits
+# immediately once the vault rules gate passes. Both are runtime-togglable.
+ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", "")
+ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
+ALPACA_PAPER = os.environ.get("ALPACA_PAPER", "true").lower() != "false"
+ALPACA_AUTOPILOT = os.environ.get("ALPACA_AUTOPILOT", "false").lower() == "true"
+
+# --- Pre-trade risk engine (portfolio circuit breakers; see sensory.risk) ----
+# These cap the whole account over time, independent of any single trade's
+# merits — the runaway guard for autopilot. Each can be disabled by setting it
+# to 0. Daily-loss latches the kill switch (block new entries until reset).
+RISK_MAX_ORDERS_PER_MIN = _env_int("RISK_MAX_ORDERS_PER_MIN", 6)
+RISK_MAX_OPEN_POSITIONS = _env_int("RISK_MAX_OPEN_POSITIONS", 20)
+RISK_MAX_GROSS_EXPOSURE_PCT = float(os.environ.get("RISK_MAX_GROSS_EXPOSURE_PCT", "200"))
+RISK_DAILY_LOSS_LIMIT_PCT = float(os.environ.get("RISK_DAILY_LOSS_LIMIT_PCT", "10"))
+
 # News watch monitor: poll interval (seconds) and primary RSS source
 # ("yahoo" or "google"). Both feeds are keyless; Yahoo is per-symbol headlines.
 NEWS_POLL_SECONDS = float(os.environ.get("NEWS_POLL_SECONDS", "300"))
 NEWS_PRIMARY_FEED = os.environ.get("NEWS_PRIMARY_FEED", "yahoo")
 
+# Pre-earnings IV-crush screener: how often to scan the watchlist (seconds) and
+# how many calendar days ahead an earnings report must fall to be in scope.
+# Backs the "skip earnings" rule — flags watchlist names that report soon AND
+# carry rich option premium (IV well above recent realized vol), so they can be
+# avoided/faded before the post-report IV crush. The earnings calendar comes
+# from Nasdaq's keyless endpoint (same no-key spirit as the news feeds); IV
+# richness reuses analysis.iv_context. Hourly default — dates and IV regime move
+# slowly relative to a 5-minute news poll, and each scan runs live IV pulls.
+EARNINGS_POLL_SECONDS = float(os.environ.get("EARNINGS_POLL_SECONDS", "3600"))
+EARNINGS_LOOKAHEAD_DAYS = _env_int("EARNINGS_LOOKAHEAD_DAYS", 3)
+
 # Chart bar source: "yahoo" (free, keyless, near-real-time for US equities) or
 # "massive" (REST aggregates; freshness depends on the stock-data entitlement).
 CHART_DATA_SOURCE = os.environ.get("CHART_DATA_SOURCE", "yahoo")
+
+# Reddit social-sentiment (optional). Reddit blocks keyless JSON, so HAL uses
+# app-only OAuth: register a free "script" app at reddit.com/prefs/apps and put
+# its client id + secret here. Left blank, the Reddit read stays inert (neutral).
+REDDIT_CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID", "")
+REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET", "")
 
 # --- Ollama endpoint + model selection --------------------------------------
 # These pick *which* models HAL asks for; where the daemon stores the blobs is
@@ -141,8 +164,8 @@ TTS_PITCH_SHIFT_STEPS = _env_int("TTS_PITCH_SHIFT_STEPS", 0)
 WHISPER_MODEL_SIZE = _env_str("WHISPER_MODEL_SIZE", "medium")
 WHISPER_PROMPT = (
     f"Conversation with {HAL_DESIGNATION}, the AI computer from 2001: A Space Odyssey. "
-    f"User is {USER_NAME}. Topics include PowerShell, Python, Ollama, files, and tasks "
-    "on a Windows desktop."
+    f"User is {USER_NAME}. Topics include bash, Python, Ollama, files, and tasks "
+    "on a Linux desktop."
 )
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 

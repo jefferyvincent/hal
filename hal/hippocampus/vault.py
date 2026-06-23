@@ -137,6 +137,7 @@ def validate_note(rel_path: str) -> list[str]:
         "trade": ["symbol", "status", "side", "strategy", "opened"],
         "thesis": ["symbol", "conviction"],
         "watch": ["symbol", "trigger", "status"],
+        "analysis": ["symbol", "bias"],
         "rule": [],
     }
     for field in required_by_type.get(note_type, []):

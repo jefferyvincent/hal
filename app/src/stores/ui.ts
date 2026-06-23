@@ -4,15 +4,20 @@ interface UiState {
   conversationsOpen: boolean;
   telemetryHidden: boolean;
   positionSizingOpen: boolean;
+  positionsOpen: boolean;
   mcpOpen: boolean;
   subscriptionsOpen: boolean;
+  cognitionOpen: boolean;
   chatOpen: boolean;
   fullscreenChat: boolean;
   toggleConversations: () => void;
   setTelemetryHidden: (hidden: boolean) => void;
   togglePositionSizing: () => void;
+  togglePositions: () => void;
   toggleMcp: () => void;
   toggleSubscriptions: () => void;
+  toggleCognition: () => void;
+  setCognitionOpen: (open: boolean) => void;
   toggleChatOpen: () => void;
   setChatOpen: (open: boolean) => void;
   toggleFullscreenChat: () => void;
@@ -22,8 +27,10 @@ export const useUi = create<UiState>((set) => ({
   conversationsOpen: false,
   telemetryHidden: true,
   positionSizingOpen: false,
+  positionsOpen: false,
   mcpOpen: false,
   subscriptionsOpen: false,
+  cognitionOpen: false,
   // Chat is hidden by default so the eye sits alone, uncluttered. The
   // Chat button in Controls toggles it on; closing also drops fullscreen.
   chatOpen: false,
@@ -37,10 +44,16 @@ export const useUi = create<UiState>((set) => ({
   togglePositionSizing: () =>
     set((s) => ({ positionSizingOpen: !s.positionSizingOpen })),
 
+  togglePositions: () => set((s) => ({ positionsOpen: !s.positionsOpen })),
+
   toggleMcp: () => set((s) => ({ mcpOpen: !s.mcpOpen })),
 
   toggleSubscriptions: () =>
     set((s) => ({ subscriptionsOpen: !s.subscriptionsOpen })),
+
+  toggleCognition: () => set((s) => ({ cognitionOpen: !s.cognitionOpen })),
+
+  setCognitionOpen: (open) => set({ cognitionOpen: open }),
 
   toggleChatOpen: () =>
     set((s) => {
