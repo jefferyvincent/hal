@@ -1,6 +1,6 @@
 # HAL 9000 — Voice Assistant
 
-Created by Jeffery Vincnet
+Created by Jeffery Vincent
 
 Local voice assistant with a HAL 9000 themed UI. Speaks via XTTS, listens via Whisper,
 thinks via Ollama. Runs entirely on the host machine — no cloud round-trips.
