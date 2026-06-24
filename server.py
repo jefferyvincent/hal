@@ -1925,9 +1925,14 @@ _QUIET_OFF = re.compile(
     re.IGNORECASE)
 _QUIET_ON = re.compile(
     r"\b(?:quiet mode|be quiet|stay quiet|go quiet|stand down|do not disturb|"
-    r"don'?t disturb|\bdnd\b|stop (?:the )?alerts?|no more alerts?|"
-    r"mute (?:the )?alerts?|silence (?:the )?alerts?|stop alerting|stop talking|"
-    r"stop pitching|stop suggesting|shut off (?:the )?alerts?|leave me alone|"
+    r"don'?t disturb|\bdnd\b|no more alerts?|"
+    # Silence the alert stream. The "turn/switch/shut off" forms must stay out of
+    # _QUIET_OFF's "turn alerts back on" path — they keep the explicit "off", so
+    # there's no overlap. Optional the/those/my + overnight qualifier so phrasings
+    # like "turn off those overnight alerts" route here (the documented failure).
+    r"(?:stop|mute|silence|shut off|turn off|switch off|disable|kill|hold|pause|"
+    r"snooze)(?: (?:the|those|my))?(?: overnight)? alerts?|"
+    r"stop alerting|stop talking|stop pitching|stop suggesting|leave me alone|"
     r"knock it off)\b",
     re.IGNORECASE)
 

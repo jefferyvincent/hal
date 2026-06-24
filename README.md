@@ -328,8 +328,8 @@ Direct requests still work — quiet only suppresses what HAL starts on its own.
 
 | Say something like… | What it does |
 | --- | --- |
-| "Be quiet" / "Stand down" / "Stop the alerts" / "Do not disturb" | Engages quiet mode |
-| "Resume" / "Alerts back on" / "Noisy mode" | Lifts it |
+| "Be quiet" / "Stand down" / "Do not disturb" / "Stop / turn off / disable / snooze the alerts" (an "overnight" qualifier is fine: *"turn off those overnight alerts"*) | Engages quiet mode |
+| "Resume" / "Alerts back on" / "Noisy mode" / "Turn alerts back on" | Lifts it |
 
 Or use the **QUIET** button in the HUD (bell-with-slash, glows amber when engaged).
 Voice and button stay in sync, so a spoken toggle updates the button and vice-versa.
