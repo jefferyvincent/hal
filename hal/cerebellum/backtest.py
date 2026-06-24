@@ -24,6 +24,7 @@ Massive endpoints used:
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
@@ -49,6 +50,31 @@ DTE_MIN, DTE_MAX = 3, 12   # acceptable expiry window around TARGET_DTE
 CONTRACT_MULTIPLIER = 100  # shares per option contract
 COMMISSION_PER_CONTRACT = 0.65  # assumption, per leg per side
 VOL_LOOKBACK = 252         # trading days for the realized-vol percentile
+
+
+@dataclass(frozen=True)
+class StrategyParams:
+    """Tunable knobs for the S/R-break + RSI signal and the contract pick.
+
+    Defaults reproduce the original hardcoded behavior, so generate_signals(bars)
+    and run_backtest(...) are byte-for-byte unchanged unless a caller passes
+    overrides. The optimizer (cerebellum.optimize) sweeps these to find a robust
+    configuration; stop_pct/tp_pct of None means "use the vault trading-rules
+    exit" (the live policy), so the default backtest still validates the same
+    exit the live trader runs.
+    """
+    rsi_period: int = RSI_PERIOD
+    pivot_k: int = PIVOT_K
+    rsi_long: float = 50.0     # RSI must EXCEED this to confirm a call (break up)
+    rsi_short: float = 50.0    # RSI must be BELOW this to confirm a put (break down)
+    target_dte: int = TARGET_DTE
+    dte_min: int = DTE_MIN
+    dte_max: int = DTE_MAX
+    stop_pct: Optional[float] = None   # None → vault rules
+    tp_pct: Optional[float] = None      # None → vault rules
+
+
+DEFAULT_PARAMS = StrategyParams()
 
 
 def configure(base_url: str, api_key: str) -> None:
@@ -174,11 +200,13 @@ def regime_label(pct: Optional[float]) -> str:
 
 # --- signal generation -----------------------------------------------------
 
-def generate_signals(bars: list[dict]) -> list[dict]:
+def generate_signals(bars: list[dict], params: StrategyParams = DEFAULT_PARAMS) -> list[dict]:
     """Scan daily bars; emit a signal when price breaks the most recent pivot
     S/R with RSI confirmation.
 
     bars: [{t (unix s), o,h,l,c,v}] ascending.
+    params: signal tuning (RSI period, pivot half-window, RSI thresholds); the
+    defaults reproduce the original fixed strategy.
     Returns [{index, date, side ('call'|'put'), spot, regime, regime_pct}].
     A signal at bar i means: enter at bar i's close (next-day fill is a future
     refinement). We require a confirmed pivot strictly before i so we are not
@@ -187,28 +215,28 @@ def generate_signals(bars: list[dict]) -> list[dict]:
     closes = [b["c"] for b in bars]
     highs = [b["h"] for b in bars]
     lows = [b["l"] for b in bars]
-    rsis = rsi(closes)
+    rsis = rsi(closes, params.rsi_period)
 
     signals: list[dict] = []
     last_side: Optional[str] = None  # de-dupe consecutive same-direction breaks
     # Need enough history for pivots + RSI before the first possible signal.
-    first = max(RSI_PERIOD + 1, PIVOT_K * 2 + 1)
+    first = max(params.rsi_period + 1, params.pivot_k * 2 + 1)
     for i in range(first, len(bars)):
         r = rsis[i]
         if r is None:
             continue
-        # Pivots strictly in the past (indices < i - PIVOT_K can be confirmed).
-        past_high = pivots(highs[:i], "high")
-        past_low = pivots(lows[:i], "low")
+        # Pivots strictly in the past (indices < i - pivot_k can be confirmed).
+        past_high = pivots(highs[:i], "high", params.pivot_k)
+        past_low = pivots(lows[:i], "low", params.pivot_k)
         if not past_high or not past_low:
             continue
         resistance = past_high[-1][1]
         support = past_low[-1][1]
         price = closes[i]
         side: Optional[str] = None
-        if price > resistance and r > 50:
+        if price > resistance and r > params.rsi_long:
             side = "call"
-        elif price < support and r < 50:
+        elif price < support and r < params.rsi_short:
             side = "put"
         if side is None or side == last_side:
             # require a flip to avoid firing every bar inside a breakout run
@@ -290,15 +318,16 @@ async def fetch_yahoo_daily(client: httpx.AsyncClient, yahoo_sym: str, frm: str,
 
 async def pick_contract(
     client: httpx.AsyncClient, underlying: str, side: str, spot: float, entry: date,
+    params: StrategyParams = DEFAULT_PARAMS,
 ) -> Optional[dict]:
-    """Find the ATM contract nearest TARGET_DTE on/after `entry`.
+    """Find the ATM contract nearest params.target_dte on/after `entry`.
 
     Lists expired contracts whose expiration falls in the DTE window, then
-    picks the one with strike closest to spot and DTE closest to TARGET_DTE.
+    picks the one with strike closest to spot and DTE closest to target_dte.
     Returns {ticker, strike, expiration, dte} or None.
     """
-    lo = (entry + timedelta(days=DTE_MIN)).isoformat()
-    hi = (entry + timedelta(days=DTE_MAX)).isoformat()
+    lo = (entry + timedelta(days=params.dte_min)).isoformat()
+    hi = (entry + timedelta(days=params.dte_max)).isoformat()
     body = await _get(client, "/v3/reference/options/contracts", {
         "underlying_ticker": underlying,
         "contract_type": side,
@@ -321,8 +350,8 @@ async def pick_contract(
         except ValueError:
             continue
         dte = (exp_d - entry).days
-        # sort key: nearest strike first, then nearest to TARGET_DTE
-        key = (abs(strike - spot), abs(dte - TARGET_DTE))
+        # sort key: nearest strike first, then nearest to target_dte
+        key = (abs(strike - spot), abs(dte - params.target_dte))
         if best_key is None or key < best_key:
             best_key = key
             best = {"ticker": tk, "strike": strike, "expiration": exp, "dte": dte}
@@ -471,16 +500,15 @@ def split_by_regime(trades: list[dict]) -> dict:
 
 # --- orchestrator ----------------------------------------------------------
 
-async def run_backtest(underlying: str = "SPY", months: int = 24) -> dict:
-    """Full pipeline: fetch underlying -> signals -> contracts -> trades ->
-    metrics. Returns a result dict (also carries an equity-curve payload for
-    the UI). Raises RuntimeError on config/data problems."""
-    if not API_KEY:
-        raise RuntimeError("MASSIVE_API_KEY not configured")
+def _resolve_underlying(underlying: str) -> tuple[str, Optional[str], str]:
+    """Map a requested root to the symbol actually traded, the Yahoo symbol for
+    its underlying value (None if Massive serves it), and a human-facing note
+    explaining any substitution. Pulled out of run_backtest so the optimizer
+    resolves the symbol the same way."""
     underlying = underlying.upper().strip()
+    note_parts: list[str] = []
     # Account-size guard: full SPX options are ~10x too large for most accounts;
     # substitute the 1/10-size mini (XSP) so picks aren't capital-heavy.
-    note_parts: list[str] = []
     if underlying in _INDEX_MINI:
         sub = _INDEX_MINI[underlying]
         note_parts.append(f"{underlying} options are ~10x account size and thinly traded; backtested {sub} (same S&P exposure, far more liquid) instead.")
@@ -491,47 +519,111 @@ async def run_backtest(underlying: str = "SPY", months: int = 24) -> dict:
     yahoo_sym = _INDEX_YAHOO.get(underlying)
     if yahoo_sym:
         note_parts.append(f"Underlying from Yahoo ({yahoo_sym}); options from Massive.")
-    proxy_note = " ".join(note_parts)
+    return underlying, yahoo_sym, " ".join(note_parts)
+
+
+async def _fetch_underlying_bars(
+    client: httpx.AsyncClient, underlying: str, yahoo_sym: Optional[str], months: int,
+) -> list[dict]:
+    """Daily underlying bars for the signal — Yahoo for index values, else Massive.
+    Depends only on (symbol, months), so the optimizer fetches it ONCE and reuses
+    it across every parameter combo."""
     to_d = date.today()
     frm_d = to_d - timedelta(days=int(months * 30.5))
+    if yahoo_sym:
+        return await fetch_yahoo_daily(client, yahoo_sym, frm_d.isoformat(), to_d.isoformat())
+    return await fetch_daily(client, underlying, frm_d.isoformat(), to_d.isoformat())
+
+
+def exit_rules_for(params: StrategyParams, vault_rules: dict) -> dict:
+    """Resolve the exit policy a backtest run should use: the vault trading-rules,
+    overridden by any explicit stop_pct/tp_pct on `params`. Default params leave
+    the vault policy untouched, so the live exit is what gets validated."""
+    rules = dict(vault_rules)
+    if params.stop_pct is not None:
+        rules["stop_loss_pct"] = params.stop_pct
+    if params.tp_pct is not None:
+        rules["take_profit_pct"] = params.tp_pct
+    return rules
+
+
+async def simulate_signals(
+    client: httpx.AsyncClient,
+    underlying: str,
+    signals: list[dict],
+    exit_rules: dict,
+    params: StrategyParams = DEFAULT_PARAMS,
+    *,
+    contract_cache: Optional[dict] = None,
+    optbar_cache: Optional[dict] = None,
+) -> list[dict]:
+    """Turn signals into completed trades: pick each contract, fetch its bars,
+    simulate the exit. Optional caches let a sweep reuse contract discovery and
+    option-bar fetches across parameter combos (the expensive API calls), so an
+    optimizer pays for each unique contract once, not once per combo."""
+    trades: list[dict] = []
+    for sig in signals:
+        entry = date.fromisoformat(sig["date"])
+        ckey = (underlying, sig["side"], sig["date"], round(sig["spot"], 2),
+                params.dte_min, params.dte_max, params.target_dte)
+        if contract_cache is not None and ckey in contract_cache:
+            contract = contract_cache[ckey]
+        else:
+            contract = await pick_contract(client, underlying, sig["side"], sig["spot"], entry, params)
+            if contract_cache is not None:
+                contract_cache[ckey] = contract
+        if not contract:
+            continue
+        okey = contract["ticker"]
+        if optbar_cache is not None and okey in optbar_cache:
+            opt_bars = optbar_cache[okey]
+        else:
+            opt_bars = await fetch_daily(client, contract["ticker"], entry.isoformat(), contract["expiration"])
+            if optbar_cache is not None:
+                optbar_cache[okey] = opt_bars
+        trade = simulate_trade(sig["side"], opt_bars, None,
+                               symbol=contract["ticker"], rules=exit_rules)
+        if not trade:
+            continue
+        trade.update({
+            "date": sig["date"],
+            "regime": sig["regime"],
+            "regime_pct": sig["regime_pct"],
+            "spot": sig["spot"],
+            "strike": contract["strike"],
+            "expiration": contract["expiration"],
+            "ticker": contract["ticker"],
+        })
+        trades.append(trade)
+    return trades
+
+
+async def run_backtest(
+    underlying: str = "SPY", months: int = 24, params: StrategyParams = DEFAULT_PARAMS,
+) -> dict:
+    """Full pipeline: fetch underlying -> signals -> contracts -> trades ->
+    metrics. Returns a result dict (also carries an equity-curve payload for
+    the UI). Raises RuntimeError on config/data problems. `params` defaults to
+    the original fixed strategy; the optimizer passes swept variants."""
+    if not API_KEY:
+        raise RuntimeError("MASSIVE_API_KEY not configured")
+    underlying, yahoo_sym, proxy_note = _resolve_underlying(underlying)
 
     async with httpx.AsyncClient() as client:
-        if yahoo_sym:
-            bars = await fetch_yahoo_daily(client, yahoo_sym, frm_d.isoformat(), to_d.isoformat())
-        else:
-            bars = await fetch_daily(client, underlying, frm_d.isoformat(), to_d.isoformat())
+        bars = await _fetch_underlying_bars(client, underlying, yahoo_sym, months)
         if len(bars) < 60:
             raise RuntimeError(f"only {len(bars)} daily bars for {underlying}; need 60+")
-        signals = generate_signals(bars)
+        signals = generate_signals(bars, params)
 
         # Load the vault exit policy ONCE and reuse it for every trade so the
-        # backtest exits exactly where the live trader would (same stop/TP %).
+        # backtest exits exactly where the live trader would (same stop/TP %),
+        # unless params explicitly override the levels (optimizer sweep).
         from hal.cortex import rules as _rules
-        exit_rules = _rules.load_rules()
+        exit_rules = exit_rules_for(params, _rules.load_rules())
         stop_pct = exit_rules.get("stop_loss_pct", 50)
         tp_pct = exit_rules.get("take_profit_pct", 50)
 
-        trades: list[dict] = []
-        for sig in signals:
-            entry = date.fromisoformat(sig["date"])
-            contract = await pick_contract(client, underlying, sig["side"], sig["spot"], entry)
-            if not contract:
-                continue
-            opt_bars = await fetch_daily(client, contract["ticker"], entry.isoformat(), contract["expiration"])
-            trade = simulate_trade(sig["side"], opt_bars, None,
-                                   symbol=contract["ticker"], rules=exit_rules)
-            if not trade:
-                continue
-            trade.update({
-                "date": sig["date"],
-                "regime": sig["regime"],
-                "regime_pct": sig["regime_pct"],
-                "spot": sig["spot"],
-                "strike": contract["strike"],
-                "expiration": contract["expiration"],
-                "ticker": contract["ticker"],
-            })
-            trades.append(trade)
+        trades = await simulate_signals(client, underlying, signals, exit_rules, params)
 
     metrics = compute_metrics(trades)
     return {

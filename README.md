@@ -396,10 +396,13 @@ cast. The seed `AVGO.md` is a worked example.
 ### Multi-agent committee (deep analysis)
 
 A heavier, slower workup than a quick trade idea: vol/setup/catalyst analysts (plus
-an **analysis** voice when the vault's `Analysis/` folder has an active note on the
-name) → bull-vs-bear debate → head-trader judge → your deterministic rules gate.
-Pins a TRADE-or-PASS verdict (with the full desk reasoning) in the Trade Ideas pane
-and **places no orders**.
+a deterministic **regime** read of the price tape — trending up/down vs chop, via a
+Kaufman efficiency ratio — and an **analysis** voice when the vault's `Analysis/`
+folder has an active note on the name) → bull-vs-bear debate → head-trader judge →
+your deterministic rules gate. Pins a TRADE-or-PASS verdict (with the full desk
+reasoning) in the Trade Ideas pane and **places no orders**. The regime read is the
+desk's one purely directional vote — it leans neutral in chop regardless of slope,
+since trading a direction in a choppy tape is how breakout signals bleed to theta.
 
 | Say something like… | What it does |
 | --- | --- |
@@ -419,6 +422,36 @@ profit factor. Its **stop / take-profit exits come from the same vault rules the
 live trader uses** (`stop_loss_pct` / `take_profit_pct` in `Rules/trading-rules.md`),
 so a backtest validates the exit policy you actually run. Edit those percentages and
 both the backtest and live brackets move together.
+
+### Strategy optimizer (parameter sweep + walk-forward)
+
+Where a backtest runs **one** fixed configuration, the optimizer **sweeps** the
+strategy's knobs — RSI period, pivot window, RSI thresholds, stop / take-profit
+percentages — scores every combination, and surfaces the ones that actually hold up.
+
+| Say something like… | What it does |
+| --- | --- |
+| "Optimize SPY" / "Tune the strategy on QQQ" | Sweeps configs, speaks the verdict, drops a ranked leaderboard in chat |
+| "Run a parameter sweep on the Dow" / "Grid search NVDA" | Same route (`optimize`), any phrasing that names the sweep |
+
+Two guards against the classic optimizer trap — curve-fitting a number that won't
+repeat live:
+
+- **Walk-forward split.** Every config is scored on an **in-sample** slice (the older
+  ~70% of the window) and *separately* measured on the **out-of-sample** tail it never
+  influenced. The leaderboard's **Held up?** column flags configs whose edge survived
+  out-of-sample; if none do, HAL says so plainly and tells you *not* to trade them —
+  the signal needs rethinking, not just retuning.
+- **Sample-size shrink.** A profit factor on three trades is noise, so thin configs
+  are shrunk in the ranking and can't top the board on a lucky handful.
+
+The sweep is **API-frugal**: contract discovery and option-bar fetches (the expensive
+Massive calls) are cached and shared across every combination, so a ~100-config sweep
+costs roughly one backtest's worth of API, not a hundred. The winning config's equity
+curve is pushed to the **strategy backtest panel** so the leaderboard has a picture to
+go with the verdict. An optional, explicitly-gated LLM review of the tearsheet
+(`ai_optimize(..., confirm_llm_usage=True)`) can suggest where to search next — off by
+default so it never burns the smart model by surprise.
 
 > The committee and Alpaca tools only work after the venv is rebuilt against
 > Python 3.13 and `alpaca-py` is installed (both handled by `./setup.sh`).
@@ -452,6 +485,8 @@ Key files when something breaks:
 | `hal/sensory/earnings.py` | Pre-earnings IV-crush screener (Nasdaq calendar → IV-richness flag) |
 | `hal/cerebellum/strategy.py` | Shared exit rule + levels + `OrderIntent` (backtest ↔ live single source of truth) |
 | `hal/cerebellum/execution.py` | `Execution` protocol: `SimBroker` (backtest) + `LiveExecution` (live) |
+| `hal/cerebellum/backtest.py` | Options strategy backtester + `StrategyParams` (tunable signal/exit knobs) |
+| `hal/cerebellum/optimize.py` | Parameter sweep + walk-forward (in/out-of-sample) ranking over the backtester |
 | `hal/cortex/committee.py` | Multi-agent trade committee (analysts → debate → judge) |
 | `hal/cerebellum/committee_backtest.py` | Committee backtest referee (baseline vs LLM) |
 | `hal/cortex/rules.py` | Deterministic trading-rules gate (`check_trade`) + vault exit-policy source |

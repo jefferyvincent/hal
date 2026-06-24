@@ -278,7 +278,27 @@ async def _gather_analysts(symbol: str, horizon: str) -> list[dict]:
             return None
         return await _analyst(_ANALYSIS_SYS, evidence, "analysis")
 
-    reads = await asyncio.gather(vol(), setup(), catalyst(), research())
+    async def regime() -> dict | None:
+        """Deterministic price-regime read (no LLM): trending up/down vs chop.
+        Gives the desk a directional-tape vote the vol/structure/journal analysts
+        don't carry. Skipped (None) when bars are unavailable, so a data gap
+        leaves the existing consensus untouched."""
+        try:
+            reg = await analysis.price_regime(symbol)
+        except Exception as e:
+            print(f"[committee] regime unavailable: {e}")
+            return None
+        if not reg or reg.get("error"):
+            return None
+        return {
+            "role": "regime",
+            "lean": reg["lean"],
+            "confidence": float(reg.get("confidence", 0.3) or 0.3),
+            "note": reg["note"],
+            "evidence": reg.get("evidence", reg["note"]),
+        }
+
+    reads = await asyncio.gather(vol(), setup(), catalyst(), research(), regime())
     return [r for r in reads if r is not None]
 
 

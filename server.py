@@ -54,6 +54,7 @@ from hal.cortex import analysis
 from hal.cortex import committee
 from hal.motor import charting
 from hal.cerebellum import backtest
+from hal.cerebellum import optimize
 from hal.cerebellum import committee_backtest
 from hal.cerebellum import strategy as trade_strategy
 from hal.cerebellum.execution import LiveExecution
@@ -1701,17 +1702,10 @@ def _resolve_index_alias(text: str) -> str | None:
     return None
 
 
-def _match_backtest_intent(text: str) -> str | None:
-    """Return the underlying ticker if this is a backtest request, else None.
-    Resolves index names (Dow/Nasdaq/Russell/...) to their option proxies, then
-    falls back to an explicit ticker, then SPY. Deterministic route because
-    Qwen3 blanks on new tools with think:False (see chart intent)."""
-    if not text or not _BACKTEST_INTENT.search(text):
-        return None
-    # "close the backtest" contains "backtest" — never treat a close request as
-    # a new backtest (the close route handles it).
-    if _match_close_view_intent(text):
-        return None
+def _resolve_backtest_symbol(text: str) -> str:
+    """Resolve the underlying ticker from a backtest/optimize phrase: index names
+    (Dow/Nasdaq/Russell/...) to their option proxies, then an explicit ticker,
+    then a company name, then SPY. Shared by the backtest and optimize routes."""
     alias = _resolve_index_alias(text)
     if alias:
         return alias
@@ -1725,6 +1719,39 @@ def _match_backtest_intent(text: str) -> str | None:
     if m2 and m2.group(1) not in ("HAL", "SPY"):
         return m2.group(1)
     return "SPY"
+
+
+def _match_backtest_intent(text: str) -> str | None:
+    """Return the underlying ticker if this is a backtest request, else None.
+    Deterministic route because Qwen3 blanks on new tools with think:False (see
+    chart intent)."""
+    if not text or not _BACKTEST_INTENT.search(text):
+        return None
+    # "close the backtest" contains "backtest" — never treat a close request as
+    # a new backtest (the close route handles it).
+    if _match_close_view_intent(text):
+        return None
+    return _resolve_backtest_symbol(text)
+
+
+# Optimization is its own route (checked before the backtest route, since "tune
+# the backtest" contains "backtest"): sweep the strategy params with a
+# walk-forward split rather than run the one fixed config.
+_OPTIMIZE_INTENT = re.compile(
+    r"\b(optimi[sz]e|optimi[sz]ation|grid[\s-]?search|walk[\s-]?forward|"
+    r"parameter sweep|param sweep|tune the (strateg|backtest|param|signal))\b",
+    re.IGNORECASE,
+)
+
+
+def _match_optimize_intent(text: str) -> str | None:
+    """Return the underlying ticker if this is a parameter-optimization request,
+    else None. Same symbol resolution as the backtest route."""
+    if not text or not _OPTIMIZE_INTENT.search(text):
+        return None
+    if _match_close_view_intent(text):
+        return None
+    return _resolve_backtest_symbol(text)
 
 
 def _match_chart_intent(text: str) -> tuple[str, str] | None:
@@ -4374,6 +4401,57 @@ async def process_turn(
                 json.dumps({"account": acct, "positions": positions},
                            default=str)[:MAX_TOOL_OUTPUT_CHARS])
             return await _speak_and_return(spoken, "positions.read")
+
+        # Parameter optimization: "optimize SPY" / "tune the strategy" sweeps the
+        # strategy knobs with a walk-forward split and shows a ranked leaderboard.
+        # Checked BEFORE the backtest route (which catches the bare "backtest" in
+        # "tune the backtest"). Surfaces a markdown table in chat (like the index
+        # sweep) AND pushes the winning config's equity curve to the BacktestStage.
+        opt_symbol = _match_optimize_intent(user_text)
+        if opt_symbol:
+            opt_months = 12 if opt_symbol in _INDEX_QUICK_SYMBOLS else 24
+            await websocket.send_json({"state": "processing",
+                                       "text": f"Optimizing {opt_symbol} — sweeping configs ({opt_months}mo, this takes a bit)..."})
+            await _emit_telemetry(websocket, "backtest.optimize", opt_symbol,
+                                  f"Parameter sweep with walk-forward validation on {opt_symbol}.")
+            table_md = ""
+            try:
+                opt_result = await optimize.optimize(opt_symbol, months=opt_months)
+                spoken = optimize.speak_summary(opt_result)
+                table_md = optimize.table(opt_result)
+                # Visualize the winning config: re-run it through the normal
+                # backtester and push its equity curve to the BacktestStage so the
+                # leaderboard table has a picture to go with the verdict.
+                best = opt_result.get("best")
+                if best:
+                    try:
+                        viz = await backtest.run_backtest(opt_symbol, months=opt_months,
+                                                          params=best["params"])
+                        await websocket.send_json({
+                            "action": "open_view", "kind": "backtest",
+                            "backtest": backtest.equity_payload(viz),
+                        })
+                    except Exception as e:
+                        print(f"[optimize] equity viz for {opt_symbol} failed: {e}")
+            except Exception as e:
+                spoken = f"I could not complete that optimization, {USER_NAME}. {e}"
+            await stream_sentence(spoken)
+            assistant_content = table_md or spoken
+            new_history = history + [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": assistant_content},
+            ]
+            if on_reply:
+                try:
+                    await on_reply(new_history)
+                except Exception as e:
+                    print(f"[turn] on_reply failed: {e}")
+            print(f"[hal] optimize {opt_symbol}: {spoken!r}")
+            await _emit_telemetry(websocket, "backtest.optimize", "done", spoken, status="ok")
+            await websocket.send_json({"state": "done"})
+            if len(new_history) > MAX_HISTORY_MESSAGES:
+                new_history = new_history[-MAX_HISTORY_MESSAGES:]
+            return new_history
 
         # Index comparison sweep: "backtest the indexes" / "compare the indexes"
         # runs the set and shows a ranked table. Checked BEFORE the single-symbol

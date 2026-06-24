@@ -341,3 +341,92 @@ async def iv_context(underlying: str, atm_window: int = 3) -> dict:
             "UNKNOWN": "insufficient data to judge",
         }[verdict],
     }
+
+
+# --- price/trend regime -----------------------------------------------------
+# A deterministic market-structure read (borrowed in spirit from QuantDinger's
+# regime_detect). The committee already judges the VOLATILITY regime (rich/cheap
+# premium); this judges the PRICE regime (trending up, trending down, or chopping
+# sideways) so the desk has an actual directional-tape input, not just a vol read.
+# Trend strength uses Kaufman's Efficiency Ratio — net move / total path over the
+# window — which cleanly separates a clean trend (ER→1) from chop (ER→0).
+
+_ER_WINDOW = 20            # bars for the efficiency-ratio path measurement
+_SMA_FAST, _SMA_SLOW = 20, 50
+_TREND_ER = 0.30           # ER at/above this is a real trend, below it is chop
+
+
+def detect_regime(closes: list[float]) -> dict:
+    """Classify the price regime from daily closes. Pure function (no I/O).
+
+    Returns {label, direction, lean, confidence, note, evidence, stats} where
+    `lean` is bullish/bearish/neutral so a committee analyst can consume it
+    directly. A choppy tape always leans neutral regardless of slope — trading a
+    direction in chop is how breakout signals bleed to theta. Returns {error:...}
+    when there isn't enough history.
+    """
+    if len(closes) < _SMA_SLOW + 1:
+        return {"error": f"insufficient bars ({len(closes)}; need {_SMA_SLOW + 1}+)"}
+    price = closes[-1]
+    sma_fast = sum(closes[-_SMA_FAST:]) / _SMA_FAST
+    sma_slow = sum(closes[-_SMA_SLOW:]) / _SMA_SLOW
+
+    window = closes[-(_ER_WINDOW + 1):]
+    net = abs(window[-1] - window[0])
+    path = sum(abs(window[i] - window[i - 1]) for i in range(1, len(window)))
+    er = net / path if path > 0 else 0.0
+
+    trending = er >= _TREND_ER
+    up = price > sma_slow and sma_fast >= sma_slow
+    down = price < sma_slow and sma_fast <= sma_slow
+    if trending and up:
+        label, direction, lean = "uptrend", "up", "bullish"
+    elif trending and down:
+        label, direction, lean = "downtrend", "down", "bearish"
+    elif trending:
+        label, direction, lean = "transition", "mixed", "neutral"
+    else:
+        label, direction, lean = "range", "sideways", "neutral"
+
+    # Trending: confidence scales with how clean the trend is. Neutral: a modest,
+    # capped confidence in the "stand aside" call (stronger the choppier it is).
+    if lean != "neutral":
+        confidence = round(min(0.9, max(0.4, er)), 2)
+    else:
+        confidence = round(min(0.5, max(0.2, 1.0 - er)), 2)
+
+    note = (
+        f"{label}: price {price:.2f} {'>' if price > sma_slow else '<'} 50-day "
+        f"{sma_slow:.2f}, 20-day {sma_fast:.2f}; efficiency ratio {er:.2f} "
+        f"({'trending' if trending else 'choppy'})."
+    )
+    return {
+        "label": label,
+        "direction": direction,
+        "lean": lean,
+        "confidence": confidence,
+        "note": note,
+        "evidence": note,
+        "stats": {
+            "price": round(price, 2),
+            "sma_fast": round(sma_fast, 2),
+            "sma_slow": round(sma_slow, 2),
+            "efficiency_ratio": round(er, 3),
+        },
+    }
+
+
+async def price_regime(underlying: str, lookback: int = 120) -> dict:
+    """Fetch daily closes and classify the price regime. Uses Alpaca daily bars
+    (entitled with HAL's trading keys, unlike Massive underlying-value data which
+    403s). Tolerant: returns {error:...} instead of raising so the committee can
+    treat a missing read as 'no regime input' rather than failing."""
+    underlying = underlying.upper().strip()
+    from hal.sensory import broker
+    try:
+        closes = await asyncio.to_thread(broker.daily_closes, underlying, lookback)
+    except Exception as e:
+        return {"error": f"daily bars unavailable: {e}"}
+    reg = detect_regime(closes or [])
+    reg["underlying"] = underlying
+    return reg
