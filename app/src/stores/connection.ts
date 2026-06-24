@@ -398,6 +398,11 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
         const chart = msg.chart;
         (async () => {
           const immersive = useImmersive.getState();
+          // When the dashboard overlay is open it mirrors chart/backtest/
+          // watchlist from this same store, so DON'T enter the immersive backdrop
+          // — that would hijack the screen out from under the board. Just set the
+          // data and let the dashboard tiles update in place.
+          const dashOpen = useUi.getState().dashboardOpen;
           if (kind === "off") {
             immersive.exit();
             return;
@@ -405,17 +410,17 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
           if (kind === "chart") {
             // Set the chart source first so enter() doesn't flash the camera.
             await immersive.setSource("chart", { chart });
-            if (!immersive.active) await immersive.enter();
+            if (!dashOpen && !immersive.active) await immersive.enter();
             return;
           }
           if (kind === "backtest") {
             await immersive.setSource("backtest", { backtest: msg.backtest });
-            if (!immersive.active) await immersive.enter();
+            if (!dashOpen && !immersive.active) await immersive.enter();
             return;
           }
           if (kind === "watchlist") {
             await immersive.setSource("watchlist", { watchlist: msg.watchlist });
-            if (!immersive.active) await immersive.enter();
+            if (!dashOpen && !immersive.active) await immersive.enter();
             return;
           }
           if (!immersive.active) await immersive.enter();
@@ -429,6 +434,19 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
             immersive.pushThought("note", `open_view: unknown kind "${kind}"`);
           }
         })().catch((err) => console.warn("open_view:", err));
+        return;
+      }
+      // Server→client: toggle a useUi overlay panel (e.g. the dashboard).
+      // Distinct from open_view, which drives the immersive backdrop.
+      if (msg.action === "ui_panel") {
+        const panel = msg.panel ?? "";
+        const mode = msg.mode ?? "toggle"; // "show" | "hide" | "toggle"
+        const ui = useUi.getState();
+        if (panel === "dashboard") {
+          if (mode === "show") ui.setDashboardOpen(true);
+          else if (mode === "hide") ui.setDashboardOpen(false);
+          else ui.toggleDashboard();
+        }
         return;
       }
       // Live refresh of the watch-list board while it's open.
