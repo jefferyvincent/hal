@@ -76,6 +76,8 @@ export default function Hud() {
   const toggleSubscriptions = useUi((s) => s.toggleSubscriptions);
   const togglePositions = useUi((s) => s.togglePositions);
   const toggleCognition = useUi((s) => s.toggleCognition);
+  const toggleDashboard = useUi((s) => s.toggleDashboard);
+  const dashboardOpen = useUi((s) => s.dashboardOpen);
   const tradeMode = useConnection((s) => s.tradeMode);
   const setTradeMode = useConnection((s) => s.setTradeMode);
   const risk = useConnection((s) => s.risk);
@@ -257,6 +259,23 @@ export default function Hud() {
                   <circle cx="18" cy="19" r="3" />
                   <line x1="8.59" y1="13.51" x2="15.42" y2="17.49" />
                   <line x1="15.41" y1="6.51" x2="8.59" y2="10.49" />
+                </svg>
+              </HudBtn>
+
+              {/* Dashboard: one board for KPIs, the price chart, the
+                  latest committee verdict, the backtest/optimizer equity curve,
+                  and live positions. Amber when open = active view. */}
+              <HudBtn
+                onClick={toggleDashboard}
+                active={dashboardOpen}
+                variant="amber"
+                title="DASHBOARD — open the dashboard: KPIs, chart, committee verdict, backtest, and positions on one board."
+              >
+                <svg className={SVG_ICON} {...strokeProps}>
+                  <rect x="3" y="3" width="7" height="9" rx="1" />
+                  <rect x="14" y="3" width="7" height="5" rx="1" />
+                  <rect x="14" y="12" width="7" height="9" rx="1" />
+                  <rect x="3" y="16" width="7" height="5" rx="1" />
                 </svg>
               </HudBtn>
 

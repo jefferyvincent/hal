@@ -1754,6 +1754,28 @@ def _match_optimize_intent(text: str) -> str | None:
     return _resolve_backtest_symbol(text)
 
 
+# Dashboard — a useUi overlay panel (not an immersive backdrop), so it's driven
+# by an `ui_panel` action rather than open_view. Voice opens/closes it. Keyed on
+# "dashboard", which is distinctive enough in HAL's domain to stand alone.
+_DASHBOARD = re.compile(r"\bdashboard\b", re.IGNORECASE)
+_DASHBOARD_CLOSE = re.compile(
+    r"\b(close|hide|exit|dismiss|get rid of|take down)\b[\w\s']*\bdashboard\b",
+    re.IGNORECASE,
+)
+
+
+def _match_dashboard_intent(text: str) -> str | None:
+    """'show' / 'hide' if this asks to open or close the dashboard, else None.
+    Close is checked first so 'close the dashboard' isn't read as an open."""
+    if not text:
+        return None
+    if _DASHBOARD_CLOSE.search(text):
+        return "hide"
+    if _DASHBOARD.search(text):
+        return "show"
+    return None
+
+
 def _match_chart_intent(text: str) -> tuple[str, str] | None:
     """Pull (ticker, timeframe) from a chart request, else None."""
     if not text or not _CHART_INTENT_KEYWORD.search(text):
@@ -1903,9 +1925,14 @@ _QUIET_OFF = re.compile(
     re.IGNORECASE)
 _QUIET_ON = re.compile(
     r"\b(?:quiet mode|be quiet|stay quiet|go quiet|stand down|do not disturb|"
-    r"don'?t disturb|\bdnd\b|stop (?:the )?alerts?|no more alerts?|"
-    r"mute (?:the )?alerts?|silence (?:the )?alerts?|stop alerting|stop talking|"
-    r"stop pitching|stop suggesting|shut off (?:the )?alerts?|leave me alone|"
+    r"don'?t disturb|\bdnd\b|no more alerts?|"
+    # Silence the alert stream. The "turn/switch/shut off" forms must stay out of
+    # _QUIET_OFF's "turn alerts back on" path — they keep the explicit "off", so
+    # there's no overlap. Optional the/those/my + overnight qualifier so phrasings
+    # like "turn off those overnight alerts" route here (the documented failure).
+    r"(?:stop|mute|silence|shut off|turn off|switch off|disable|kill|hold|pause|"
+    r"snooze)(?: (?:the|those|my))?(?: overnight)? alerts?|"
+    r"stop alerting|stop talking|stop pitching|stop suggesting|leave me alone|"
     r"knock it off)\b",
     re.IGNORECASE)
 
@@ -4401,6 +4428,31 @@ async def process_turn(
                 json.dumps({"account": acct, "positions": positions},
                            default=str)[:MAX_TOOL_OUTPUT_CHARS])
             return await _speak_and_return(spoken, "positions.read")
+
+        # Dashboard: "open the dashboard" / "close the dashboard" toggles the
+        # useUi overlay (KPIs + chart + committee + backtest + positions). Driven
+        # by ui_panel, not open_view (it's not an immersive backdrop). Checked
+        # early so it doesn't fall through to a data route.
+        dashboard_panel = _match_dashboard_intent(user_text)
+        if dashboard_panel:
+            await websocket.send_json({"action": "ui_panel", "panel": "dashboard", "mode": dashboard_panel})
+            spoken = ("Opening the dashboard." if dashboard_panel == "show"
+                      else "Closing the dashboard.")
+            await stream_sentence(spoken)
+            new_history = history + [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": spoken},
+            ]
+            if on_reply:
+                try:
+                    await on_reply(new_history)
+                except Exception as e:
+                    print(f"[turn] on_reply failed: {e}")
+            await _emit_telemetry(websocket, "ui_panel", f"dashboard:{dashboard_panel}", spoken, status="ok")
+            await websocket.send_json({"state": "done"})
+            if len(new_history) > MAX_HISTORY_MESSAGES:
+                new_history = new_history[-MAX_HISTORY_MESSAGES:]
+            return new_history
 
         # Parameter optimization: "optimize SPY" / "tune the strategy" sweeps the
         # strategy knobs with a walk-forward split and shows a ranked leaderboard.

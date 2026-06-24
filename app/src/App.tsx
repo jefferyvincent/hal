@@ -10,6 +10,7 @@ import Transcript from "@/components/Transcript";
 import ConversationsPanel from "@/components/ConversationsPanel";
 import TelemetryPanel from "@/components/TelemetryPanel";
 import CognitionStage from "@/components/CognitionStage";
+import Dashboard from "@/components/Dashboard";
 import PositionSizing from "@/components/PositionSizing";
 import PositionsPanel from "@/components/PositionsPanel";
 import McpPanel from "@/components/McpPanel";
@@ -159,6 +160,8 @@ export default function App() {
       <TelemetryPanel />
       {/* Cognition: full-screen holographic decision-flow (HAL + committee + broker + human). */}
       <CognitionStage />
+      {/* Dashboard: KPIs + chart + committee verdict + backtest + positions on one board. */}
+      <Dashboard />
       {/* Risk-based options position sizing (account size + risk rules). */}
       <PositionSizing />
       <SubscriptionsPanel />

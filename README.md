@@ -218,6 +218,18 @@ via `tauri-plugin-global-shortcut`. Works even when the window is hidden.
   bull/bear → judge → rules gate), and opening it auto-triggers when the
   committee convenes. Click any card to **zoom in** (wheel / `+` `−` / Esc) for
   its full input/output; the newest card shimmers while HAL is mid-thought.
+- **Dashboard (`DASHBOARD` button):** a single full-screen board — QuantDinger-
+  style — that pulls together everything HAL computes: a **KPI strip** (equity,
+  win rate with a gauge ring, profit factor, max drawdown, trades, open
+  positions), the **price chart** with RSI/pivot + supertrend overlays and
+  buy/sell markers, the latest **committee verdict** (TRADE/PASS/HOLD with a
+  confidence ring + reasoning), the **backtest / optimizer** equity curve with a
+  tearsheet, and **live positions + P&L**. Each tile reads whatever's currently
+  loaded and shows a "say X to populate" hint when empty, so the board is useful
+  before any data lands (e.g. *"optimize SPY"*, *"deep dive on AAPL"*, *"show me a
+  chart of NVDA"*). HAL's red/amber CRT skin, not QuantDinger's. Open it with the
+  HUD button or by voice (**"open the dashboard"** / **"close the dashboard"**);
+  `Esc` also closes it.
 - Fast / smart model toggle (lightning bolt).
 - Wipe memory (trash icon).
 - Stop button (interrupt speech/generation).
@@ -316,8 +328,8 @@ Direct requests still work — quiet only suppresses what HAL starts on its own.
 
 | Say something like… | What it does |
 | --- | --- |
-| "Be quiet" / "Stand down" / "Stop the alerts" / "Do not disturb" | Engages quiet mode |
-| "Resume" / "Alerts back on" / "Noisy mode" | Lifts it |
+| "Be quiet" / "Stand down" / "Do not disturb" / "Stop / turn off / disable / snooze the alerts" (an "overnight" qualifier is fine: *"turn off those overnight alerts"*) | Engages quiet mode |
+| "Resume" / "Alerts back on" / "Noisy mode" / "Turn alerts back on" | Lifts it |
 
 Or use the **QUIET** button in the HUD (bell-with-slash, glows amber when engaged).
 Voice and button stay in sync, so a spoken toggle updates the button and vice-versa.
@@ -493,6 +505,7 @@ Key files when something breaks:
 | `hal/cortex/strategies.py` | Vault `Strategy/` playbook loader + auto-match selection |
 | `app/src/components/PositionsPanel.tsx` | Live positions UI + manual close override |
 | `app/src/components/CognitionStage.tsx` | Full-screen Cognition view (decision-flow cards + pipes + zoom) |
+| `app/src/components/Dashboard.tsx` | Full-screen dashboard (KPI strip + chart + committee verdict + backtest + positions) |
 | `app/src/App.tsx` | Root layout, autostart hook, immersive thought mirroring |
 | `app/src/lib/ws.ts` | WS client (binary audio + JSON envelopes) |
 | `app/src/lib/audio.ts` | Gap-free WAV chunk playback queue |
