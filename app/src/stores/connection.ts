@@ -15,8 +15,10 @@ import type {
   Attachment,
   BrokerAccount,
   BrokerPosition,
+  ChartPayload,
   ChatMessage,
   ConversationSummary,
+  EquityFundamentals,
   McpServer,
   Mode,
   CommitteeStatus,
@@ -93,6 +95,14 @@ interface ConnectionState {
   positionsError: string | null;
   // In-flight committee run progress (null when idle). startedAt is client-stamped.
   committeeStatus: (CommitteeStatus & { startedAt: number }) | null;
+  // Equity-research fundamentals for the terminal's Equity/DCF tab, keyed by
+  // symbol so switching tickers doesn't refetch ones we've already pulled.
+  equity: Record<string, EquityFundamentals>;
+  equityLoading: string | null; // symbol currently being fetched, else null
+  // Daily candlestick payloads for the Equity tab, keyed by symbol (same caching
+  // rationale as `equity`). Carries an `error` payload when a build fails.
+  equityChart: Record<string, ChartPayload>;
+  equityChartLoading: string | null;
 }
 
 interface ConnectionActions {
@@ -129,6 +139,8 @@ interface ConnectionActions {
   placeTrade: (id: string) => void;
   setTradeMode: (mode: "confirm" | "autopilot") => void;
   resetKillSwitch: () => void;
+  loadEquity: (symbol: string) => void;
+  loadEquityChart: (symbol: string) => void;
 }
 
 const STATE_LABELS: Record<Mode, string[]> = {
@@ -357,6 +369,22 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
         })().catch((err) => console.warn("trade_idea open:", err));
         return;
       }
+      if (msg.equity) {
+        const eq = msg.equity;
+        set((s) => ({
+          equity: { ...s.equity, [eq.symbol]: eq },
+          equityLoading: s.equityLoading === eq.symbol ? null : s.equityLoading,
+        }));
+        return;
+      }
+      if (msg.equity_chart) {
+        const ch = msg.equity_chart;
+        set((s) => ({
+          equityChart: { ...s.equityChart, [ch.symbol]: ch },
+          equityChartLoading: s.equityChartLoading === ch.symbol ? null : s.equityChartLoading,
+        }));
+        return;
+      }
       if (msg.trade_placed) {
         const { id, ok } = msg.trade_placed;
         set((s) => ({
@@ -545,6 +573,10 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
       risk: null,
       positionsError: null,
       committeeStatus: null,
+      equity: {},
+      equityLoading: null,
+      equityChart: {},
+      equityChartLoading: null,
 
       // -- actions -----------------------------------------------------
       async init() {
@@ -882,6 +914,18 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
       },
       resetKillSwitch() {
         void getSocket().sendCommand({ command: "reset_kill_switch" });
+      },
+      loadEquity(symbol) {
+        const sym = symbol.toUpperCase().trim();
+        if (!sym) return;
+        set({ equityLoading: sym });
+        void getSocket().sendCommand({ command: "equity_fundamentals", symbol: sym });
+      },
+      loadEquityChart(symbol) {
+        const sym = symbol.toUpperCase().trim();
+        if (!sym) return;
+        set({ equityChartLoading: sym });
+        void getSocket().sendCommand({ command: "equity_chart", symbol: sym, timeframe: "1d" });
       },
     };
   },

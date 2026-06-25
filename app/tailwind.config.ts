@@ -16,6 +16,24 @@ export default {
           text: "#c8c8d0",
           "text-dim": "#6a6a72",
         },
+        // Bloomberg-style terminal skin — amber on near-black, dense mono grids.
+        // Scoped to the Terminal overlay (FinceptTerminal-inspired) so it lives
+        // alongside HAL's red/amber chrome without overriding it.
+        term: {
+          bg: "#000000",
+          panel: "#0a0b0d",
+          "panel-2": "#101216",
+          border: "#1d2026",
+          amber: "#ffb000",
+          "amber-dim": "#a6730a",
+          "amber-bright": "#ffd166",
+          green: "#2ecc71",
+          red: "#ff453a",
+          cyan: "#3fb6e0",
+          text: "#e8d9b5",
+          "text-dim": "#8a8470",
+          muted: "#5a5648",
+        },
       },
       fontFamily: {
         mono: ['"Share Tech Mono"', '"Courier New"', "monospace"],

@@ -9,6 +9,7 @@ interface UiState {
   subscriptionsOpen: boolean;
   cognitionOpen: boolean;
   dashboardOpen: boolean;
+  terminalOpen: boolean;
   chatOpen: boolean;
   fullscreenChat: boolean;
   toggleConversations: () => void;
@@ -21,6 +22,8 @@ interface UiState {
   setCognitionOpen: (open: boolean) => void;
   toggleDashboard: () => void;
   setDashboardOpen: (open: boolean) => void;
+  toggleTerminal: () => void;
+  setTerminalOpen: (open: boolean) => void;
   toggleChatOpen: () => void;
   setChatOpen: (open: boolean) => void;
   toggleFullscreenChat: () => void;
@@ -35,6 +38,7 @@ export const useUi = create<UiState>((set) => ({
   subscriptionsOpen: false,
   cognitionOpen: false,
   dashboardOpen: false,
+  terminalOpen: false,
   // Chat is hidden by default so the eye sits alone, uncluttered. The
   // Chat button in Controls toggles it on; closing also drops fullscreen.
   chatOpen: false,
@@ -62,6 +66,10 @@ export const useUi = create<UiState>((set) => ({
   toggleDashboard: () => set((s) => ({ dashboardOpen: !s.dashboardOpen })),
 
   setDashboardOpen: (open) => set({ dashboardOpen: open }),
+
+  toggleTerminal: () => set((s) => ({ terminalOpen: !s.terminalOpen })),
+
+  setTerminalOpen: (open) => set({ terminalOpen: open }),
 
   toggleChatOpen: () =>
     set((s) => {

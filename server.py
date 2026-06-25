@@ -45,6 +45,7 @@ from piper import PiperVoice
 from hal.sensory import market
 from hal.sensory import news
 from hal.sensory import earnings
+from hal.sensory import fundamentals
 from hal.sensory import watchlist
 from hal.sensory import broker
 from hal.sensory import brackets
@@ -5664,6 +5665,33 @@ async def voice_interface(websocket: WebSocket):
                                 req["symbol"], req["timeframe"], websocket, refresh=True)
                         except Exception as e:
                             print(f"[chart] refresh failed: {e}")
+                elif cmd == "equity_fundamentals":
+                    # Terminal Equity tab: fetch company fundamentals + annual
+                    # statements (Nasdaq keyless) and push them back keyed by
+                    # symbol. fetch() swallows its own errors into the payload.
+                    sym = str(command.get("symbol", "")).upper().strip()
+                    if sym:
+                        try:
+                            payload = await fundamentals.fetch(sym)
+                        except Exception as e:
+                            payload = {"symbol": sym, "error": f"{e}", "annual": [],
+                                       "summary": {}, "as_of": int(time.time())}
+                        await websocket.send_json({"equity": payload})
+                elif cmd == "equity_chart":
+                    # Terminal Equity tab: build a standalone daily candlestick
+                    # payload for the symbol and return it keyed as equity_chart
+                    # (separate channel from the immersive open_view chart, so it
+                    # doesn't re-enter the backdrop). Errors come back so the tab
+                    # can show a fallback instead of a stuck spinner.
+                    sym = str(command.get("symbol", "")).upper().strip()
+                    tf = str(command.get("timeframe", "1d")).strip() or "1d"
+                    if sym:
+                        try:
+                            payload = await charting.build_chart(sym, tf)
+                            payload["levels"] = charting.analyze(payload).get("levels", [])
+                        except Exception as e:
+                            payload = {"symbol": sym, "error": f"{e}"}
+                        await websocket.send_json({"equity_chart": payload})
                 elif cmd == "mcp_list":
                     await send_mcp_snapshot()
                 elif cmd == "mcp_add":
