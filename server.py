@@ -55,6 +55,7 @@ from hal.cortex import committee
 from hal.motor import charting
 from hal.cerebellum import backtest
 from hal.cerebellum import optimize
+from hal.cerebellum import research_agent
 from hal.cerebellum import committee_backtest
 from hal.cerebellum import strategy as trade_strategy
 from hal.cerebellum.execution import LiveExecution
@@ -1739,7 +1740,7 @@ def _match_backtest_intent(text: str) -> str | None:
 # walk-forward split rather than run the one fixed config.
 _OPTIMIZE_INTENT = re.compile(
     r"\b(optimi[sz]e|optimi[sz]ation|grid[\s-]?search|walk[\s-]?forward|"
-    r"parameter sweep|param sweep|tune the (strateg|backtest|param|signal))\b",
+    r"parameter sweep|param sweep|tune the (strateg\w*|backtest|param\w*|signal\w*))\b",
     re.IGNORECASE,
 )
 
@@ -1748,6 +1749,30 @@ def _match_optimize_intent(text: str) -> str | None:
     """Return the underlying ticker if this is a parameter-optimization request,
     else None. Same symbol resolution as the backtest route."""
     if not text or not _OPTIMIZE_INTENT.search(text):
+        return None
+    if _match_close_view_intent(text):
+        return None
+    return _resolve_backtest_symbol(text)
+
+
+# Research agent is its own route, checked BEFORE optimize (its phrases — "deep
+# optimize", "research the backtest" — contain the optimize/backtest keywords).
+# It runs the closed RD-Agent loop (LLM proposes grids → optimizer referees →
+# lock-box validates), so its triggers are deliberately specific: a bare
+# "research AAPL" must NOT hijack a generic research/news ask — only explicit
+# strategy-search phrasing routes here.
+_RESEARCH_INTENT = re.compile(
+    r"\b(research[\s-]?(agent|loop)|rd[\s-]?agent|"
+    r"(research|evolve) the (strateg\w*|backtest|param\w*|signal\w*)|"
+    r"auto[\s-]?tune|deep optimi[sz]e)\b",
+    re.IGNORECASE,
+)
+
+
+def _match_research_intent(text: str) -> str | None:
+    """Return the underlying ticker if this is a closed-loop research request,
+    else None. Same symbol resolution as the backtest/optimize routes."""
+    if not text or not _RESEARCH_INTENT.search(text):
         return None
     if _match_close_view_intent(text):
         return None
@@ -2301,7 +2326,15 @@ _TRADE_IDEA_TRIGGERS = re.compile(
     r"(got|have) (anything|something)|"
     r"anything (good )?(today|right now|out there)|"
     r"what do you like|"
-    r"should i be (in|long|short)"
+    r"should i be (in|long|short)|"
+    # Structure/strategy phrasings the model would otherwise answer by NARRATING
+    # the screen instead of running it (the bug this guards). The _TRADING_CONTEXT
+    # gate still applies, so these only fire with ticker/options vocab present.
+    r"should i (do|put on|open|run|set ?up|structure|leg into)|"
+    r"what'?s the (play|trade|setup|move)|"
+    r"(screen|set ?up|structure|build|put on|leg into|size)( me)?"
+    r"( a| an| the| one| some)?( \w+)? (trade|spread|condor|straddle|strangle|play|setup|position|idea)|"
+    r"sell( me)?( some| the)? premium"
     r")\b",
     re.IGNORECASE,
 )
@@ -2463,12 +2496,24 @@ async def _holds_underlying(symbol: str) -> bool:
 
 
 def _extract_trade_symbol(text: str) -> str | None:
-    """Pull the underlying ticker from a trade-idea question (for auto-backtest)."""
+    """Pull the underlying ticker from a trade-idea question. Resolves explicit
+    tickers, spelled-out index names ("the S&P", "the Dow"), and known company
+    names ("Micron" -> MU) — the same resolvers the chart/backtest routes use —
+    so a NAMED trade idea reaches the deterministic builder instead of falling
+    through to the model, which narrates the screen ("I'll run iv_context...")
+    without ever emitting the tool calls. Returns None when nothing is named, so
+    a symbol-less request still routes to the watchlist screen."""
     if not text:
         return None
     m = _CHART_TICKERS.search(text)
     if m:
         return m.group(1).upper()
+    alias = _resolve_index_alias(text)
+    if alias:
+        return alias
+    name = _resolve_company_name(text)
+    if name:
+        return name
     m2 = re.search(r"\b([A-Z]{2,5})\b", text)
     if m2 and m2.group(1) not in ("HAL", "IV", "DTE", "ATM", "OTM", "ITM"):
         return m2.group(1)
@@ -4449,6 +4494,60 @@ async def process_turn(
                 except Exception as e:
                     print(f"[turn] on_reply failed: {e}")
             await _emit_telemetry(websocket, "ui_panel", f"dashboard:{dashboard_panel}", spoken, status="ok")
+            await websocket.send_json({"state": "done"})
+            if len(new_history) > MAX_HISTORY_MESSAGES:
+                new_history = new_history[-MAX_HISTORY_MESSAGES:]
+            return new_history
+
+        # Closed-loop research agent: "research the strategy on SPY" / "rd-agent
+        # NVDA" / "deep optimize QQQ" runs the RD-Agent loop — the smart model
+        # proposes successive grids, the optimizer referees each, and a held-back
+        # lock-box validates the winner. Checked BEFORE optimize (its phrases
+        # contain the optimize/backtest keywords). The spoken command IS the
+        # opt-in that the library gate (confirm_llm_usage) otherwise requires, so
+        # it runs confirmed but with a modest round budget to cap smart-model cost.
+        research_symbol = _match_research_intent(user_text)
+        if research_symbol:
+            research_months = 12 if research_symbol in _INDEX_QUICK_SYMBOLS else 24
+            await websocket.send_json({"state": "processing",
+                                       "text": f"Researching {research_symbol} — running the RD-Agent loop ({research_months}mo, several rounds, this takes a few minutes)..."})
+            await _emit_telemetry(websocket, "backtest.research", research_symbol,
+                                  f"Closed-loop RD-Agent search on {research_symbol} (lock-box validated).")
+            report_md = ""
+            try:
+                research_result = await research_agent.research(
+                    research_symbol, months=research_months, max_rounds=4,
+                    confirm_llm_usage=True)
+                spoken = research_agent.speak_summary(research_result)
+                report_md = research_result.get("report", "")
+                # Visualize the chosen config (if any held up) on the BacktestStage,
+                # same as the optimizer route, so the report has a picture.
+                best = research_result.get("best")
+                if best:
+                    try:
+                        viz = await backtest.run_backtest(research_symbol, months=research_months,
+                                                          params=best["params"])
+                        await websocket.send_json({
+                            "action": "open_view", "kind": "backtest",
+                            "backtest": backtest.equity_payload(viz),
+                        })
+                    except Exception as e:
+                        print(f"[research] equity viz for {research_symbol} failed: {e}")
+            except Exception as e:
+                spoken = f"I could not complete that research run, {USER_NAME}. {e}"
+            await stream_sentence(spoken)
+            assistant_content = report_md or spoken
+            new_history = history + [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": assistant_content},
+            ]
+            if on_reply:
+                try:
+                    await on_reply(new_history)
+                except Exception as e:
+                    print(f"[turn] on_reply failed: {e}")
+            print(f"[hal] research {research_symbol}: {spoken!r}")
+            await _emit_telemetry(websocket, "backtest.research", "done", spoken, status="ok")
             await websocket.send_json({"state": "done"})
             if len(new_history) > MAX_HISTORY_MESSAGES:
                 new_history = new_history[-MAX_HISTORY_MESSAGES:]

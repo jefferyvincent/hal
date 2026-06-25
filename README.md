@@ -25,6 +25,173 @@ Two completely decoupled processes:
 - The WS client (`app/src/lib/ws.ts`) reconnects on every user action, so the
   two processes can start in either order.
 
+## How HAL works (system map)
+
+The brain-region module names are literal: **sensory** talks to the outside world,
+**cortex** reasons, **cerebellum** runs the quant/execution machinery, **hippocampus**
+remembers, **motor** draws. A turn enters `server.py`, hits a **deterministic intent
+router** first (so quant/trade/UI commands behave predictably regardless of the LLM's
+mood), and only falls back to LLM tool-calling when nothing matches.
+
+```mermaid
+flowchart TB
+  subgraph CLIENT["Tauri + React UI — just a webview"]
+    direction LR
+    IN["Mic + VAD · Text bar · Camera / files"]
+    OUT["HUD · Dashboard · Cognition view · Positions · streamed TTS"]
+  end
+
+  CLIENT <-->|"WebSocket  ws://:8000/ws"| SERVER
+
+  subgraph SERVER["server.py — FastAPI · owns every model weight + conversation history"]
+    ROUTER{{"Deterministic intent router<br/>chart · research · optimize · backtest · committee<br/>orders · positions · news · alerts · risk · quiet"}}
+    TOOLS["LLM tool-calling — when no route matches"]
+    ROUTER -.->|fallback| TOOLS
+  end
+
+  subgraph AI["Local models — GPU, no cloud round-trips"]
+    direction LR
+    WHIS["Whisper — speech to text"]
+    XTTS["XTTS — text to speech"]
+    FAST["Ollama FAST model<br/>analysts · quick turns"]
+    SMART["Ollama SMART model<br/>debate · judge · proposals"]
+  end
+  SERVER --- AI
+
+  subgraph CORTEX["cortex — reasoning"]
+    COMMITTEE["Trade committee<br/>multi-agent"]
+    RULES["rules.check_trade<br/>deterministic gate"]
+    STRAT["Strategy playbooks"]
+    RAG["RAG / CAG retrieval"]
+  end
+
+  subgraph CEREB["cerebellum — quant + execution"]
+    RESEARCH["research_agent<br/>RD-Agent loop"]
+    OPT["optimize<br/>sweep + walk-forward"]
+    BT["backtest"]
+    CBT["committee_backtest"]
+    EXIT["strategy.exit_signal<br/>single code path"]
+    RESEARCH --> OPT --> BT
+  end
+
+  subgraph SENSORY["sensory — the outside world"]
+    BROKER["broker<br/>confirm / autopilot gate"]
+    RISK["risk<br/>circuit breakers"]
+    BRACK["brackets<br/>managed exits"]
+    MON["monitors<br/>market feed · earnings · news"]
+  end
+
+  subgraph MEM["hippocampus — memory"]
+    DB[("SQLite<br/>history · watchlist · alerts")]
+    VAULT[("Obsidian vault<br/>Rules/ · Strategy/ · Analysis/")]
+  end
+
+  subgraph EXT["External services"]
+    direction LR
+    MASSIVE["Massive<br/>options data + feed"]
+    ALPACA["Alpaca<br/>broker"]
+    NASDAQ["Nasdaq<br/>earnings cal"]
+    YAHOO["Yahoo<br/>index bars"]
+  end
+
+  ROUTER -->|"deep dive"| COMMITTEE
+  ROUTER -->|"research / optimize / backtest"| RESEARCH
+  ROUTER -->|"buy / sell / close"| BROKER
+  ROUTER -->|"quick answer"| FAST
+
+  COMMITTEE --> FAST
+  COMMITTEE --> SMART
+  COMMITTEE --> RAG
+  COMMITTEE --> RULES
+  CBT -.->|"referees"| COMMITTEE
+  RULES --> BROKER
+  BROKER --> RISK
+  RISK --> ALPACA
+  BRACK --> ALPACA
+  EXIT --- BRACK
+  EXIT --- BT
+
+  BT --> MASSIVE
+  BT --> YAHOO
+  MON --> MASSIVE
+  MON --> NASDAQ
+  MON -->|"proactive alert · gated by quiet mode"| CLIENT
+
+  RAG --- VAULT
+  STRAT --- VAULT
+  SERVER --- DB
+```
+
+### The trade committee (the multi-agent part)
+
+A "deep dive" convenes a desk of agents — cheap **analysts in parallel** on the fast
+model, then a **bull-vs-bear debate** and a **judge** on the smart model, then your
+**deterministic rules gate** has the final, un-sweet-talkable word. It pins a verdict
+and **places no orders**.
+
+```mermaid
+flowchart LR
+  Q["Symbol under review"] --> A
+
+  subgraph A["1 · Analysts — FAST model, parallel"]
+    direction TB
+    VOL["Vol — IV vs realized → rich / cheap"]
+    SET["Setup — chain structure + liquidity"]
+    CAT["Catalyst — journal / RAG"]
+    ANA["Analysis — vault note, if any"]
+    REG["Regime — deterministic Kaufman ER"]
+  end
+
+  A --> CONS["Consensus bias"]
+
+  subgraph B["2 · Researchers — SMART model"]
+    direction LR
+    BULL["Bull case"]
+    BEAR["Bear case"]
+  end
+
+  CONS --> B
+  B --> REF["3 · Reflection<br/>past CLOSED trades on this name"]
+  REF --> JUDGE["4 · Judge — SMART<br/>TRADE or PASS + thesis"]
+  JUDGE --> GATE{"5 · Rules gate<br/>rules.check_trade"}
+  GATE -->|"pass"| TRADE["TRADE verdict<br/>pinned in Trade Ideas · NO order placed"]
+  GATE -->|"fail"| PASS["Forced PASS"]
+```
+
+### The quant research stack
+
+Each layer is the referee for the one above it: a `backtest` runs one config, `optimize`
+sweeps many with walk-forward + significance guards, and `research_agent` closes the loop
+— the smart model proposes the next grid, the optimizer scores it, and a **held-back
+lock-box** validates the winner once. The exit rule is a **single code path** shared by
+backtests and the live trader, so a backtest exercises the exact logic that manages a
+real position.
+
+```mermaid
+flowchart TB
+  subgraph LOOP["research_agent — closed RD-Agent loop"]
+    direction TB
+    H["Hypothesis<br/>SMART model proposes next grid"]
+    I["Instantiate params<br/>audited allow-list · NO codegen"]
+    V["Validate — via optimize()"]
+    F["Feedback<br/>update best by OUT-OF-SAMPLE"]
+    H --> I --> V --> F --> H
+  end
+
+  V --> OPT
+  subgraph OPT["optimize — sweep + walk-forward"]
+    direction TB
+    G1["walk-forward in / out of sample"]
+    G2["sample-size shrink"]
+    G3["significance dampener — t-stat / IC-IR"]
+  end
+  OPT --> BT["backtest — one config, real option bars"]
+  F -->|"once, at the end"| LB["Lock-box<br/>recent slice the loop never saw → go / no-go"]
+
+  BT -.->|"shared exit · single code path"| LIVE["live brackets<br/>sensory.brackets"]
+  CBT["committee_backtest"] -.->|"validates"| COMM["trade committee"]
+```
+
 ## Layout
 
 ```
@@ -424,7 +591,12 @@ since trading a direction in a choppy tape is how breakout signals bleed to thet
 The backtest defaults to the **cheap baseline arm (no LLM)** — run that first to
 see if the signals predict direction at all. Add **"the full version"** to also run
 the (slow) LLM arm. It's a *directional proxy*, not options P&L — see the module
-docstrings in `hal/cerebellum/committee_backtest.py` for the honest caveats.
+docstrings in `hal/cerebellum/committee_backtest.py` for the honest caveats. Each arm
+is also scored by **IC (Information Coefficient)** — the correlation between the side
+it took and the realized forward move, with a significance t-stat. Unlike hit-rate
+(which ignores *how far* price moved) IC is scale-free, so it's comparable across
+symbols and windows; it's the rigorous form of the "does this signal predict
+direction?" question the backtest exists to answer.
 
 **Strategy backtest panel** (the equity curve HAL shows when it backtests an
 underlying's option strategy, e.g. during a deep analysis): the stats overlay now
@@ -446,7 +618,7 @@ percentages — scores every combination, and surfaces the ones that actually ho
 | "Optimize SPY" / "Tune the strategy on QQQ" | Sweeps configs, speaks the verdict, drops a ranked leaderboard in chat |
 | "Run a parameter sweep on the Dow" / "Grid search NVDA" | Same route (`optimize`), any phrasing that names the sweep |
 
-Two guards against the classic optimizer trap — curve-fitting a number that won't
+Three guards against the classic optimizer trap — curve-fitting a number that won't
 repeat live:
 
 - **Walk-forward split.** Every config is scored on an **in-sample** slice (the older
@@ -456,6 +628,12 @@ repeat live:
   the signal needs rethinking, not just retuning.
 - **Sample-size shrink.** A profit factor on three trades is noise, so thin configs
   are shrunk in the ranking and can't top the board on a lucky handful.
+- **Significance dampener.** Profit factor measures the *size* of an edge, never
+  whether it's real. Borrowing qlib's IC-IR lens, each config is scaled by the
+  **t-stat** of its trade returns (the leaderboard's **IS t** column); a config whose
+  per-trade edge can't be told from zero — |t| under ~2 — is faded down the board no
+  matter how high its profit factor. This matters most as the referee for the research
+  agent below, which is only as trustworthy as the number it maximizes.
 
 The sweep is **API-frugal**: contract discovery and option-bar fetches (the expensive
 Massive calls) are cached and shared across every combination, so a ~100-config sweep
@@ -464,6 +642,58 @@ curve is pushed to the **strategy backtest panel** so the leaderboard has a pict
 go with the verdict. An optional, explicitly-gated LLM review of the tearsheet
 (`ai_optimize(..., confirm_llm_usage=True)`) can suggest where to search next — off by
 default so it never burns the smart model by surprise.
+
+### Closed-loop research agent (RD-Agent)
+
+An autonomous evolution of the optimizer, adapted in spirit from Microsoft qlib's
+**RD-Agent**. Where the optimizer sweeps **one** grid you hand it, the research agent
+runs the loop a human runs by hand: it reads the leaderboard, the smart model proposes
+the *next* grid plus a one-line thesis, the optimizer scores it, and it repeats —
+converging on configs that hold up, or stopping early when the evidence says there's
+no real edge to find.
+
+| Say something like… | What it does |
+| --- | --- |
+| "Research the strategy on SPY" / "Run the RD-agent on QQQ" | Runs the closed RD-Agent loop, speaks the verdict, drops the round-by-round report + lock-box result in chat |
+| "Evolve the strategy for NVDA" / "Auto-tune the Dow" / "Deep optimize SPY" | Same route (`research`), any phrasing that asks to *search* the strategy rather than run one config |
+
+The spoken command **is** the opt-in for the smart-model spend (the library gate
+below) — so a voice run is confirmed automatically but capped at a modest round budget.
+The winning config's equity curve is pushed to the **strategy backtest panel**, same as
+the optimizer. It's the heaviest trading route HAL has (several rounds, each a sweep +
+a smart-model call), so it announces a few-minute runtime up front.
+
+For scripting (or a wider, uncapped search) call it directly — the library entrypoint
+is gated behind `confirm_llm_usage` so it never burns the smart model by surprise:
+
+```python
+from hal.cerebellum import research_agent
+result = await research_agent.research("SPY", months=24, max_rounds=4,
+                                       confirm_llm_usage=True)
+print(result["report"])      # round-by-round trail + the lock-box verdict
+```
+
+Three things keep an LLM-driven search honest:
+
+- **Parameters only — never code.** The model may only pick values inside an audited
+  allow-list (the same RSI / pivot / stop / TP knobs); it never authors signal or exit
+  code, so `generate_signals` stays fixed. This is the deliberate line vs qlib's
+  RD-Agent, which evolves executable factor code — HAL's output can reach a real broker.
+  A malformed proposal falls back to a deterministic perturbation of the current best,
+  so a flaky model just makes a round dumber, it can't break the loop.
+- **The optimizer is the referee.** The model proposes experiments; the deterministic
+  walk-forward + significance objective scores them. It can never grade its own work.
+- **A lock-box slice.** A recent window (default 3 months) is **held back before the
+  loop starts**, and the single chosen config is tested on it **exactly once** at the
+  end. If the model steered by out-of-sample every round, out-of-sample would quietly
+  become in-sample — the lock-box is the one slice the search never touched, and its
+  number is the only go/no-go. Disagreement with the in-loop result means the loop
+  overfit itself → verdict is *do not trade*.
+
+Gated behind `confirm_llm_usage` and bounded by `max_rounds` (cost = at most that many
+smart-model calls; the Massive sweep is shared across rounds via persistent caches). It
+produces a research artifact and at most **one** candidate flagged for paper-forward —
+it never wires a trigger and never places a trade.
 
 > The committee and Alpaca tools only work after the venv is rebuilt against
 > Python 3.13 and `alpaca-py` is installed (both handled by `./setup.sh`).
@@ -499,6 +729,7 @@ Key files when something breaks:
 | `hal/cerebellum/execution.py` | `Execution` protocol: `SimBroker` (backtest) + `LiveExecution` (live) |
 | `hal/cerebellum/backtest.py` | Options strategy backtester + `StrategyParams` (tunable signal/exit knobs) |
 | `hal/cerebellum/optimize.py` | Parameter sweep + walk-forward (in/out-of-sample) ranking over the backtester |
+| `hal/cerebellum/research_agent.py` | Closed-loop RD-Agent: LLM proposes grids → optimizer referees → lock-box validates ("research SPY" route + library) |
 | `hal/cortex/committee.py` | Multi-agent trade committee (analysts → debate → judge) |
 | `hal/cerebellum/committee_backtest.py` | Committee backtest referee (baseline vs LLM) |
 | `hal/cortex/rules.py` | Deterministic trading-rules gate (`check_trade`) + vault exit-policy source |
