@@ -222,3 +222,6 @@ node_modules/
 # The Python "lib/" rule above is unanchored and also matches the frontend's
 # app/src/lib (TS source, not a build artifact) — keep that dir tracked.
 !app/src/lib/
+
+# Claude Code local/personal settings — not shared
+.claude/settings.local.json
