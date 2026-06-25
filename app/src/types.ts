@@ -88,6 +88,68 @@ export interface ServerEnvelope {
   quiet?: boolean;
   /** Live committee-run progress for the Cognition view's completion bar. */
   committee_status?: CommitteeStatus;
+  /** Equity-research fundamentals snapshot (reply to equity_fundamentals). */
+  equity?: EquityFundamentals;
+  /** Standalone candlestick payload for the Equity tab (reply to equity_chart). */
+  equity_chart?: ChartPayload;
+}
+
+/** Company fundamentals for the terminal's Equity Research / DCF tab, built
+ *  server-side by hal/sensory/fundamentals.py from Nasdaq's keyless endpoints.
+ *  Any field may be null when the source omits it — the UI degrades gracefully
+ *  and the client runs the DCF from whatever's present. Money values are in the
+ *  reporting currency's base units (dollars, not millions). */
+export interface EquityFundamentals {
+  symbol: string;
+  name: string | null;
+  as_of: number; // unix seconds
+  price: number | null;
+  currency: string | null;
+  market_cap: number | null;
+  shares_outstanding: number | null;
+  sector: string | null;
+  industry: string | null;
+  region: string | null;
+  description: string | null;
+  /** Mean 1-year analyst price target. */
+  target_price: number | null;
+  /** Analyst coverage: consensus rating, analyst count, covering broker firms. */
+  analyst: {
+    rating: string | null; // e.g. "Buy"
+    count: number | null; // analysts offering recommendations
+    brokers: string[]; // broker firm names (drives the coverage graph)
+  } | null;
+  summary: {
+    pe: number | null;
+    eps: number | null;
+    dividend_yield: number | null; // fraction, e.g. 0.012
+    beta: number | null;
+    week52_high: number | null;
+    week52_low: number | null;
+    volume: number | null;
+    avg_volume: number | null;
+    change: number | null; // intraday net change in price
+    change_pct: number | null; // intraday change as a fraction
+    day_high: number | null;
+    day_low: number | null;
+    prev_close: number | null;
+  };
+  /** Annual statements, newest first. */
+  annual: EquityYear[];
+  error: string | null;
+}
+
+export interface EquityYear {
+  year: string; // fiscal year label, e.g. "2024"
+  revenue: number | null;
+  gross_profit: number | null;
+  operating_income: number | null;
+  net_income: number | null;
+  operating_cash_flow: number | null;
+  capex: number | null; // positive magnitude of capital expenditure
+  free_cash_flow: number | null; // operating_cash_flow - capex when both present
+  total_debt: number | null;
+  cash: number | null;
 }
 
 /** Progress of an in-flight committee run, streamed per desk step. */
@@ -182,6 +244,8 @@ export interface ChartPayload {
   supertrend_down: { time: number; value: number }[];
   markers: { time: number; side: "buy" | "sell" }[];
   levels: { price: number; kind: "support" | "resistance"; label: string }[];
+  /** Set instead of the series fields when the build failed (equity_chart path). */
+  error?: string;
 }
 
 /** Backtest equity-curve payload built server-side by backtest.py. Times

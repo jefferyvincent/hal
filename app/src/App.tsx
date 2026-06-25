@@ -11,6 +11,7 @@ import ConversationsPanel from "@/components/ConversationsPanel";
 import TelemetryPanel from "@/components/TelemetryPanel";
 import CognitionStage from "@/components/CognitionStage";
 import Dashboard from "@/components/Dashboard";
+import Terminal from "@/components/terminal/Terminal";
 import PositionSizing from "@/components/PositionSizing";
 import PositionsPanel from "@/components/PositionsPanel";
 import McpPanel from "@/components/McpPanel";
@@ -162,6 +163,8 @@ export default function App() {
       <CognitionStage />
       {/* Dashboard: KPIs + chart + committee verdict + backtest + positions on one board. */}
       <Dashboard />
+      {/* Terminal: Bloomberg-style tabbed workspace (overview / portfolio / news / equity / nodes). */}
+      <Terminal />
       {/* Risk-based options position sizing (account size + risk rules). */}
       <PositionSizing />
       <SubscriptionsPanel />
