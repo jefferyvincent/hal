@@ -475,6 +475,13 @@ def compute_metrics(trades: list[dict]) -> dict:
         "payoff_ratio": round(avg_win / abs(avg_loss), 2) if avg_loss < 0 else None,
         "sharpe_per_trade": round(mean / std, 3) if std > 0 else None,
         "sortino_per_trade": round(mean / downside, 3) if downside > 0 else None,
+        # t-stat of mean trade P&L vs zero (= sharpe_per_trade · √n). This is the
+        # significance test profit factor and win-rate hide: a PF of 1.6 on 6
+        # noisy trades and one on 60 steady trades read the same on PF but not
+        # here. qlib scores signals by IC-IR (mean/std of the edge) for exactly
+        # this reason; this is that idea applied to realized trade returns.
+        # |t| ≳ 2 ⇒ the edge is unlikely to be a fluke of the sample.
+        "t_stat": round(mean / (std / math.sqrt(n)), 2) if std > 0 else None,
         "best": round(max(pnls), 2),
         "worst": round(min(pnls), 2),
         "equity": equity,

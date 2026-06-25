@@ -10,8 +10,8 @@ scoring two arms on the same dates:
                 direction, no amount of LLM debate will rescue them.
   · committee (run_llm=True)  — the full bull/bear debate + judge on the SAME
                 reconstructed evidence. If it doesn't beat baseline on hit-rate,
-                forward-return, or selectivity, the 27B layer isn't earning its
-                cost.
+                forward-return, IC (signal/return correlation), or selectivity,
+                the 27B layer isn't earning its cost.
 
 HONEST LIMITATIONS — read before trusting any number this prints:
   · DIRECTIONAL PROXY, not options P&L. We score whether the committee's side
@@ -32,6 +32,7 @@ budget: `points × 3`. Use `step_days` and `limit` to keep it sane.
 """
 from __future__ import annotations
 
+import math
 from datetime import date, datetime, timedelta
 from typing import Optional
 
@@ -174,14 +175,43 @@ async def backtest(
     return result
 
 
+def _pearson(xs: list[float], ys: list[float]) -> Optional[float]:
+    """Pearson correlation, or None when either series has no variance (e.g. all
+    points took the same side) so the correlation is undefined."""
+    n = len(xs)
+    if n < 2:
+        return None
+    mx, my = sum(xs) / n, sum(ys) / n
+    cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    vx = sum((x - mx) ** 2 for x in xs)
+    vy = sum((y - my) ** 2 for y in ys)
+    if vx <= 0 or vy <= 0:
+        return None
+    return cov / math.sqrt(vx * vy)
+
+
 def _score(points: list[dict], side_key: str) -> dict:
-    """Directional hit-rate + forward-return for one arm. Neutral/None sides are
-    excluded from hit-rate (counted as a PASS instead)."""
+    """Directional hit-rate, forward-return, and Information Coefficient for one
+    arm. Neutral/None sides are excluded from hit-rate (counted as a PASS).
+
+    IC is qlib's signal-quality lens applied here: the correlation between the
+    signed side (+1 call / −1 put) and the realized forward return. Unlike
+    hit-rate it weights by HOW FAR price moved (right on big moves beats right on
+    flat tape), and unlike avg_aligned_return it is scale-free, so it's
+    comparable across symbols and windows. ic_t is its significance — |t| ≳ 2
+    means the alignment is unlikely to be a fluke of the sample."""
     directional = [p for p in points if p.get(side_key) in ("call", "put")]
     hits = sum(1 for p in directional
                if (p[side_key] == "call") == (p["fwd_return"] > 0))
     aligned = [p["fwd_return"] if p[side_key] == "call" else -p["fwd_return"]
                for p in directional]
+    sides = [1.0 if p[side_key] == "call" else -1.0 for p in directional]
+    rets = [p["fwd_return"] for p in directional]
+    ic = _pearson(sides, rets)
+    k = len(directional)
+    # t-stat of a correlation: ic·√((k−2)/(1−ic²)). Undefined at |ic|→1 or k<3.
+    ic_t = (round(ic * math.sqrt((k - 2) / (1 - ic ** 2)), 2)
+            if ic is not None and k > 2 and abs(ic) < 1 else None)
     n = len(points)
     return {
         "n": n,
@@ -189,6 +219,8 @@ def _score(points: list[dict], side_key: str) -> dict:
         "pass_rate": round(1 - len(directional) / n, 3) if n else None,
         "hit_rate": round(hits / len(directional), 3) if directional else None,
         "avg_aligned_return": round(sum(aligned) / len(aligned), 4) if aligned else None,
+        "ic": round(ic, 3) if ic is not None else None,
+        "ic_t": ic_t,
     }
 
 
@@ -198,8 +230,10 @@ def _render_report(r: dict) -> str:
             return f"- {name}: (not run)"
         hr = f"{s['hit_rate']:.0%}" if s["hit_rate"] is not None else "—"
         ar = f"{s['avg_aligned_return']:+.2%}" if s["avg_aligned_return"] is not None else "—"
+        ic = f"{s['ic']:+.3f}" if s["ic"] is not None else "—"
+        ict = f" (t {s['ic_t']:+.1f})" if s["ic_t"] is not None else ""
         return (f"- {name}: {s['trades']}/{s['n']} trades · hit-rate {hr} · "
-                f"avg aligned move {ar} · pass-rate {s['pass_rate']:.0%}")
+                f"avg aligned move {ar} · IC {ic}{ict} · pass-rate {s['pass_rate']:.0%}")
 
     lines = [
         f"**Committee backtest — {r['symbol']}  {r['window']}**",
