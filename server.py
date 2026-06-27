@@ -2477,6 +2477,88 @@ async def _concurrent_risk_dollars(stop_pct: float) -> float:
     return sum(abs(p.get("market_value") or 0.0) for p in positions) * frac
 
 
+# |ρ| of daily returns at/above this means two names are effectively one bet.
+_CORR_THRESHOLD = 0.70
+
+
+def _returns_corr(a: list[float], b: list[float]) -> float | None:
+    """Pearson correlation of daily simple returns over the overlapping tail of
+    two close-price series (both oldest→newest). Correlating RETURNS, not prices,
+    is what isolates 'these move together'. None when the overlap is too short or
+    a series is flat (correlation undefined)."""
+    n = min(len(a), len(b))
+    if n < 31:                      # ~6 weeks of overlapping bars for a stable read
+        return None
+    a, b = a[-n:], b[-n:]
+    pairs = [((a[i] - a[i - 1]) / a[i - 1], (b[i] - b[i - 1]) / b[i - 1])
+             for i in range(1, n) if a[i - 1] > 0 and b[i - 1] > 0]
+    if len(pairs) < 30:
+        return None
+    ra, rb = [p[0] for p in pairs], [p[1] for p in pairs]
+    k = len(ra)
+    ma, mb = sum(ra) / k, sum(rb) / k
+    cov = sum((x - ma) * (y - mb) for x, y in zip(ra, rb))
+    va, vb = sum((x - ma) ** 2 for x in ra), sum((y - mb) ** 2 for y in rb)
+    if va <= 0 or vb <= 0:
+        return None
+    return cov / (va * vb) ** 0.5
+
+
+def _position_underlying(psym: str) -> str:
+    """Root ticker from a position symbol — the equity ticker as-is, or the OCC
+    option root (everything before the trailing 15-char YYMMDD+C/P+strike block,
+    e.g. AAPL250620C00185000 → AAPL)."""
+    s = (psym or "").upper()
+    if len(s) >= 16 and s[-15:-9].isdigit() and s[-9] in ("C", "P") and s[-8:].isdigit():
+        return s[:-15]
+    return s
+
+
+async def _correlation_check(symbol: str, stop_pct: float) -> dict:
+    """Find open positions whose daily returns move with `symbol` at/above
+    _CORR_THRESHOLD — the same factor bet dressed up as a second ticker. Returns
+    {correlated: [(name, rho, risk$)], risk: total correlated risk$, summary:
+    'SPY (ρ 0.94), NVDA (ρ 0.82)'}. Fail-open to an empty result on any broker/
+    data hiccup so a positions read never blocks sizing."""
+    empty = {"correlated": [], "risk": 0.0, "summary": ""}
+    if not broker.is_ready():
+        return empty
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return empty
+    try:
+        positions = await asyncio.to_thread(broker.list_positions)
+    except Exception as e:
+        print(f"[trade] correlation gate: couldn't read positions: {e}")
+        return empty
+    # Distinct held underlyings (excluding the name we're sizing) + their stop-based
+    # risk, the same yardstick the concurrent-risk cap uses.
+    frac = (stop_pct / 100.0) if stop_pct > 0 else 1.0
+    held: dict[str, float] = {}
+    for p in positions:
+        root = _position_underlying(p.get("symbol") or "")
+        if root and root != sym:
+            held[root] = held.get(root, 0.0) + abs(p.get("market_value") or 0.0) * frac
+    if not held:
+        return empty
+    # Pull return series for the new name + every held underlying concurrently.
+    symbols = [sym, *held.keys()]
+    series = await asyncio.gather(
+        *(asyncio.to_thread(broker.daily_closes, s, 130) for s in symbols))
+    closes = dict(zip(symbols, series))
+    base = closes.get(sym) or []
+    correlated = [(name, rho, risk) for name, risk in held.items()
+                  if (rho := _returns_corr(base, closes.get(name) or [])) is not None
+                  and rho >= _CORR_THRESHOLD]
+    if not correlated:
+        return empty
+    correlated.sort(key=lambda x: -x[1])
+    summary = ", ".join(f"{n} (ρ {r:.2f})" for n, r, _ in correlated)
+    return {"correlated": correlated,
+            "risk": sum(rk for _, _, rk in correlated),
+            "summary": summary}
+
+
 async def _holds_underlying(symbol: str) -> bool:
     """True if an open Alpaca position is in `symbol` — the equity itself or one
     of its options (whose OCC symbol starts with the underlying). Used to skip
@@ -3075,6 +3157,24 @@ def _opposes(side: str, label: str) -> bool:
     return (side == "put" and label == "bullish") or (side == "call" and label == "bearish")
 
 
+def _format_vol_edge(ivc: dict) -> str:
+    """One-line volatility edge for a LONG-premium reco: the spread between the
+    market's price (ATM implied vol) and our model reference (30-day realized
+    vol), in vol points — the options analog of Kalshi's model−market edge.
+    Positive = implied sits BELOW realized, so premium is cheap and a long buyer
+    has the wind at their back; negative = you're paying up for vol. Empty string
+    when either leg is missing (verdict UNKNOWN)."""
+    iv, hv = ivc.get("atm_iv"), ivc.get("hv30")
+    if not iv or not hv:
+        return ""
+    edge_pts = (hv - iv) * 100          # model (realized) − market (implied)
+    favor = ("premium is cheap — tailwind for a long buyer" if edge_pts > 0.5
+             else "you're paying up for vol — headwind for a long buyer" if edge_pts < -0.5
+             else "implied ≈ realized — no vol edge either way")
+    return (f"Vol edge: implied {iv * 100:.1f}% vs realized {hv * 100:.1f}% "
+            f"→ {edge_pts:+.1f} vol pts ({ivc.get('verdict', '?')}) — {favor}.")
+
+
 async def build_trade_reco(symbol: str, risk: dict | None, websocket: WebSocket) -> tuple[str, str]:
     """Deterministically build a long call/put recommendation: direction from
     the daily chart bias, contract from a liquidity-screened ATM strike, size
@@ -3237,10 +3337,20 @@ async def build_trade_reco(symbol: str, risk: dict | None, websocket: WebSocket)
     existing_risk = await _concurrent_risk_dollars(stop_pct)
     concurrent_room = account * concurrent_cap_pct / 100.0 - existing_risk
     per_trade_budget = account * max_risk_pct / 100.0
+    # Correlated-risk cap: positions that move WITH this name are the same bet, so
+    # their risk eats a (usually tighter) correlated budget. Whichever cap binds
+    # harder sizes the trade — concentration is capped two ways, not one. No
+    # correlated names → infinite correlated room, so only the concurrent cap acts.
+    correlated_cap_pct = float(rules.get("max_correlated_risk_pct", concurrent_cap_pct))
+    corr = await _correlation_check(sym, stop_pct)
+    correlated_room = (account * correlated_cap_pct / 100.0 - corr["risk"]
+                       if corr["correlated"] else float("inf"))
+    room = min(concurrent_room, correlated_room)
     qty, dollar_risk = _size_contracts(account, max_risk_pct, stop_pct, entry,
-                                       cap_dollars=concurrent_room)
-    # True when the account cap (not the per-trade %) is what limited the size.
-    capped_by_account = account > 0 and concurrent_room < per_trade_budget
+                                       cap_dollars=room)
+    # Which cap (if any) limited the size — drives the explanatory note below.
+    capped_by_account = account > 0 and concurrent_room < per_trade_budget and concurrent_room <= correlated_room
+    capped_by_corr = account > 0 and correlated_room < per_trade_budget and correlated_room < concurrent_room
     breakeven = strike + entry if side == "call" else strike - entry
     await _emit_telemetry(
         websocket, "trade.sizing", f"acct ${account:,.0f}, {max_risk_pct:g}% risk, {stop_pct:g}% stop",
@@ -3265,13 +3375,19 @@ async def build_trade_reco(symbol: str, risk: dict | None, websocket: WebSocket)
             zero_note = (
                 "I couldn't read an account total — connect Alpaca (or set your "
                 "account size in the Position panel) so I can size this.")
+        elif capped_by_corr and correlated_room <= 0:
+            zero_note = (
+                f"No room for this: {corr['summary']} already use your "
+                f"{correlated_cap_pct:g}% correlated-risk cap (${corr['risk']:,.0f} of "
+                f"{sym}-correlated risk on) — adding it would just double the same bet. "
+                "Close one or pick an uncorrelated name.")
         elif concurrent_room <= 0:
             zero_note = (
                 f"Your open positions already use the {concurrent_cap_pct:g}% account "
                 f"risk cap (${existing_risk:,.0f} at risk) — no room for another trade. "
                 "Close something first.")
         elif entry > 0:
-            budget = min(per_trade_budget, concurrent_room)
+            budget = min(per_trade_budget, room)
             per = entry * 100.0 * (stop_pct / 100.0 if stop_pct > 0 else 1.0)
             zero_note = (
                 f"One contract risks ${per:,.0f} at your {stop_pct:g}% stop, over your "
@@ -3285,6 +3401,22 @@ async def build_trade_reco(symbol: str, risk: dict | None, websocket: WebSocket)
             f"Sized down to ${dollar_risk:,.0f} to stay under your {concurrent_cap_pct:g}% "
             f"account risk cap — open positions already risk ${existing_risk:,.0f}."
         )
+    # Correlation gate (hard): if this long stacks onto names that move with it,
+    # the size was already capped to the correlated budget above — say so. Within
+    # the cap it's a soft heads-up. The qty==0 correlation case is in zero_note.
+    corr_note = ""
+    if corr["correlated"] and qty > 0:
+        if capped_by_corr:
+            corr_note = (
+                f"Sized down to ${dollar_risk:,.0f} to stay under your "
+                f"{correlated_cap_pct:g}% correlated-risk cap — you already hold "
+                f"{corr['summary']}, which move with {sym} (${corr['risk']:,.0f} "
+                "correlated risk on).")
+        else:
+            corr_note = (
+                f"Heads up: {sym} moves with {corr['summary']} you already hold "
+                f"(${corr['risk']:,.0f} correlated risk) — this adds concentration, "
+                "not diversification.")
     # Conflict heads-up: chart and sentiment disagree, so this is lower conviction.
     conflict_note = ""
     if news_conflict:
@@ -3362,10 +3494,11 @@ async def build_trade_reco(symbol: str, risk: dict | None, websocket: WebSocket)
                  else "Want me to set stop and take-profit alerts on it, and tell me once you've placed it?")
         cap_phrase = f" {cap_note}" if cap_note else ""
         conflict_phrase = f" {conflict_note}" if conflict_note else ""
+        corr_phrase = f" {corr_note}" if corr_note else ""
         spoken = (
             f"{sym} is {bias_phrase}. I'd look at {qty} of the {strike:g} {side_label.lower()}s "
             f"expiring {expiry}, a limit around ${limit_price:.2f}, stop at ${stop_price:.2f}, "
-            f"max risk ${dollar_risk:,.0f}.{iv_phrase}{news_phrase}{conflict_phrase}{cap_phrase} "
+            f"max risk ${dollar_risk:,.0f}.{iv_phrase}{news_phrase}{conflict_phrase}{corr_phrase}{cap_phrase} "
             + close
         )
         # Stash the proposed trade so the next turn can act on a yes/placed reply.
@@ -3391,10 +3524,15 @@ async def build_trade_reco(symbol: str, risk: dict | None, websocket: WebSocket)
     full_md = f"{summary}\n\n{table}\n\n{steps}"
     if conflict_note:
         full_md += f"\n\n⚠️ {conflict_note}"
+    if corr_note:
+        full_md += f"\n\n⚠️ {corr_note}"
     if cap_note:
         full_md += f"\n\n⚠️ {cap_note}"
     if zero_note:
         full_md += f"\n\n⚠️ {zero_note}"
+    edge_line = _format_vol_edge(ivc)
+    if edge_line:
+        full_md += f"\n\n_{edge_line}_"
     if bt_line:
         full_md += f"\n\n_{bt_line}_"
     if sentiment["count"]:

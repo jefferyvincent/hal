@@ -88,6 +88,31 @@ def _bias_to_side(bias: str) -> str:
     return {"bullish": "call", "bearish": "put"}.get(bias, "neutral")
 
 
+# Most claimed edge over a coin flip for a single directional read, so a
+# probability is never treated as certain (p stays in [0.5, 0.5+_MAX_EDGE]).
+# Keeps the Brier score honest — an overconfident 1.0 that misses is unbounded.
+_MAX_EDGE = 0.40
+
+
+def _agreement(analysts: list[dict], bias: str) -> float:
+    """How strongly the analysts back the consensus `bias`, in [0,1] — mean
+    confidence over ALL analysts of those leaning the bias side. Mirrors the
+    agreement term in committee._committee_score so the baseline arm's conviction
+    matches what the live desk feels from the same evidence. Neutral → 0."""
+    if bias not in ("bullish", "bearish") or not analysts:
+        return 0.0
+    leaning = sum(a["confidence"] for a in analysts if a["lean"] == bias)
+    return round(leaning / len(analysts), 3)
+
+
+def _prob_up(side: str, conf: float) -> float:
+    """P(underlying up over the horizon) implied by a side + conviction `conf`
+    in [0,1]. A directional read of strength conf claims P(correct)=0.5+edge,
+    edge = _MAX_EDGE·conf; a put just mirrors that to the downside."""
+    p_correct = 0.5 + _MAX_EDGE * max(0.0, min(1.0, conf))
+    return p_correct if side == "call" else 1.0 - p_correct
+
+
 # --- Data --------------------------------------------------------------------
 async def _load_closes(symbol: str, start: str, end: str) -> list[dict]:
     """Daily bars [{t,o,h,l,c,v}] from Yahoo (keyless) covering warm-up → end+buffer."""
@@ -149,7 +174,11 @@ async def backtest(
             "iv_level": iv_level,
             "fwd_return": round(fwd, 4),
             "baseline_side": _bias_to_side(bias),
+            # Conviction in [0,1] for the directional probability the Brier scorer
+            # needs. Baseline has no judge, so it leans on analyst agreement.
+            "baseline_conf": _agreement(analysts, bias),
             "committee_side": None,
+            "committee_conf": None,
             "committee_decision": None,
         }
         if run_llm:
@@ -159,6 +188,9 @@ async def backtest(
                 bias=bias, reflection="", account_size=account_size)
             point["committee_decision"] = v["decision"]
             point["committee_side"] = v["side"] if v["decision"] == "TRADE" else "neutral"
+            # The 0-100 committee score already blends judge conviction with
+            # analyst agreement; normalize to [0,1] as this arm's conviction.
+            point["committee_conf"] = v["score"] / 100
         points.append(point)
 
     result = {
@@ -167,8 +199,8 @@ async def backtest(
         "horizon_days": horizon_days,
         "step_days": step_days,
         "n_points": len(points),
-        "baseline": _score(points, "baseline_side"),
-        "committee": _score(points, "committee_side") if run_llm else None,
+        "baseline": _score(points, "baseline_side", "baseline_conf"),
+        "committee": _score(points, "committee_side", "committee_conf") if run_llm else None,
         "points": points,
     }
     result["report"] = _render_report(result)
@@ -190,16 +222,38 @@ def _pearson(xs: list[float], ys: list[float]) -> Optional[float]:
     return cov / math.sqrt(vx * vy)
 
 
-def _score(points: list[dict], side_key: str) -> dict:
-    """Directional hit-rate, forward-return, and Information Coefficient for one
-    arm. Neutral/None sides are excluded from hit-rate (counted as a PASS).
+def _brier(probs: list[float], outcomes: list[float]) -> tuple[Optional[float], Optional[float]]:
+    """Brier score (mean squared error of the up-probabilities against 0/1
+    outcomes — lower is better, 0.25 is a coin flip) and its SKILL score vs the
+    climatology baseline of always predicting the sample base rate. skill > 0 ⇒
+    the probabilities beat 'just predict the base rate'; skill is None when every
+    outcome was identical (climatology is already perfect and the ratio blows up)."""
+    n = len(probs)
+    if n == 0:
+        return None, None
+    brier = sum((p - o) ** 2 for p, o in zip(probs, outcomes)) / n
+    base = sum(outcomes) / n
+    climo = base * (1 - base)            # Brier of the constant base-rate forecast
+    skill = (1 - brier / climo) if climo > 0 else None
+    return round(brier, 4), (round(skill, 3) if skill is not None else None)
+
+
+def _score(points: list[dict], side_key: str, conf_key: str) -> dict:
+    """Directional hit-rate, forward-return, Information Coefficient, and Brier
+    calibration for one arm. Neutral/None sides are excluded from hit-rate
+    (counted as a PASS).
 
     IC is qlib's signal-quality lens applied here: the correlation between the
     signed side (+1 call / −1 put) and the realized forward return. Unlike
     hit-rate it weights by HOW FAR price moved (right on big moves beats right on
     flat tape), and unlike avg_aligned_return it is scale-free, so it's
     comparable across symbols and windows. ic_t is its significance — |t| ≳ 2
-    means the alignment is unlikely to be a fluke of the sample."""
+    means the alignment is unlikely to be a fluke of the sample.
+
+    Brier turns each directional read into P(up) from its conviction and scores
+    it against the realized 0/1 move: hit-rate asks 'right or wrong?', Brier asks
+    'was the CONFIDENCE earned?' — a confident miss is punished more than a
+    hedged one. brier_skill > 0 means better-calibrated than the base rate."""
     directional = [p for p in points if p.get(side_key) in ("call", "put")]
     hits = sum(1 for p in directional
                if (p[side_key] == "call") == (p["fwd_return"] > 0))
@@ -212,6 +266,9 @@ def _score(points: list[dict], side_key: str) -> dict:
     # t-stat of a correlation: ic·√((k−2)/(1−ic²)). Undefined at |ic|→1 or k<3.
     ic_t = (round(ic * math.sqrt((k - 2) / (1 - ic ** 2)), 2)
             if ic is not None and k > 2 and abs(ic) < 1 else None)
+    probs = [_prob_up(p[side_key], p.get(conf_key) or 0.0) for p in directional]
+    outcomes = [1.0 if p["fwd_return"] > 0 else 0.0 for p in directional]
+    brier, brier_skill = _brier(probs, outcomes)
     n = len(points)
     return {
         "n": n,
@@ -221,6 +278,8 @@ def _score(points: list[dict], side_key: str) -> dict:
         "avg_aligned_return": round(sum(aligned) / len(aligned), 4) if aligned else None,
         "ic": round(ic, 3) if ic is not None else None,
         "ic_t": ic_t,
+        "brier": brier,
+        "brier_skill": brier_skill,
     }
 
 
@@ -232,8 +291,11 @@ def _render_report(r: dict) -> str:
         ar = f"{s['avg_aligned_return']:+.2%}" if s["avg_aligned_return"] is not None else "—"
         ic = f"{s['ic']:+.3f}" if s["ic"] is not None else "—"
         ict = f" (t {s['ic_t']:+.1f})" if s["ic_t"] is not None else ""
+        bs = f"{s['brier']:.3f}" if s.get("brier") is not None else "—"
+        sk = f" (skill {s['brier_skill']:+.2f})" if s.get("brier_skill") is not None else ""
         return (f"- {name}: {s['trades']}/{s['n']} trades · hit-rate {hr} · "
-                f"avg aligned move {ar} · IC {ic}{ict} · pass-rate {s['pass_rate']:.0%}")
+                f"avg aligned move {ar} · IC {ic}{ict} · Brier {bs}{sk} · "
+                f"pass-rate {s['pass_rate']:.0%}")
 
     lines = [
         f"**Committee backtest — {r['symbol']}  {r['window']}**",

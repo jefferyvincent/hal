@@ -541,6 +541,18 @@ all listed conditions must hold): `symbols` (tickers; omit to apply to any),
 **Override keys** (any omitted falls back to `trading-rules.md`): `stop_loss_pct`,
 `take_profit_pct`, `max_risk_per_trade_pct`, `limit_buffer_pct`, `min_reward_risk`.
 
+**On a single-name trade idea** (the quick sized long call/put, not the committee)
+HAL also prints a **vol edge** — implied ATM IV vs 30-day realized vol, in vol
+points (positive = premium is cheap for a long buyer; the options analog of a
+model-minus-market spread) — and enforces two **account-level risk caps** while
+sizing: `max_concurrent_risk_pct` (total stop-risk across all open positions) and
+`max_correlated_risk_pct` (stop-risk in positions whose daily *returns* move with
+the new name at |ρ| ≥ 0.70, so it won't quietly stack the same factor bet under a
+second ticker). Whichever cap binds harder sizes the trade down — or to zero, with
+the reason stated. `max_concurrent_risk_pct` defaults to 6%, and
+`max_correlated_risk_pct` falls back to whatever the concurrent cap is; a playbook
+may override either like any other key.
+
 **Starter playbooks** ship in the vault's `Strategy/` folder — copy `_TEMPLATE.md`
 to start your own:
 
@@ -596,7 +608,13 @@ is also scored by **IC (Information Coefficient)** — the correlation between t
 it took and the realized forward move, with a significance t-stat. Unlike hit-rate
 (which ignores *how far* price moved) IC is scale-free, so it's comparable across
 symbols and windows; it's the rigorous form of the "does this signal predict
-direction?" question the backtest exists to answer.
+direction?" question the backtest exists to answer. Each arm also carries a
+**Brier score** and its **skill score** — the calibration lens. Every directional
+call becomes a probability from its conviction (the baseline arm from analyst
+agreement, the committee arm from its 0-100 score), scored against the realized
+0/1 move, so a confident miss is punished harder than a hedged one. Where hit-rate
+asks *right or wrong?*, Brier asks *was the confidence earned?* — and skill > 0
+means the arm is better-calibrated than just predicting the base rate.
 
 **Strategy backtest panel** (the equity curve HAL shows when it backtests an
 underlying's option strategy, e.g. during a deep analysis): the stats overlay now
