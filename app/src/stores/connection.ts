@@ -29,6 +29,7 @@ import type {
   Subscription,
   TelemetryEvent,
   TradeIdea,
+  MoversPayload,
 } from "@/types";
 
 export interface McpAddPayload {
@@ -103,6 +104,10 @@ interface ConnectionState {
   // rationale as `equity`). Carries an `error` payload when a build fails.
   equityChart: Record<string, ChartPayload>;
   equityChartLoading: string | null;
+  // Market-movers board (top gainers/losers/most-active) backing the terminal's
+  // Heatmap tab. Cached here — keyed off the movers_refresh reply — so the tab
+  // has a home for the data independent of the immersive watch-list board.
+  moversBoard: MoversPayload | null;
 }
 
 interface ConnectionActions {
@@ -132,6 +137,7 @@ interface ConnectionActions {
   removeNewsWatch: (watchId: number) => void;
   clearTradeIdeas: () => void;
   refreshWatchlist: () => void;
+  refreshMovers: () => void;
   refreshChart: () => void;
   refreshPositions: () => void;
   closePosition: (symbol: string) => void;
@@ -385,6 +391,10 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
         }));
         return;
       }
+      if (msg.movers) {
+        set({ moversBoard: msg.movers });
+        return;
+      }
       if (msg.trade_placed) {
         const { id, ok } = msg.trade_placed;
         set((s) => ({
@@ -577,6 +587,7 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
       equityLoading: null,
       equityChart: {},
       equityChartLoading: null,
+      moversBoard: null,
 
       // -- actions -----------------------------------------------------
       async init() {
@@ -889,6 +900,9 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
       },
       refreshWatchlist() {
         void getSocket().sendCommand({ command: "watchlist_refresh" });
+      },
+      refreshMovers() {
+        void getSocket().sendCommand({ command: "movers_refresh" });
       },
       refreshChart() {
         void getSocket().sendCommand({ command: "chart_refresh" });
