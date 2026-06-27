@@ -11,7 +11,8 @@ export type TerminalTab =
   | "portfolio"
   | "news"
   | "equity"
-  | "nodes";
+  | "nodes"
+  | "heatmap";
 
 export const TERMINAL_TABS: { id: TerminalTab; key: string; label: string }[] = [
   { id: "overview", key: "F1", label: "OVERVIEW" },
@@ -19,6 +20,7 @@ export const TERMINAL_TABS: { id: TerminalTab; key: string; label: string }[] = 
   { id: "news", key: "F3", label: "NEWS" },
   { id: "equity", key: "F4", label: "EQUITY" },
   { id: "nodes", key: "F5", label: "NODES" },
+  { id: "heatmap", key: "F6", label: "HEATMAP" },
 ];
 
 interface TerminalState {

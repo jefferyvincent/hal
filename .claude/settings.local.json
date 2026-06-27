@@ -37,7 +37,12 @@
       "Bash(command -v shellcheck)",
       "Bash(shellcheck setup.sh)",
       "Bash(.venv/bin/python -c \"import ast; ast.parse\\(open\\('server.py'\\).read\\(\\)\\); print\\('server.py parses OK'\\)\")",
-      "Bash(python3 -c \"import ast; ast.parse\\(open\\('server.py'\\).read\\(\\)\\); print\\('server.py parses OK'\\)\")"
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('server.py'\\).read\\(\\)\\); print\\('server.py parses OK'\\)\")",
+      "Bash(curl -s -m 20 -H 'User-Agent: __TRACKED_VAR__' -H 'Accept: application/json' -H 'Origin: https://www.nasdaq.com' -H 'Referer: https://www.nasdaq.com/' https://api.nasdaq.com/api/marketmovers)",
+      "Bash(python3 -c ' *)",
+      "Bash(.venv/bin/python -c ' *)",
+      "Bash(cd *)",
+      "Bash(graphify query *)"
     ],
     "additionalDirectories": [
       "/media/jefferyvincent/New Volume1/repos/hal"

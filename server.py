@@ -47,6 +47,7 @@ from hal.sensory import news
 from hal.sensory import earnings
 from hal.sensory import fundamentals
 from hal.sensory import watchlist
+from hal.sensory import movers
 from hal.sensory import broker
 from hal.sensory import brackets
 from hal.sensory import money
@@ -5657,6 +5658,15 @@ async def voice_interface(websocket: WebSocket):
                             {"action": "watchlist_update", "watchlist": payload})
                     except Exception as e:
                         print(f"[watchlist] refresh failed: {e}")
+                elif cmd == "movers_refresh":
+                    # Terminal Heatmap tab: a fixed, market-wide movers board
+                    # (top gainers/losers/most-active, Nasdaq keyless). build_payload
+                    # swallows its own errors into the payload.
+                    try:
+                        payload = await movers.build_payload()
+                    except Exception as e:
+                        payload = {"rows": [], "generated_at": time.time(), "error": f"{e}"}
+                    await websocket.send_json({"movers": payload})
                 elif cmd == "chart_refresh":
                     req = websocket.scope.get("hal_chart_req")
                     if req:

@@ -92,6 +92,8 @@ export interface ServerEnvelope {
   equity?: EquityFundamentals;
   /** Standalone candlestick payload for the Equity tab (reply to equity_chart). */
   equity_chart?: ChartPayload;
+  /** Market-movers board for the Heatmap tab (reply to movers_refresh). */
+  movers?: MoversPayload;
 }
 
 /** Company fundamentals for the terminal's Equity Research / DCF tab, built
@@ -230,6 +232,25 @@ export interface WatchlistRow {
 export interface WatchlistPayload {
   rows: WatchlistRow[];
   generated_at: number;
+}
+
+/** A single market-mover tile for the terminal's Heatmap tab. change_pct is in
+ *  percent units (e.g. 4.82 = +4.82%). category is "Gainer" | "Loser" | "Active"
+ *  | "NDX". Built server-side by hal/sensory/movers.py from Nasdaq's keyless feed. */
+export interface MoversRow {
+  symbol: string;
+  name?: string | null;
+  price?: number | null;
+  change_pct: number;
+  category: string;
+  error?: string | null;
+}
+
+export interface MoversPayload {
+  rows: MoversRow[];
+  generated_at: number;
+  as_of?: string | null;
+  error?: string | null;
 }
 
 /** Candlestick chart payload built server-side by charting.py. Times are

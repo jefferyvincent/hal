@@ -16,6 +16,7 @@ import PortfolioTab from "@/components/terminal/tabs/PortfolioTab";
 import NewsTab from "@/components/terminal/tabs/NewsTab";
 import EquityTab from "@/components/terminal/tabs/EquityTab";
 import NodesTab from "@/components/terminal/tabs/NodesTab";
+import HeatmapTab from "@/components/terminal/tabs/HeatmapTab";
 
 const FKEY_TO_TAB: Record<string, TerminalTab> = {
   F1: "overview",
@@ -23,6 +24,7 @@ const FKEY_TO_TAB: Record<string, TerminalTab> = {
   F3: "news",
   F4: "equity",
   F5: "nodes",
+  F6: "heatmap",
 };
 
 function Clock() {
@@ -126,6 +128,7 @@ export default function Terminal() {
         {tab === "news" && <NewsTab />}
         {tab === "equity" && <EquityTab />}
         {tab === "nodes" && <NodesTab />}
+        {tab === "heatmap" && <HeatmapTab />}
       </main>
 
       <CommandLine />
