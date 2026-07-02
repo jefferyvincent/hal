@@ -82,10 +82,12 @@ export const useImmersive = create<ImmersiveState>((set, get) => ({
     if (get().source === "off") await get().setSource("camera");
     // Hands-free: entering immersive opens the mic and keeps it live. VAD
     // sends each utterance and the loop re-arms (see maybeReturnToIdle) until
-    // the user toggles immersive off.
+    // the user toggles immersive off. Respect the stop-listening switch
+    // (halListen): if the user has HAL muted from listening, immersive stays
+    // visual-only — the same guard maybeReturnToIdle uses before re-arming.
     try {
       const conn = useConnection.getState();
-      if (!conn.recording) void conn.startRecording(false);
+      if (!conn.recording && conn.halListen) void conn.startRecording(false);
     } catch {
       /* ignore */
     }

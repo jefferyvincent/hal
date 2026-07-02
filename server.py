@@ -971,10 +971,23 @@ _TRADE_IDEA_MARKERS = re.compile(
     re.IGNORECASE)
 
 
+def _is_trade_idea(text: str) -> bool:
+    """Single source of truth: does this reply read like an actionable trade
+    idea? Drives BOTH the spoken "here's a trade idea" pointer (agent_loop) and
+    the Trade Ideas pane pin (_push_idea_if_trade) off ONE decision, so HAL can
+    never announce an idea he doesn't pin — or pin one he never says."""
+    return bool(text and _TRADE_IDEA_MARKERS.search(text))
+
+
 async def _push_idea_if_trade(websocket: WebSocket, user_text: str, reply: str) -> None:
     """If an LLM reply reads like a trade recommendation, pin it in the Trade
     Ideas pane (the deterministic routes already pin theirs)."""
-    if not reply or not _TRADE_IDEA_MARKERS.search(reply):
+    # Reuse the ONE trade-idea decision agent_loop already made for the spoken
+    # pointer this turn, so the pane pin can't disagree with what HAL said. Fall
+    # back to the shared predicate if agent_loop didn't run (non-streaming path).
+    flag = websocket.scope.pop("hal_reply_is_trade", None)
+    is_trade = flag if flag is not None else _is_trade_idea(reply)
+    if not reply or not is_trade:
         return
     sym = (_resolve_company_name(user_text or "")
            or _resolve_company_name(reply or ""))
@@ -3694,6 +3707,9 @@ async def agent_loop(
     model_mode: str = "",
 ) -> tuple[str, list]:
     """Run a tool-using chat loop. Returns (final_text, updated_history)."""
+    # Clear last turn's trade-idea flag up front: not every caller pins (the
+    # alert path doesn't), so a stale True must never bleed into this turn.
+    websocket.scope.pop("hal_reply_is_trade", None)
     attachments = attachments or []
     text_context = _format_text_attachments(attachments)
     images = [a["content"] for a in attachments if a["kind"] == "image"]
@@ -3892,12 +3908,27 @@ async def agent_loop(
                                 await on_sentence(leftover)
                             except Exception as e:
                                 print(f"[agent] on_sentence flush error: {e}")
+                    # `final_reply` is exactly what this branch returns as
+                    # `content` below (_strip_thinking + strip of the stream).
+                    # Decide trade-idea-ness ONCE, on this one text, and stash it:
+                    # it drives both the spoken pointer here and the Trade Ideas
+                    # pane pin (_push_idea_if_trade), so the two can't drift apart
+                    # even if the reply is transformed between the two call sites.
+                    final_reply = _strip_thinking(accumulated).strip()
+                    is_trade = _is_trade_idea(final_reply)
+                    websocket.scope["hal_reply_is_trade"] = is_trade
                     # If the reply was all-structured (nothing spoken), still say a
-                    # one-line pointer so HAL isn't silent on a trade idea.
-                    if on_sentence and not spoke_any and accumulated.strip():
+                    # one-line pointer so HAL isn't silent — but only call it a
+                    # trade idea when it actually is one (otherwise it's a table /
+                    # metrics / summary that lands in chat, not the pane, and
+                    # promising an idea would leave HAL claiming one he never shows).
+                    if not spoke_any and final_reply:
+                        pointer = (
+                            "Here's a trade idea — the details are on screen."
+                            if is_trade
+                            else "The details are on screen.")
                         try:
-                            await on_sentence(
-                                "Here's a trade idea — the details are on screen.")
+                            await on_sentence(pointer)
                         except Exception as e:
                             print(f"[agent] on_sentence summary error: {e}")
                     msg = {"role": "assistant", "content": accumulated}

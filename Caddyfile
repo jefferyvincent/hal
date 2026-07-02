@@ -1,0 +1,37 @@
+# HAL — HTTPS front for the FastAPI/uvicorn app, on this machine and the LAN.
+# Caddy issues locally-trusted certs (its own CA) for every name below.
+# Run:  caddy run --config Caddyfile
+# Open (this machine):  https://localhost:8443
+# Open (other devices): https://pop-os.local:8443   (needs the CA installed there)
+#
+# Port 8443 (not 443) so Caddy needs no root / privileged-port binding.
+{
+	# Don't open the :80 HTTP->HTTPS redirect listener — it needs a
+	# privileged port and we serve only on 8443.
+	auto_https disable_redirects
+	# Don't auto-install the local CA into the system trust store here —
+	# that blocks on a sudo/pkexec prompt. Install it once with:
+	#   caddy trust   (host, needs sudo)  — setup.sh also does the browser NSS db.
+	skip_install_trust
+	# Browsers omit SNI when the URL is a bare IP, leaving Caddy no name to pick a
+	# cert by. Default those handshakes to the LAN-IP cert so https://192.168.1.199:8443
+	# gets a matching cert instead of a handshake error. (Named clients —
+	# localhost, pop-os.local — send SNI and are unaffected.)
+	default_sni 192.168.1.199
+}
+
+# One site, several names. Caddy binds all interfaces by default, so the LAN
+# reaches it; it serves an internal-CA cert matching whichever name is requested.
+#   - localhost      : this machine
+#   - pop-os.local   : other devices via mDNS (Avahi)
+#   - 192.168.1.199  : other devices by LAN IP, for clients that can't resolve
+#                      mDNS. If the host's DHCP lease changes this IP, update it
+#                      here (or reserve it in your router) and reload Caddy.
+localhost:8443, pop-os.local:8443, https://192.168.1.199:8443 {
+	# Use Caddy's local CA for these names (without this, non-localhost names
+	# would try public Let's Encrypt and fail — the LAN isn't publicly reachable).
+	tls internal
+	# Reverse-proxy to uvicorn. WebSocket upgrades are handled transparently,
+	# so HAL's /ws endpoints work over wss:// with no extra config.
+	reverse_proxy 127.0.0.1:8000
+}
