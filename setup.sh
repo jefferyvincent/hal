@@ -253,6 +253,54 @@ else
   warn "               nomic-embed-text (RAG embeddings — vault search needs this)"
 fi
 
+# --- 7. Caddy — local HTTPS reverse proxy (https://localhost:8443) ------------
+# server.py speaks plain HTTP on :8000; Caddy fronts it with a locally-trusted
+# TLS cert so the UI and its wss:// WebSockets load over HTTPS. The static binary
+# needs no root and drops into ~/.local/bin (already on PATH). `caddy trust`
+# installs Caddy's local CA into the system store so the browser doesn't warn —
+# that step needs sudo. start-hal.sh brings the proxy up automatically.
+case "$(uname -m)" in
+  x86_64)        CADDY_ARCH=amd64 ;;
+  aarch64|arm64) CADDY_ARCH=arm64 ;;
+  *)             CADDY_ARCH=amd64 ;;
+esac
+if command -v caddy >/dev/null 2>&1; then
+  say "Caddy already present: $(caddy version | head -1)"
+else
+  say "Installing Caddy (static binary -> ~/.local/bin, no sudo)"
+  mkdir -p "$HOME/.local/bin"
+  curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=${CADDY_ARCH}" \
+    -o "$HOME/.local/bin/caddy"
+  chmod +x "$HOME/.local/bin/caddy"
+fi
+# Trust the local CA. Pin XDG_DATA_HOME to the real ~/.local/share so the CA we
+# trust here is the exact one start-hal.sh serves (the Flatpak terminal remaps
+# XDG_DATA_HOME into its sandbox, which would otherwise mint a different CA).
+CADDY_BIN="$(command -v caddy || echo "$HOME/.local/bin/caddy")"
+if can_sudo; then
+  say "Trusting Caddy's local CA (caddy trust) so https://localhost:8443 has no browser warning"
+  XDG_DATA_HOME="$HOME/.local/share" "$CADDY_BIN" trust \
+    || warn "caddy trust failed — the browser will warn on https://localhost:8443 until you run it."
+else
+  # No sudo (system trust store is off-limits), but Chromium-family browsers read
+  # a per-user NSS db at ~/.pki/nssdb that certutil can write without root. This
+  # gets Chrome/Chromium/Brave/Edge to trust the CA; Firefox and the OS store
+  # still need `caddy trust` from a host terminal.
+  CA="$HOME/.local/share/caddy/pki/authorities/local/root.crt"
+  if command -v certutil >/dev/null 2>&1 && [ -s "$CA" ]; then
+    say "Trusting Caddy's local CA in the browser NSS db (no sudo; Chromium-family)"
+    mkdir -p "$HOME/.pki/nssdb"
+    certutil -d sql:"$HOME/.pki/nssdb" -D -n "Caddy Local Authority - HAL" 2>/dev/null || true
+    certutil -d sql:"$HOME/.pki/nssdb" -A -t "C,," -n "Caddy Local Authority - HAL" -i "$CA" \
+      && say "  imported — fully restart the browser to pick it up" \
+      || warn "  certutil import failed — the browser will warn on https://localhost:8443."
+  else
+    warn "Skipping CA trust (needs sudo, and certutil not found for the no-sudo path)."
+    warn "  From a host terminal:  XDG_DATA_HOME=\$HOME/.local/share caddy trust"
+  fi
+fi
+
 say "Done. Start the server with:  source .venv/bin/activate && python server.py"
+say "Or the full launcher (Ollama + frontend + HTTPS):  ./start-hal.sh   ->  https://localhost:8443"
 say "Frontend (browser mode):       cd app && npm run dev   ->  http://localhost:1420"
 say "Frontend (native window):      cd app && npm run tauri:dev  (first build: 5-10 min)"

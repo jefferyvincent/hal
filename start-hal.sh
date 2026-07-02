@@ -22,6 +22,18 @@ OLLAMA_URL="$(_env_val OLLAMA_URL)"; OLLAMA_URL="${OLLAMA_URL:-http://localhost:
 OLLAMA_HOST="$(printf '%s' "$OLLAMA_URL" | sed -E 's#(https?://[^/]+).*#\1#')"
 ollama_up() { curl -fsS -m 3 "$OLLAMA_HOST/api/tags" >/dev/null 2>&1; }
 
+# --- HTTPS front (Caddy) ------------------------------------------------------
+# Caddy (setup.sh installs it to ~/.local/bin) reverse-proxies https://localhost:8443
+# to server.py on :8000 using a locally-trusted cert. Where the browser lands is
+# set below and printed once HAL is up.
+CADDY_BIN="$(command -v caddy 2>/dev/null || true)"; [ -n "$CADDY_BIN" ] || CADDY_BIN="$HOME/.local/bin/caddy"
+# Pin Caddy's data dir to the REAL ~/.local/share so the CA it serves is the same
+# one `caddy trust` installed — the VSCode Flatpak terminal otherwise redirects
+# XDG_DATA_HOME into its sandbox and Caddy would mint a different, untrusted CA.
+CADDY_XDG="$HOME/.local/share"
+HAL_URL="http://localhost:8000"                    # updated to https:// if Caddy comes up
+caddy_up() { curl -skS -m 3 -o /dev/null https://localhost:8443/ 2>/dev/null; }
+
 # Ollama's model store lives on a removable drive; its systemd service waits for
 # that mount. If the path is missing, try to mount the drive by its label
 # (the directory name under /media/<user>/) via udisksctl (no sudo needed).
@@ -68,6 +80,30 @@ warm_ollama() {
     >/dev/null 2>&1 &
 }
 
+# Bring up the Caddy HTTPS front, if it's installed and a Caddyfile is present.
+# Idempotent: if something already answers on 8443 we assume Caddy is up and just
+# switch the advertised URL to https. Missing Caddy is non-fatal — HAL still
+# serves plain http on :8000.
+ensure_caddy() {
+  [ -f Caddyfile ] || return 0
+  if [ ! -x "$CADDY_BIN" ]; then
+    echo "HAL: Caddy not installed — skipping HTTPS (run ./setup.sh). Serving $HAL_URL." >&2
+    return 0
+  fi
+  if caddy_up; then
+    HAL_URL="https://localhost:8443"
+    echo "HAL: Caddy (HTTPS) already running — $HAL_URL" >&2
+    return 0
+  fi
+  echo "HAL: starting Caddy (HTTPS) on https://localhost:8443 ..." >&2
+  if XDG_DATA_HOME="$CADDY_XDG" "$CADDY_BIN" start --config Caddyfile >> hal.log 2>&1; then
+    HAL_URL="https://localhost:8443"
+    echo "HAL: Caddy up — $HAL_URL" >&2
+  else
+    echo "HAL: Caddy failed to start (see hal.log) — serving $HAL_URL instead." >&2
+  fi
+}
+
 # HAL serves the prebuilt React bundle from app/dist. Rebuild it when any source
 # under app/ (outside node_modules/dist) is newer than the last build, so UI
 # changes show up on launch without a manual `npm run build`. A failed build
@@ -97,6 +133,7 @@ ensure_frontend_build() {
 ensure_model_drive
 ensure_frontend_build
 ensure_ollama && warm_ollama
+ensure_caddy
 
 ts="$(date '+%Y-%m-%d %H:%M:%S')"
 printf '\n=== HAL starting %s ===\n' "$ts" >> hal.log
@@ -123,7 +160,7 @@ for _ in $(seq 1 120); do
     wait "$hal_pid"; exit $?
   fi
   if this_run | grep -q "HAL is running"; then
-    echo "HAL: running (pid $hal_pid) — open http://localhost:8000" >&2
+    echo "HAL: running (pid $hal_pid) — open $HAL_URL" >&2
     break
   fi
   sleep 1
