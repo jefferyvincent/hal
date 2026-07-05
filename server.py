@@ -15,6 +15,8 @@ from hal.brainstem.config import (
     ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER, ALPACA_AUTOPILOT,
     RISK_MAX_ORDERS_PER_MIN, RISK_MAX_OPEN_POSITIONS,
     RISK_MAX_GROSS_EXPOSURE_PCT, RISK_DAILY_LOSS_LIMIT_PCT,
+    SCALPER_POLL_SECONDS, SCALPER_MAX_CONCURRENT,
+    SCALPER_SCORE_THRESHOLD, SCALPER_CATASTROPHIC_STOP_PCT,
     REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET,
     USER_NAME, HAL_DESIGNATION,
 )
@@ -59,19 +61,28 @@ from hal.cerebellum import backtest
 from hal.cerebellum import optimize
 from hal.cerebellum import research_agent
 from hal.cerebellum import committee_backtest
+from hal.cerebellum import scalper
+from hal.cerebellum import markettime
 from hal.cerebellum import strategy as trade_strategy
 from hal.cerebellum.execution import LiveExecution
 from hal.cerebellum import option_strategy
 from hal.peripheral import mcp_client
 from hal.cerebellum.symbols import _resolve_company_name, _resolve_symbol
-from hal.cerebellum.markettime import _options_date_context, market_status_line
+from hal.cerebellum.markettime import (
+    _options_date_context, market_status_line, market_closed_for_day)
 from hal.peripheral.attachments import (
     _normalize_attachments,
     _format_text_attachments,
     _attachment_summary,
 )
 
-from hal.cortex.prompts import HAL_SYSTEM_PROMPT, QUIET_MODE_DIRECTIVE, TOOLS
+from hal.cortex.prompts import (
+    HAL_SYSTEM_PROMPT,
+    AFTER_HOURS_DIRECTIVE,
+    QUIET_MODE_DIRECTIVE,
+    SCALPER_ACTIVE_DIRECTIVE,
+    TOOLS,
+)
 from hal.hippocampus import vault as _vault
 from hal.cortex import rag as _rag
 from hal.cortex import cag as _cag
@@ -96,6 +107,7 @@ _MODEL_TOOL_NAMES = {
     "get_account", "list_positions", "list_orders", "cancel_order", "close_position",
     "manage_risk",
     "committee_review", "committee_backtest",
+    "scalper_start", "scalper_stop", "scalper_status",
 }
 _MODEL_TOOLS = [
     t for t in TOOLS if t.get("function", {}).get("name") in _MODEL_TOOL_NAMES
@@ -371,6 +383,8 @@ async def _lifespan(_app: FastAPI):
         await news.monitor.stop()
         await earnings.monitor.stop()
         await brackets.monitor.stop()
+        if _scalper_session is not None:
+            await _scalper_session.stop()
         _rag.stop_watcher()
 
 
@@ -1097,6 +1111,8 @@ async def execute_tool(name: str, args: dict, websocket: WebSocket, abort_event:
         return await run_committee_tool(args, websocket)
     if name == "committee_backtest":
         return await run_committee_backtest_tool(args, websocket)
+    if name in ("scalper_start", "scalper_stop", "scalper_status"):
+        return await run_scalper_tool(name, args, websocket)
     if name == "open_webull":
         return await run_webull_tool(args, websocket)
     if name == "open_view":
@@ -1295,6 +1311,13 @@ async def _place_order(args: dict) -> dict:
         option_type=args.get("option_type"),
         strike=args.get("strike"),
     )
+    return await _gated_submit(spec)
+
+
+async def _gated_submit(spec: dict) -> dict:
+    """Run a prepared order spec through the full gate — rules check → risk engine
+    → confirm/autopilot submit. Extracted from _place_order so the scalper submits
+    entries through the IDENTICAL guards rather than a parallel path."""
     gate = _broker_rules_check(spec)
     if not gate["passed"]:
         return {"blocked": True, "failures": gate["failures"],
@@ -1405,6 +1428,19 @@ async def _open_positions_for(symbol: str) -> list[dict]:
             or re.match(rf"{re.escape(root)}\d", psym)]
 
 
+async def _recent_alerts_for(symbol: str, limit: int = 8) -> list[dict]:
+    """Recent fired alerts whose subscription names this underlying — the '20
+    missed alerts' texture the committee weighs (usually as noise). [] on any
+    error so a missing/locked alert DB never blocks the desk."""
+    root = symbol.upper().strip()
+    try:
+        events = await asyncio.to_thread(market.list_alert_events, 40)
+    except Exception as e:
+        print(f"[committee] alert history read failed: {e}")
+        return []
+    return [e for e in events if root in (e.get("symbol") or "").upper()][:limit]
+
+
 # Committee step → (completion fraction, human label) for the Cognition progress
 # bar. The sequence is deterministic (reflection is the one optional step), so a
 # preset fraction per stage gives an honest fill toward done without guessing.
@@ -1412,6 +1448,8 @@ _COMMITTEE_STEPS: dict[str, tuple[float, str]] = {
     "analyst.vol": (0.12, "Vol analyst"),
     "analyst.setup": (0.22, "Setup analyst"),
     "analyst.catalyst": (0.32, "Catalyst analyst"),
+    "analyst.news": (0.35, "News analyst"),
+    "analyst.social": (0.38, "Social analyst"),
     "consensus": (0.42, "Consensus"),
     "reflection": (0.52, "Reflection"),
     "position": (0.56, "Existing position"),
@@ -1424,11 +1462,14 @@ _COMMITTEE_STEPS: dict[str, tuple[float, str]] = {
 
 
 async def _convene_committee(symbol: str, horizon: str, account_size: float,
-                             websocket: WebSocket) -> dict | None:
+                             websocket: WebSocket,
+                             proposed_idea: dict | None = None) -> dict | None:
     """Run the multi-agent committee on `symbol` with full Cognition status +
     telemetry, pin the verdict card in the Trade Ideas pane, and return the
     structured verdict. Returns None on failure. Pure analysis — no orders.
-    Shared by the committee_review tool and the place-trade committee gate."""
+    Shared by the committee_review tool and the place-trade committee gate.
+    `proposed_idea` ({side,structure,thesis}) is the idea HAL is pleading — the
+    desk critiques that specific hypothesis instead of only deriving its own."""
     await websocket.send_json(
         {"state": "processing", "text": f"Convening the committee on {symbol}..."})
 
@@ -1445,15 +1486,21 @@ async def _convene_committee(symbol: str, horizon: str, account_size: float,
         if frac:
             await _committee_status(True, frac, label)
 
-    # Existing holdings in this name (equity or any option whose OCC root matches)
-    # so the desk can weigh add/hold/trim/stand-aside instead of blindly stacking.
-    open_positions = await _open_positions_for(symbol)
+    # Soft context the desk weighs alongside the hard vol/chain reads: existing
+    # holdings (add/hold/trim/stand-aside vs blindly stacking), news + Reddit
+    # sentiment (chatter votes), and recent alert fires on the name (usually
+    # noise). All fetched concurrently; each degrades to empty on failure.
+    open_positions, news, reddit, alerts = await asyncio.gather(
+        _open_positions_for(symbol), _news_sentiment(symbol),
+        _reddit_sentiment(symbol), _recent_alerts_for(symbol))
+    sentiment = {"news": news, "reddit": reddit}
 
     await _committee_status(True, 0.03, "Convening")
     try:
         verdict = await committee.run_committee(
             symbol, horizon=horizon, account_size=account_size, emit=_committee_step,
-            open_positions=open_positions)
+            open_positions=open_positions, sentiment=sentiment, alerts=alerts,
+            proposed_idea=proposed_idea)
     except Exception as e:
         await _committee_status(False)
         msg = f"Committee failed on {symbol}: {type(e).__name__}: {e}"
@@ -1477,22 +1524,40 @@ async def run_committee_tool(args: dict, websocket: WebSocket) -> str:
     horizon = str(args.get("horizon") or "swing").lower()
     risk = websocket.scope.get("hal_risk") or {}
     account_size = await _resolve_account_size(risk)
-    verdict = await _convene_committee(symbol, horizon, account_size, websocket)
+    # HAL's seeded idea (optional): when he pleads a specific idea, the desk
+    # critiques THAT hypothesis. Any one field is enough to count as a seed.
+    seed_side = str(args.get("proposed_side") or "").strip().lower()
+    proposed_idea = None
+    if seed_side in ("call", "put") or args.get("proposed_structure") or args.get("proposed_thesis"):
+        proposed_idea = {
+            "side": seed_side if seed_side in ("call", "put") else "",
+            "structure": str(args.get("proposed_structure") or "").strip(),
+            "thesis": str(args.get("proposed_thesis") or "").strip(),
+        }
+    verdict = await _convene_committee(symbol, horizon, account_size, websocket,
+                                       proposed_idea=proposed_idea)
     if verdict is None:
         return f"The committee couldn't reach a verdict on {symbol} — try again."
+    # In autopilot a strong verdict is placed automatically instead of just being
+    # pinned as a recommendation. Declines (None) fall through to the spoken card.
+    auto = await _autotrade_on_verdict(symbol, verdict, websocket)
+    if auto is not None:
+        return auto
     open_positions = verdict.get("open_positions") or []
     score = verdict.get("score")
     held = (f" You already hold {len(open_positions)} leg(s) in {symbol}."
             if open_positions else "")
+    # Frame the ruling as a verdict on HAL's idea when he seeded one.
     if verdict["decision"] == "TRADE":
+        lead = "Committee backs your idea" if proposed_idea else "Committee says PUT ON THE TRADE"
         return (
-            f"Committee says PUT ON THE TRADE — {symbol}, score {score} out of 100. "
+            f"{lead} — {symbol}, score {score} out of 100. "
             f"{verdict['side']} via {verdict['structure'] or 'the chosen structure'}, "
             f"{verdict['conviction']} conviction. {verdict['thesis']}{held}".strip()
         )
     why = "; ".join(verdict["rules_failures"]) or verdict["invalidation"] or "the bear case held"
-    return (f"Committee says DO NOT TRADE {symbol} — score {score} out of 100. "
-            f"{why}.{held}").strip()
+    lead = "Committee waved off your idea" if proposed_idea else "Committee says DO NOT TRADE"
+    return (f"{lead} — {symbol}, score {score} out of 100. {why}.{held}").strip()
 
 
 async def run_committee_backtest_tool(args: dict, websocket: WebSocket) -> str:
@@ -1527,6 +1592,192 @@ async def run_committee_backtest_tool(args: dict, websocket: WebSocket) -> str:
     status = "error" if result.get("error") else "ok"
     await _emit_telemetry(websocket, "committee.backtest", f"{symbol} {start}..{end}", report, status=status)
     return report[:MAX_TOOL_OUTPUT_CHARS]
+
+
+# --- Scalper: autonomous, committee-gated profit-target auto-trader ---------
+# One session at a time, held at module scope like the broker/risk runtime state.
+_scalper_session: scalper.ScalperSession | None = None
+
+
+def _scalper_period_key(period: str):
+    """A callable the engine polls to detect a new period bucket (day/week) and
+    re-baseline. Uses the Eastern trading clock so 'day' rolls at the session,
+    not local midnight."""
+    def key() -> str:
+        et, _ = markettime._eastern_now()
+        if period == "week":
+            iso = et.isocalendar()
+            return f"{iso[0]}-W{iso[1]:02d}"
+        return et.strftime("%Y-%m-%d")
+    return key
+
+
+# Movers categories that are reliably liquid + optionable (large/mid-cap):
+# most-active-by-dollar-volume and Nasdaq-100 movers. Raw Gainer/Loser rows are
+# microcap-heavy (thin penny names with no option chain) that the options
+# committee can only ever PASS — so the scalper skips them and stops burning
+# committee runs (and Massive rate-limit) on names it can't trade. A liquid name
+# that is ALSO a top gainer may be labeled "Gainer" by movers' dedup priority and
+# skipped here; that's fine — the watchlist covers the user's own names and the
+# committee stays the backstop for anything untradeable that slips through.
+_SCALPER_LIQUID_MOVER_CATEGORIES = {"Active", "NDX"}
+
+
+async def _scalper_candidates() -> list[dict]:
+    """Deduped [{symbol, price}] the scalper convenes the committee on: the user's
+    watchlist (curated, liquid) first, then only the LIQUID movers categories.
+    Illiquid microcap movers are dropped — the committee needs option data they
+    don't have, so scanning them just produces guaranteed PASSes."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for source, build in (("watchlist", watchlist.build_payload), ("movers", movers.build_payload)):
+        try:
+            payload = await build()
+        except Exception as e:
+            print(f"[scalper] {source} candidates failed: {e}")
+            continue
+        for r in payload.get("rows", []):
+            sym = (r.get("symbol") or "").upper().strip()
+            price = r.get("price")
+            if not sym or sym in seen or not price:
+                continue
+            if source == "movers" and r.get("category") not in _SCALPER_LIQUID_MOVER_CATEGORIES:
+                continue  # skip microcap gainers/losers the committee can't clear
+            seen.add(sym)
+            out.append({"symbol": sym, "price": float(price)})
+    return out
+
+
+def _make_scalper_deps(websocket: WebSocket, capital: float, period: str) -> scalper.ScalperDeps:
+    """Bind the engine's injected side-effects to the live committee + gated
+    broker. Every entry rides _gated_submit (rules + risk); every exit rides the
+    same confirm/autopilot close path as any manual close."""
+    async def decide(symbol: str, open_positions: list[dict]) -> dict | None:
+        # The scalper is a long-lived BACKGROUND task, but the websocket it armed
+        # with can close (tab reload / reconnect). _convene_committee does
+        # unprotected websocket.send_json calls, so a dead socket used to throw
+        # BEFORE the committee even ran — every name skipped, the scalper silently
+        # frozen for the whole session. Run the committee HEADLESSLY instead: the
+        # verdict never depends on a live UI, and all UI pushes are best-effort.
+        async def _step(step: str, summary: str, detail: str) -> None:
+            try:
+                await _emit_telemetry(websocket, f"committee.{step}", f"{symbol} · {summary}",
+                                      detail, source="committee")
+                frac, label = _COMMITTEE_STEPS.get(step, (0.0, step))
+                if frac:
+                    await websocket.send_json({"committee_status": {
+                        "active": True, "fraction": frac, "label": label, "symbol": symbol}})
+            except Exception:
+                pass  # dead socket — the decision below still stands
+        try:
+            verdict = await committee.run_committee(
+                symbol, horizon="day", account_size=capital, emit=_step,
+                open_positions=open_positions)
+        except Exception as e:
+            print(f"[scalper] committee failed on {symbol}: {e}")
+            return None
+        try:
+            kind = "trade" if verdict["decision"] == "TRADE" else "hold"
+            await _push_trade_idea(websocket, kind, symbol, verdict["markdown"])
+        except Exception:
+            pass  # best-effort card; never sink the decision on a UI push
+        return verdict
+
+    async def read_positions() -> list[dict]:
+        return await asyncio.to_thread(broker.list_positions)
+
+    async def emit(step: str, summary: str, detail: str) -> None:
+        await _emit_telemetry(websocket, f"scalper.{step}", summary, detail, source="scalper")
+        # Push the full session snapshot alongside each step so the Scalper panel
+        # tracks P&L / status live without polling.
+        await _send_scalper_status(websocket)
+
+    return scalper.ScalperDeps(
+        decide=decide,
+        place_order=_gated_submit,
+        flatten=lambda symbol: _close_position({"symbol": symbol}),
+        read_positions=read_positions,
+        candidates=_scalper_candidates,
+        prepare_order=broker.prepare_order,
+        market_open=markettime.is_regular_hours,
+        period_key=_scalper_period_key(period),
+        emit=emit,
+    )
+
+
+async def _scalper_start(args: dict, websocket: WebSocket) -> str:
+    global _scalper_session
+    if not broker.is_ready():
+        return "Alpaca isn't configured — the scalper needs the broker. Set the API keys in .env."
+    if broker.get_mode() != "autopilot":
+        return ("The scalper only runs in autopilot ('robo trader') mode — it places orders itself. "
+                "Say 'turn on autopilot' first, then start the scalper.")
+    if _scalper_session is not None and _scalper_session.running:
+        return "A scalper session is already running. Stop it before starting another."
+    try:
+        capital = float(args.get("capital"))
+        target = float(args.get("profit_target"))
+    except (TypeError, ValueError):
+        return "I need a capital amount and a dollar profit_target to start the scalper."
+    if capital <= 0 or target <= 0:
+        return "capital and profit_target must be positive dollar amounts."
+    loss_limit = float(args.get("loss_limit") or target)   # default floor mirrors the target
+    period = str(args.get("period") or "day").lower()
+    cfg = scalper.ScalperConfig(
+        capital=capital, profit_target=target, loss_limit=loss_limit, period=period,
+        score_threshold=int(args.get("score_threshold") or SCALPER_SCORE_THRESHOLD),
+        max_concurrent=int(args.get("max_concurrent") or SCALPER_MAX_CONCURRENT),
+        poll_seconds=SCALPER_POLL_SECONDS,
+        catastrophic_stop_pct=SCALPER_CATASTROPHIC_STOP_PCT,
+    )
+    deps = _make_scalper_deps(websocket, capital, cfg.period)
+    _scalper_session = scalper.ScalperSession(cfg, deps)
+    await _scalper_session.start()
+    return (
+        f"Scalper armed in autopilot: ${capital:,.0f} working capital, target ${target:,.0f} "
+        f"per {cfg.period}, hard floor ${loss_limit:,.0f}. Entering on committee score "
+        f"≥ {cfg.score_threshold}, up to {cfg.max_concurrent} at once, with a "
+        f"{cfg.catastrophic_stop_pct:g}% per-position backstop. I'll halt at the target or the floor."
+    )
+
+
+async def _send_scalper_status(websocket: WebSocket) -> None:
+    """Broadcast the current session snapshot (or null when idle) to the client
+    so the Scalper panel reflects server truth."""
+    status = _scalper_session.status() if _scalper_session is not None else None
+    try:
+        await websocket.send_json({"scalper_status": status})
+    except Exception:
+        pass
+
+
+async def run_scalper_tool(name: str, args: dict, websocket: WebSocket) -> str:
+    global _scalper_session
+    if name == "scalper_start":
+        result = await _scalper_start(args, websocket)
+        await _emit_telemetry(websocket, "scalper.start", json.dumps(args, default=str)[:200],
+                              result, source="scalper")
+        return result
+    if name == "scalper_status":
+        if _scalper_session is None:
+            return "No scalper session is running."
+        st = _scalper_session.status()
+        await _emit_telemetry(websocket, "scalper.status", "status",
+                              json.dumps(st, indent=2, default=str), source="scalper")
+        return (f"Scalper {st['status']}: P&L ${st['total_pnl']:+,.0f} of ${st['profit_target']:,.0f} "
+                f"target ({len(st['open_positions'])} open, {st['passes']} passes). {st['note']}")
+    if name == "scalper_stop":
+        if _scalper_session is None:
+            return "No scalper session to stop."
+        flatten = bool(args.get("flatten"))
+        await _scalper_session.stop(flatten=flatten)
+        st = _scalper_session.status()
+        _scalper_session = None
+        tail = " Open positions were flattened." if flatten else " Open positions were left as-is."
+        await _emit_telemetry(websocket, "scalper.stop", json.dumps(args, default=str),
+                              json.dumps(st, default=str), source="scalper")
+        return f"Scalper stopped. Session P&L ${st['total_pnl']:+,.0f}.{tail}"
+    return f"Unknown scalper tool: {name}"
 
 
 async def run_webull_tool(args: dict, websocket: WebSocket) -> str:
@@ -1984,6 +2235,31 @@ def _match_quiet_intent(text: str) -> str | None:
     if _QUIET_OFF.search(text):
         return "off"
     if _QUIET_ON.search(text):
+        return "on"
+    return None
+
+
+# --- Futures-mode intents --------------------------------------------------
+# Toggles whether HAL pitches trade ideas after the equity session has closed
+# (see AFTER_HOURS_DIRECTIVE). OFF is checked first so "turn off futures mode"
+# can't trip the ON set (both share "futures mode").
+_FUTURES_OFF = re.compile(
+    r"\b(?:turn off futures|futures (?:mode )?off|disable futures|stop futures|"
+    r"no futures|equities only|regular hours only|back to (?:regular|equities))\b",
+    re.IGNORECASE)
+_FUTURES_ON = re.compile(
+    r"\b(?:turn on futures|futures mode(?: on)?|enable futures|futures on|"
+    r"trad(?:e|ing) futures|i'?m (?:on|trading) futures|around the clock)\b",
+    re.IGNORECASE)
+
+
+def _match_futures_intent(text: str) -> str | None:
+    """'turn on futures mode' → 'on'; 'futures off' / 'equities only' → 'off'."""
+    if not text:
+        return None
+    if _FUTURES_OFF.search(text):
+        return "off"
+    if _FUTURES_ON.search(text):
         return "on"
     return None
 
@@ -3696,6 +3972,49 @@ async def _place_trade_idea(trade: dict, websocket: WebSocket) -> str:
     return spoken
 
 
+# "Moderate"-band and up (see committee._score_band: moderate≥50) auto-fire in
+# autopilot; a weaker TRADE still just pins the card / offers, so the human sees
+# it first. The order's SIZE and exit levels come from the committee-gated
+# build_trade_reco + the vault rules gate, not from this number.
+AUTOTRADE_MIN_SCORE = 50
+
+
+async def _autotrade_on_verdict(symbol: str, verdict: dict, websocket: WebSocket) -> str | None:
+    """Autopilot only: turn a strong committee TRADE verdict into a placed order.
+
+    The committee is the GATE; build_trade_reco is the sizing/contract engine and
+    _place_trade_idea_inner is the final rules-gated submit — so this just wires
+    the two together when the desk clears the bar. Returns the spoken result when
+    it acts (placed / couldn't size / side-conflict), or None when it declines to
+    act at all (not autopilot, PASS, weak score, rules failed) so the caller keeps
+    its normal pin/offer behavior."""
+    if broker.get_mode() != "autopilot" or not broker.is_ready():
+        return None
+    if verdict.get("decision") != "TRADE" or not verdict.get("rules_passed"):
+        return None
+    score = int(verdict.get("score") or 0)
+    if score < AUTOTRADE_MIN_SCORE:
+        return None
+    # Size it (this stashes hal_pending_trade); the spoken/markdown it returns is
+    # the recommendation copy, which we replace with the fill confirmation.
+    await build_trade_reco(symbol, websocket.scope.get("hal_risk"), websocket)
+    pending = websocket.scope.get("hal_pending_trade")
+    if not pending or int(pending.get("qty") or 0) < 1:
+        websocket.scope.pop("hal_pending_trade", None)
+        return (f"The committee backs {symbol} at score {score}, but I sized it to zero "
+                "contracts under your risk rules — no order placed.")
+    # Don't fire the opposite bet: if build_trade_reco's direction contradicts the
+    # desk's side, stand aside rather than auto-place against the committee.
+    proceed, reason = _committee_gate_outcome(verdict, pending)
+    if not proceed:
+        websocket.scope.pop("hal_pending_trade", None)
+        return f"I'll stand aside on {symbol} — {reason}."
+    spoken = await _place_trade_idea(pending, websocket)
+    websocket.scope.pop("hal_pending_trade", None)
+    websocket.scope.pop("hal_pending_trade_armed", None)
+    return f"Autopilot placed it — {reason}. {spoken}"
+
+
 async def agent_loop(
     user_text: str,
     history: list,
@@ -3780,6 +4099,16 @@ async def agent_loop(
     # alert stream is silenced separately at market.clients.broadcast.
     if market.is_quiet():
         system_content += f"\n\n{QUIET_MODE_DIRECTIVE}"
+    # Scalper active: the auto-trader is placing its own orders, so stop HAL
+    # volunteering trade ideas on top of it (it competes with the running mandate).
+    if _scalper_session is not None and _scalper_session.running:
+        system_content += f"\n\n{SCALPER_ACTIVE_DIRECTIVE}"
+    # After hours: once the equity session has closed for the day, stop HAL
+    # volunteering trade ideas — unless futures mode is on (trading overnight).
+    # Direct requests are still honored (the directive only suppresses what he
+    # starts on his own), matching the quiet-mode contract.
+    if market_closed_for_day() and not market.is_futures():
+        system_content += f"\n\n{AFTER_HOURS_DIRECTIVE}"
     # CAG: inject stable vault context (rules + open trades + watchlist + theses).
     # Ollama reuses cached KV for any unchanged prefix, so this is a cache hit
     # on every turn where the vault hasn't changed.
@@ -3923,10 +4252,23 @@ async def agent_loop(
                     # metrics / summary that lands in chat, not the pane, and
                     # promising an idea would leave HAL claiming one he never shows).
                     if not spoke_any and final_reply:
-                        pointer = (
-                            "Here's a trade idea — the details are on screen."
-                            if is_trade
-                            else "The details are on screen.")
+                        if is_trade:
+                            pointer = "Here's a trade idea — the details are on screen."
+                        else:
+                            # spoke_any is False because the structure guard muted
+                            # the whole reply. For a trade idea that's intended (the
+                            # table lands on screen), but for a short non-trade reply
+                            # — a news headline with a stray emoji/dash trips the
+                            # same guard — "the details are on screen" hides the very
+                            # thing HAL should read. Speak the stripped prose instead;
+                            # tables/code/emoji are already collapsed by
+                            # _strip_code_for_tts, and the length cap keeps a genuinely
+                            # long structured block from being read aloud in full.
+                            spoken_reply = _strip_code_for_tts(_strip_thinking(final_reply)).strip()
+                            pointer = (
+                                spoken_reply
+                                if spoken_reply and len(spoken_reply) <= _TTS_POINTER_MAX_CHARS
+                                else "The details are on screen.")
                         try:
                             await on_sentence(pointer)
                         except Exception as e:
@@ -4000,14 +4342,21 @@ async def agent_loop(
 
 
 # --- XTTS synthesis ---------------------------------------------------------
+# Upper bound (chars) on prose we'll read aloud when the structure guard muted
+# a non-trade reply. A news headline is well under this; a long list/summary
+# exceeds it and stays a spoken pointer rather than a wall of speech.
+_TTS_POINTER_MAX_CHARS = 400
+
 # Marks where a streamed reply turns from prose into a structured/bulleted
-# block (trade tables, metric lists, emoji headers). TTS goes quiet past this —
-# the full text is still shown on screen. See agent_loop's streaming.
+# block (trade tables, metric lists) — real markdown structure, not a stray
+# glyph. TTS goes quiet past this; the full text still shows on screen. See
+# agent_loop's streaming. Emoji are NOT a boundary: they're already stripped
+# for speech by _EMOJI_RE, so a lone headline emoji shouldn't mute the prose
+# around it (that swallowed news announcements into a dead "on screen" pointer).
 _TTS_STRUCT_BOUNDARY = re.compile(
     r"\n\s*[\*\-•\+]\s"
     r"|\n\s*#{1,6}\s"
     r"|\n\s*\d+\.\s"
-    r"|[\U0001F000-\U0001FAFF←-➿️]"
     r"|\b(Trade Structure|Key Metrics|Recommended Strategy|Max Profit|Max Loss|"
     r"Break\s?even|Net Credit|Net Debit|Probability of Profit)\b",
     re.IGNORECASE)
@@ -4279,6 +4628,20 @@ async def process_turn(
                     websocket.scope.pop("hal_news_offer", None)
                     offer = (f"You're already in {_news_sym}, so I'll leave that "
                              "position as-is rather than pitch a new trade.")
+                elif broker.get_mode() == "autopilot" and broker.is_ready():
+                    # Autotrader: don't offer — run the desk and auto-place a
+                    # strong verdict. A PASS / weak score / unavailable committee
+                    # stands aside instead of pitching an idea to confirm.
+                    websocket.scope.pop("hal_news_offer", None)
+                    account_size = await _resolve_account_size(
+                        websocket.scope.get("hal_risk") or {})
+                    verdict = await _convene_committee(
+                        _news_sym, "swing", account_size, websocket)
+                    acted = (await _autotrade_on_verdict(_news_sym, verdict, websocket)
+                             if verdict is not None else None)
+                    offer = acted or (
+                        f"The committee didn't clear a trade on {_news_sym}, "
+                        "so I'll stand aside.")
                 else:
                     websocket.scope["hal_news_offer"] = _news_sym
                     offer = f"Want me to size a trade idea on {_news_sym}?"
@@ -4382,6 +4745,25 @@ async def process_turn(
                 spoken = (f"Quiet mode's already off, {USER_NAME}." if already
                           else f"Back on, {USER_NAME}. Alerts and ideas are live again.")
             return await _speak_and_return(spoken, f"quiet.{'on' if want_on else 'off'}")
+
+        # Futures mode: toggle by voice. On → HAL keeps pitching ideas after the
+        # close; off → the after-hours directive suppresses proactive pitches.
+        # Mirrors the quiet toggle (see _match_futures_intent).
+        futures_cmd = _match_futures_intent(user_text)
+        if futures_cmd is not None:
+            want_on = futures_cmd == "on"
+            already = market.is_futures() == want_on
+            market.set_futures(want_on)
+            await websocket.send_json({"futures": want_on})
+            if want_on:
+                spoken = (f"Futures mode's already on, {USER_NAME}." if already
+                          else f"Futures mode on, {USER_NAME}. I'll pitch ideas "
+                               "around the clock now.")
+            else:
+                spoken = (f"Futures mode's already off, {USER_NAME}." if already
+                          else f"Futures mode off, {USER_NAME}. I'll hold trade "
+                               "ideas until the next open.")
+            return await _speak_and_return(spoken, f"futures.{'on' if want_on else 'off'}")
 
         # Complete a pending alert from a short follow-up answer ("above 250").
         pending_alert = websocket.scope.get("pending_alert")
@@ -5682,6 +6064,24 @@ async def voice_interface(websocket: WebSocket):
                         "You cleared the daily-loss kill switch; new entries allowed.",
                         source="human")
                     await send_positions_snapshot()
+                elif cmd == "scalper_start":
+                    # Scalper panel: arm a session (autopilot-gated inside the
+                    # handler), then broadcast the snapshot so the panel updates.
+                    keys = ("capital", "profit_target", "loss_limit", "period",
+                            "score_threshold", "max_concurrent")
+                    result = await run_scalper_tool(
+                        "scalper_start", {k: command.get(k) for k in keys}, websocket)
+                    await _emit_telemetry(websocket, "human.scalper_start",
+                                          "panel start", result, source="human")
+                    await _send_scalper_status(websocket)
+                elif cmd == "scalper_stop":
+                    result = await run_scalper_tool(
+                        "scalper_stop", {"flatten": bool(command.get("flatten"))}, websocket)
+                    await _emit_telemetry(websocket, "human.scalper_stop",
+                                          "panel stop", result, source="human")
+                    await _send_scalper_status(websocket)
+                elif cmd == "scalper_refresh":
+                    await _send_scalper_status(websocket)
                 elif cmd == "watchlist_refresh":
                     try:
                         payload = await watchlist.build_payload()

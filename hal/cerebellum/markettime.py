@@ -35,6 +35,17 @@ def is_regular_hours() -> bool:
     return _market_session(et) == "OPEN (regular hours)"
 
 
+def market_closed_for_day() -> bool:
+    """True once the regular session has ended for the day — after-hours,
+    overnight, or the weekend. Pre-market (still prepping for the coming open)
+    and the live regular session both return False, so a morning warm-up isn't
+    blocked. Holidays are not accounted for. Gates HAL's proactive trade-pitching
+    when futures mode is off (see server turn loop)."""
+    et, _ = _eastern_now()
+    return _market_session(et) not in (
+        "OPEN (regular hours)", "pre-market (not yet open)")
+
+
 def _market_session(et: datetime) -> str:
     """US equity/options session label for a given Eastern time. Time-of-day +
     weekday only; market holidays are not accounted for."""

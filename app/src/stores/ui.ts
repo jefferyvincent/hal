@@ -7,6 +7,7 @@ interface UiState {
   positionsOpen: boolean;
   mcpOpen: boolean;
   subscriptionsOpen: boolean;
+  scalperOpen: boolean;
   cognitionOpen: boolean;
   dashboardOpen: boolean;
   terminalOpen: boolean;
@@ -18,6 +19,7 @@ interface UiState {
   togglePositions: () => void;
   toggleMcp: () => void;
   toggleSubscriptions: () => void;
+  toggleScalper: () => void;
   toggleCognition: () => void;
   setCognitionOpen: (open: boolean) => void;
   toggleDashboard: () => void;
@@ -36,6 +38,7 @@ export const useUi = create<UiState>((set) => ({
   positionsOpen: false,
   mcpOpen: false,
   subscriptionsOpen: false,
+  scalperOpen: false,
   cognitionOpen: false,
   dashboardOpen: false,
   terminalOpen: false,
@@ -58,6 +61,8 @@ export const useUi = create<UiState>((set) => ({
 
   toggleSubscriptions: () =>
     set((s) => ({ subscriptionsOpen: !s.subscriptionsOpen })),
+
+  toggleScalper: () => set((s) => ({ scalperOpen: !s.scalperOpen })),
 
   toggleCognition: () => set((s) => ({ cognitionOpen: !s.cognitionOpen })),
 

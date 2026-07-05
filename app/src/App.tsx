@@ -14,6 +14,7 @@ import Dashboard from "@/components/Dashboard";
 import Terminal from "@/components/terminal/Terminal";
 import PositionSizing from "@/components/PositionSizing";
 import PositionsPanel from "@/components/PositionsPanel";
+import ScalperPanel from "@/components/ScalperPanel";
 import McpPanel from "@/components/McpPanel";
 import SubscriptionsPanel from "@/components/SubscriptionsPanel";
 import TradeIdeasStage from "@/components/TradeIdeasPanel";
@@ -172,6 +173,8 @@ export default function App() {
       <McpPanel />
       {/* Live brokerage positions + manual close (overrides HAL). */}
       <PositionsPanel />
+      {/* Autonomous profit-target auto-trader (autopilot only). */}
+      <ScalperPanel />
 
       <main
         className={`relative z-[5] flex h-full w-full items-center justify-center pt-[70px] pb-[260px] ${

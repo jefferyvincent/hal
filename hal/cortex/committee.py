@@ -124,23 +124,102 @@ async def _llm(
         return ""
 
 
+def _brace_spans(text: str) -> list[str]:
+    """Every balanced top-level {...} substring, in order. A naive
+    first-brace-to-last-brace grab breaks when the model emits a stray brace in
+    prose ('the {call} spread') before the real object — the span then covers
+    both and fails to parse. Scanning for balanced spans isolates the real JSON."""
+    spans, depth, start = [], 0, -1
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                spans.append(text[start:i + 1])
+    return spans
+
+
 def _parse_json(text: str) -> dict:
-    """Pull the first {...} object out of a model reply, tolerantly. Returns {}
-    when nothing parses so callers apply their own defaults."""
+    """Pull a JSON object out of a model reply, tolerantly. Local models wrap the
+    object in prose, stray braces, markdown fences, or trailing commas — any of
+    which broke the old naive grab and silently defaulted the judge to PASS. Try
+    each balanced {...} candidate newest-first (the real answer follows any
+    reasoning), with a trailing-comma repair. Returns {} when nothing parses."""
     if not text:
         return {}
-    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if not m:
-        return {}
-    try:
-        return json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return {}
+    for span in reversed(_brace_spans(text)):
+        for attempt in (span, re.sub(r",(\s*[}\]])", r"\1", span)):
+            try:
+                obj = json.loads(attempt)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                return obj
+    return {}
 
 
 def _lean(d: dict) -> str:
     v = str(d.get("lean", "neutral")).lower()
     return v if v in ("bullish", "bearish", "neutral") else "neutral"
+
+
+# --- Injected soft context (sentiment / alerts / HAL's seeded idea) ----------
+# News and Reddit sentiment are classified upstream by the server (it owns the
+# feeds + creds), so the committee takes them as pre-scored evidence — same
+# dependency-injection shape as `open_positions` and `emit` — and converts them
+# to analyst votes here with NO extra model call. Social is capped below news,
+# and both cap well under the hard vol/chain/regime reads, so chatter informs
+# the vote without ever dominating it.
+_SENTIMENT_SPEC = (("news", "news", 0.55), ("reddit", "social", 0.45))
+
+
+def _sentiment_reads(sentiment: Optional[dict]) -> list[dict]:
+    """Turn injected {news,reddit} sentiment into analyst reads. A source with
+    zero items is skipped (like the analysis analyst) so a quiet name doesn't
+    dilute consensus with neutral filler."""
+    reads = []
+    for key, role, cap in _SENTIMENT_SPEC:
+        src = (sentiment or {}).get(key) or {}
+        count = int(src.get("count") or 0)
+        if count <= 0:
+            continue
+        lean = str(src.get("label", "neutral")).lower()
+        lean = lean if lean in ("bullish", "bearish", "neutral") else "neutral"
+        # More items → a touch more confidence, capped; a neutral read stays low
+        # so it barely moves the score either way.
+        conf = 0.2 if lean == "neutral" else min(cap, 0.25 + 0.04 * count)
+        note = (src.get("thesis") or "").strip() or f"{count} {role} item(s), {lean}"
+        reads.append({
+            "role": role,
+            "lean": lean,
+            "confidence": round(conf, 2),
+            "note": note,
+            "evidence": f"{count} {role} item(s) classified {lean}",
+        })
+    return reads
+
+
+def _format_alerts(alerts: Optional[list[dict]]) -> str:
+    """Compact view of recent fired alerts on the name. A burst of these is
+    usually noise, so the desk sees them as context to weigh, not a vote."""
+    lines = []
+    for a in (alerts or [])[:8]:
+        msg = " ".join(str(a.get("message") or "").split())[:120]
+        lines.append(f"[{a.get('fired_at', '?')}] {a.get('symbol', '')}: {msg}".strip())
+    return "\n".join(lines)
+
+
+def _format_proposed(idea: Optional[dict]) -> str:
+    """One-line rendering of the idea HAL is pleading to the desk."""
+    if not idea:
+        return ""
+    parts = [str(idea.get("side") or "").strip(), str(idea.get("structure") or "").strip()]
+    head = " ".join(p for p in parts if p) or "an idea"
+    thesis = str(idea.get("thesis") or "").strip()
+    return head + (f" — {thesis}" if thesis else "")
 
 
 # --- Analyst roles (fast model, one tool each) ------------------------------
@@ -346,11 +425,20 @@ async def _debate(brief: str) -> dict:
 _JUDGE_SYS = (
     "You are the head trader. You receive three analyst reads, a bull case, a "
     "bear case, lessons from past trades, and the available option structures. "
-    "Make ONE decision. Defined-risk only — never naked short options. If the "
-    "bear case is not clearly beaten, PASS; passing is a valid, common answer. "
-    "If an existing position in the name is shown, factor it in — decide whether "
-    "to add, hold, trim, or stand aside, and don't over-concentrate. "
-    "Reply ONLY as JSON: "
+    "Make ONE decision, and be willing to act: when the evidence points to a "
+    "clear direction, express it — bullish → a defined-risk CALL structure, "
+    "bearish → a defined-risk PUT structure. Defined-risk only; never naked "
+    "short options. A bear case ALWAYS exists (a researcher is paid to write "
+    "one), so its mere presence is NOT a reason to PASS — weigh whether the "
+    "evidence, not the debate, supports a side. PASS only when the analyst reads "
+    "genuinely conflict, the direction is unclear/neutral, or the structure and "
+    "liquidity are poor — not by default. If HAL's proposed idea is included, it "
+    "is the hypothesis on trial: endorse it, refine its structure/side, or reject "
+    "it — say which, and don't ignore it. News and social reads are among the "
+    "analysts; a cluster of recent alerts is often just noise — weigh whether it's "
+    "signal before letting it move you. If an existing position in the name is "
+    "shown, factor it in — decide whether to add, hold, trim, or stand aside, "
+    "and don't over-concentrate. Reply ONLY as JSON: "
     '{"decision":"TRADE|PASS","side":"call|put|neutral","structure":"<label '
     'from the provided list>","conviction":"high|medium|low","thesis":"one '
     'sentence","invalidation":"one sentence","max_loss_note":"one sentence"}.'
@@ -361,6 +449,16 @@ async def _judge(brief: str) -> dict:
     raw = await _llm(brief, system=_JUDGE_SYS, model=OLLAMA_MODEL,
                      temperature=0.35, num_ctx=6144)
     out = _parse_json(raw)
+    # A judge reply that doesn't parse silently becomes PASS below — log it so an
+    # "always do-not-trade" run can be told apart from a real, reasoned pass.
+    if not out:
+        print(f"[committee] judge JSON unparseable → defaulting PASS; raw={raw[:200]!r}")
+    # Diagnostic: the object parsed but has no `decision`/`side` key means the
+    # model answered in a different schema (e.g. "recommendation":"BUY") and we're
+    # silently defaulting to PASS/neutral. Log the raw so we can see the real shape.
+    elif "decision" not in out or "side" not in out:
+        print(f"[committee] judge object missing decision/side keys "
+              f"(keys={list(out)}) → raw={raw[:300]!r}")
     decision = str(out.get("decision", "PASS")).upper()
     return {
         "decision": "TRADE" if decision == "TRADE" else "PASS",
@@ -433,18 +531,26 @@ async def run_committee(
     account_size: float = 0.0,
     emit: Emit = None,
     open_positions: Optional[list[dict]] = None,
+    sentiment: Optional[dict] = None,
+    alerts: Optional[list[dict]] = None,
+    proposed_idea: Optional[dict] = None,
 ) -> dict:
     """Run the full committee on `symbol` and return a structured verdict.
 
     Pure analysis — places no orders, pushes nothing to the UI. Safe to call
     repeatedly (e.g. from a backtest harness comparing it to build_trade_reco).
     Pass `emit` to stream each step (analysts → consensus → debate → judge →
-    rules gate) as its own progress event.
+    rules gate) as its own progress event. `sentiment` ({news,reddit} reads),
+    `alerts` (recent fires on the name), and `proposed_idea` (the idea HAL is
+    pleading — {side,structure,thesis}) are injected by the caller; the committee
+    weighs them but never fetches them itself (no server import).
     """
     symbol = symbol.upper().strip()
 
-    # 1. Analysts (evidence + reads), concurrently.
+    # 1. Analysts (evidence + reads), concurrently. Injected news/Reddit reads
+    #    join the vote so consensus and score reflect the tape's chatter too.
     analysts = await _gather_analysts(symbol, horizon)
+    analysts += _sentiment_reads(sentiment)
     bias = _consensus_bias(analysts)
     for a in analysts:
         await _emit(emit, f"analyst.{a['role']}",
@@ -472,7 +578,8 @@ async def run_committee(
     return await decide_from_evidence(
         symbol, analysts=analysts, structures=structures, iv_level=iv_level,
         bias=bias, reflection=reflection, account_size=account_size,
-        horizon=horizon, emit=emit, open_positions=open_positions)
+        horizon=horizon, emit=emit, open_positions=open_positions,
+        alerts=alerts, proposed_idea=proposed_idea)
 
 
 def candidate_structures(symbol: str, bias: str, iv_level: str) -> list[str]:
@@ -495,23 +602,38 @@ async def decide_from_evidence(
     horizon: str = "swing",
     emit: Emit = None,
     open_positions: Optional[list[dict]] = None,
+    alerts: Optional[list[dict]] = None,
+    proposed_idea: Optional[dict] = None,
 ) -> dict:
     """The reasoning core: bull/bear debate → judge → deterministic rules gate →
     verdict. Deliberately separated from evidence-gathering so the backtest can
     drive it with point-in-time RECONSTRUCTED evidence instead of live tool
     calls — same reasoning, swappable inputs. `emit` streams each step;
     `open_positions` (already filtered to this name) lets the desk see what's
-    already on and decide to add / hold / trim / stand aside."""
+    already on and decide to add / hold / trim / stand aside. `alerts` (recent
+    fires on the name) and `proposed_idea` (HAL's seeded idea) become context the
+    debate + judge weigh — the idea is the hypothesis on trial."""
+    proposed_block = _format_proposed(proposed_idea)
+    # HAL's own structure joins the shortlist so the judge can endorse it verbatim
+    # rather than being forced onto a bias-derived label.
+    if proposed_idea and (ps := str(proposed_idea.get("structure") or "").strip()) \
+            and ps not in structures:
+        structures = [ps, *structures]
     analyst_block = "\n".join(f"- {a['role']}: lean={a['lean']} conf={a['confidence']:.2f} :: {a['note']}"
                               for a in analysts)
     position_block = _format_positions(open_positions)
+    alerts_block = _format_alerts(alerts)
     brief = (
-        f"Symbol: {symbol}  | horizon: {horizon}  | consensus bias: {bias}  | vol: {iv_level}\n"
+        (f"HAL'S PROPOSED IDEA — the hypothesis on trial; endorse, refine, or "
+         f"reject it and say which:\n{proposed_block}\n\n" if proposed_block else "")
+        + f"Symbol: {symbol}  | horizon: {horizon}  | consensus bias: {bias}  | vol: {iv_level}\n"
         f"Analyst reads:\n{analyst_block}\n"
         f"Available structures: {', '.join(structures) or 'none'}\n"
         f"Past trade lessons:\n{reflection or '(none on record)'}"
         + (f"\nALREADY HELD in {symbol} (decide add/hold/trim/stand-aside, don't "
            f"over-concentrate):\n{position_block}" if position_block else "")
+        + (f"\nRecent alerts on {symbol} (often just noise — weigh whether it's "
+           f"signal):\n{alerts_block}" if alerts_block else "")
     )
     debate = await _debate(brief)
     await _emit(emit, "debate.bull", "bull case", debate["bull"])
@@ -545,6 +667,12 @@ async def decide_from_evidence(
     band = _score_band(score)
     await _emit(emit, "score", f"{decision} · {score}/100 ({band})",
                 f"Committee conviction score: {score}/100 — {band}.")
+    # One-line decision log — scores/bias are otherwise invisible, so a quiet
+    # "everything PASSed" session can't be diagnosed. Covers every caller
+    # (scalper, news, review, place-it gate) since they all reach this core.
+    print(f"[committee] {symbol}: {decision} score={score} band={band} bias={bias} "
+          f"judge_side={judge['side']} conv={judge['conviction']} "
+          f"rules={'ok' if gate['passed'] else 'FAIL:' + ';'.join(gate['failures'])}")
 
     verdict = {
         "symbol": symbol,
@@ -567,6 +695,8 @@ async def decide_from_evidence(
         "reflection": reflection,
         "candidate_structures": structures,
         "open_positions": open_positions or [],
+        "proposed_idea": proposed_idea or {},
+        "alerts": alerts or [],
     }
     verdict["markdown"] = _render_markdown(verdict)
     return verdict
@@ -594,6 +724,8 @@ def _render_markdown(v: dict) -> str:
         f"- Bias: {v['bias']} · Vol: {v['iv_level']} · Side: {v['side']}"
         + (f" · Structure: {v['structure']}" if v["structure"] else ""),
     ]
+    if v.get("proposed_idea"):
+        lines.append(f"- 🗣 HAL pled: {_format_proposed(v['proposed_idea'])}")
     if v.get("open_positions"):
         lines.append(f"- 📌 Already open in {v['symbol']}:")
         for ln in _format_positions(v["open_positions"]).split("\n"):
@@ -618,5 +750,7 @@ def _render_markdown(v: dict) -> str:
     ]
     if v["reflection"]:
         lines += ["", f"**Past trades:** {v['reflection']}"]
+    if v.get("alerts"):
+        lines += ["", f"**Recent alerts (weighed as noise):** {len(v['alerts'])} on record"]
     lines.append("</details>")
     return "\n".join(lines)

@@ -108,6 +108,14 @@ RISK_MAX_OPEN_POSITIONS = _env_int("RISK_MAX_OPEN_POSITIONS", 20)
 RISK_MAX_GROSS_EXPOSURE_PCT = float(os.environ.get("RISK_MAX_GROSS_EXPOSURE_PCT", "200"))
 RISK_DAILY_LOSS_LIMIT_PCT = float(os.environ.get("RISK_DAILY_LOSS_LIMIT_PCT", "10"))
 
+# Scalper (autonomous profit-target auto-trader). Only the mandate — capital,
+# profit target, loss floor — is set per session; these are the engine defaults.
+# Poll is a FLOOR on cadence: the real pace is committee throughput (minutes).
+SCALPER_POLL_SECONDS = float(os.environ.get("SCALPER_POLL_SECONDS", "60"))
+SCALPER_MAX_CONCURRENT = _env_int("SCALPER_MAX_CONCURRENT", 3)
+SCALPER_SCORE_THRESHOLD = _env_int("SCALPER_SCORE_THRESHOLD", 50)  # "moderate" band: enter on solid directional setups, not just "strong" (70)
+SCALPER_CATASTROPHIC_STOP_PCT = float(os.environ.get("SCALPER_CATASTROPHIC_STOP_PCT", "15"))
+
 # News watch monitor: poll interval (seconds) and primary RSS source
 # ("yahoo" or "google"). Both feeds are keyless; Yahoo is per-symbol headlines.
 NEWS_POLL_SECONDS = float(os.environ.get("NEWS_POLL_SECONDS", "300"))
