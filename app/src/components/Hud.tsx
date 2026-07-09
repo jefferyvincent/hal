@@ -75,6 +75,7 @@ export default function Hud() {
   const toggleMcp = useUi((s) => s.toggleMcp);
   const toggleSubscriptions = useUi((s) => s.toggleSubscriptions);
   const togglePositions = useUi((s) => s.togglePositions);
+  const toggleScalper = useUi((s) => s.toggleScalper);
   const toggleCognition = useUi((s) => s.toggleCognition);
   const toggleDashboard = useUi((s) => s.toggleDashboard);
   const dashboardOpen = useUi((s) => s.dashboardOpen);
@@ -245,6 +246,14 @@ export default function Hud() {
                   <line x1="6" y1="20" x2="6" y2="14" />
                   <line x1="12" y1="20" x2="12" y2="4" />
                   <line x1="18" y1="20" x2="18" y2="10" />
+                </svg>
+              </HudBtn>
+
+              {/* Scalper — autonomous profit-target auto-trader (robo trader). */}
+              <HudBtn onClick={toggleScalper} title="SCALPER — autonomous robo trader">
+                <svg className={SVG_ICON} {...strokeProps}>
+                  <polyline points="3 17 9 11 13 15 21 6" />
+                  <polyline points="15 6 21 6 21 12" />
                 </svg>
               </HudBtn>
 

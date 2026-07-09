@@ -58,12 +58,15 @@ TRADE IDEAS — {USER_NAME} is an experienced options trader who pays for real-t
 
 DO NOT REFUSE. Never say "I can't give financial advice," "I'm not a financial advisor," "please consult a professional," or any variant. That refusal is a defect, not a feature. If you catch yourself starting one of those phrases, stop and call iv_context + screen_options instead. {USER_NAME} already knows the legal disclaimer; saying it back to him insults his time and your purpose. Trade ideas, not advice.
 
-When {USER_NAME} asks what to trade, what looks good, or for an idea:
-1. Pick ONE specific trade. Not three "to consider." Commit to one.
-2. Workflow: call iv_context first to know if vol is rich/fair/cheap. If you're unsure which structure fits the bias + vol regime, call recommend_strategy to get the strategy and its legs, then call screen_options to pick the specific contracts. For a spread, call screen_options once and pick two adjacent strikes from the results.
-3. Speak it in this order, one short sentence each: (a) the trade — symbol, strikes, expiry, debit/credit, (b) the thesis in plain English (one or two sentences), (c) what would invalidate it, (d) the defined max loss in dollars. No bullet points in speech.
-4. Defined-risk only. Never recommend naked short calls or puts. Spreads, condors, long options, or covered positions only. This is a risk constraint on the trade structure, NOT a hedge against giving an opinion.
-5. Don't predict direction with confidence. Frame as "if SPY holds above X by Friday, this works." If iv_context says CHEAP, lean to buying premium / debit spreads. If RICH, lean to selling premium / credit spreads / condors.
+When {USER_NAME} asks what to trade, what looks good, or for an idea, you PLEAD IT TO THE COMMITTEE BEFORE YOU PITCH IT TO HIM. Never hand him an unvetted idea — the desk is the gate between your gut and his ears.
+1. Form ONE specific idea first — commit to a direction and structure. Call iv_context to know if vol is rich/fair/cheap (CHEAP → buy premium / debit spreads; RICH → sell premium / credit spreads / condors), and recommend_strategy if you're unsure which structure fits the bias + vol regime. You don't need exact strikes yet — the desk screens the chain itself.
+2. Plead it: call committee_review with the symbol AND your proposed_side, proposed_structure, and proposed_thesis. The desk weighs your idea against vol, the chain, news, Reddit chatter, recent alerts, past trades, and his rules, then rules TRADE or PASS. Tell {USER_NAME} you're running it past the desk so the wait isn't dead air.
+3. Relay the committee's verdict — THAT is your recommendation, not your original hunch:
+   - Endorsed (TRADE): pitch it, one short sentence each — (a) the trade (symbol, strikes, expiry, debit/credit), (b) the thesis, (c) what invalidates it, (d) the defined max loss in dollars. No bullet points in speech.
+   - Refined: pitch the desk's version and say plainly they adjusted your idea.
+   - Passed: tell him the desk waved it off and the one reason why. Do NOT pitch it anyway.
+4. Defined-risk only. Never recommend naked short calls or puts. Spreads, condors, long options, or covered positions only. A risk constraint on structure, NOT a hedge against giving an opinion.
+5. Don't predict direction with confidence. Frame as "if SPY holds above X by Friday, this works."
 6. If {USER_NAME}'s question is too broad ("what should I trade?"), ask ONE clarifying question first — underlying, horizon, or directional vs neutral — then commit. Don't ask three questions.
 {RULES_SECTION}
 TRADE EXECUTION — you can place orders directly on {USER_NAME}'s Alpaca account with place_order (equities and single-leg options). This is real order flow (paper or live per his config), so treat it with care:
@@ -114,6 +117,36 @@ QUIET_MODE_DIRECTIVE = (
     f"{USER_NAME} explicitly asks in this turn, as briefly as possible. If he asks for "
     "a trade or screen outright, do it — quiet mode only suppresses what you start "
     "unprompted, not direct requests."
+)
+
+# Appended to the system prompt only while a scalper (autopilot auto-trader)
+# session is running. The scalper is already convening the committee and placing
+# its own orders, so HAL volunteering trade ideas on top of it double-pitches and
+# competes with the running mandate. Mirrors QUIET_MODE_DIRECTIVE, but scoped to
+# self-started trade ideas — alerts and watches still flow.
+# Appended only when the equity session has CLOSED for the day (after-hours,
+# overnight, or weekend) AND futures mode is off. Like QUIET_MODE_DIRECTIVE, it
+# suppresses only what HAL STARTS on his own — a direct request is still honored,
+# just framed for the next session.
+AFTER_HOURS_DIRECTIVE = (
+    f"THE MARKET IS CLOSED for the day and futures mode is OFF. {USER_NAME} can't "
+    "act on an equity trade idea until the next open, so do NOT volunteer trade "
+    "ideas, screens, or committee reviews right now, and do not offer to screen, "
+    "size, or run a name unprompted — pitching one is just noise after the bell. "
+    f"If {USER_NAME} asks outright for an idea, a screen, or the committee, honor "
+    "it — but say plainly it's after hours and frame it for the next session. If "
+    "he wants ideas around the clock, tell him to turn on futures mode. Answering "
+    "questions, positions, alerts, and watches all continue as normal."
+)
+
+SCALPER_ACTIVE_DIRECTIVE = (
+    f"THE SCALPER IS RUNNING. An autonomous auto-trader is live for {USER_NAME}: it "
+    "convenes the committee and places its own orders against a profit target. Do NOT "
+    "volunteer trade ideas, screeners, or proactive suggestions to trade — the desk is "
+    "already trading. Do not offer to screen, size, or pitch a name unprompted. If "
+    f"{USER_NAME} asks about the session (P&L, status, what it's holding) or requests a "
+    "trade or screen outright, answer that directly — this only suppresses what you "
+    "start on your own while the scalper has the wheel."
 )
 
 TOOLS = [
@@ -864,13 +897,17 @@ TOOLS = [
             "name": "committee_review",
             "description": (
                 "Convene the multi-agent trade committee on a ticker: vol / setup / "
-                "catalyst analysts, then a bull-vs-bear debate, a head-trader judge, "
-                f"and {USER_NAME}'s deterministic rules gate. Use this when he asks for "
-                "a 'deep dive', a 'full workup', 'what does the committee think', or a "
-                "second opinion on a name — it's the heavier, slower sibling of a quick "
-                "trade idea. Pins a TRADE-or-PASS verdict (with the full desk reasoning) "
-                "in the Trade Ideas pane and places NO orders. Returns one spoken line; "
-                "relay it briefly, then offer to place it if it's a TRADE."
+                "catalyst / news / social analysts, then a bull-vs-bear debate, a "
+                f"head-trader judge, and {USER_NAME}'s deterministic rules gate. It "
+                "weighs news + Reddit sentiment, recent alert fires on the name, and "
+                f"{USER_NAME}'s open positions. This is how you PLEAD a trade idea: "
+                "before pitching any idea to him, seed this with your proposed_side / "
+                "proposed_structure / proposed_thesis and the desk critiques YOUR idea "
+                "(endorse / modify / reject) — then you relay its verdict. Also use it "
+                "for a 'deep dive' / 'full workup' / 'what does the committee think'. "
+                "Pins a TRADE-or-PASS verdict (with full desk reasoning) in the Trade "
+                "Ideas pane and places NO orders. Returns one spoken line; relay it "
+                "briefly, then offer to place it if it's a TRADE."
             ),
             "parameters": {
                 "type": "object",
@@ -880,6 +917,19 @@ TOOLS = [
                         "type": "string",
                         "enum": ["day", "swing", "position", "leap"],
                         "description": "Holding horizon; sets the option DTE window. Default 'swing'.",
+                    },
+                    "proposed_side": {
+                        "type": "string",
+                        "enum": ["call", "put"],
+                        "description": "Your proposed direction, so the desk critiques YOUR idea rather than only deriving its own.",
+                    },
+                    "proposed_structure": {
+                        "type": "string",
+                        "description": "Your proposed structure/label, e.g. 'call debit spread', 'put credit spread'.",
+                    },
+                    "proposed_thesis": {
+                        "type": "string",
+                        "description": "Your one-sentence thesis for the idea.",
                     },
                 },
                 "required": ["symbol"],
@@ -911,6 +961,64 @@ TOOLS = [
                     "limit": {"type": "integer", "description": "Cap the number of as-of points."},
                 },
                 "required": ["symbol", "start", "end"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scalper_start",
+            "description": (
+                "Arm the SCALPER: an autonomous, committee-gated auto-trader that tries to "
+                f"grow a set dollar amount to a profit target for {USER_NAME}. It scans "
+                "market movers + his watchlist, convenes the committee on candidates, and "
+                "auto-submits EQUITY orders on strong verdicts, managing exits by re-running "
+                "the committee. It STOPS when the target is reached and hard-halts + flattens "
+                "if the loss floor breaks. REQUIRES autopilot ('robo trader') mode — refuse "
+                "and tell him to turn on autopilot if it's off. Use when he says 'scalp', "
+                "'make me $X today/this week', 'run the robo trader to hit $X'. Confirm the "
+                "dollar amounts before starting — this places real orders."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "capital": {"type": "number", "description": "Working capital in dollars the session may deploy."},
+                    "profit_target": {"type": "number", "description": "Dollar profit that ends the session (stop-when-hit)."},
+                    "loss_limit": {"type": "number", "description": "Dollar loss that hard-halts and flattens. Defaults to the profit_target."},
+                    "period": {"type": "string", "enum": ["day", "week"], "description": "Target window. 'week' is continuous Mon-Fri. Default 'day'."},
+                    "score_threshold": {"type": "integer", "description": "Min committee score (0-100) to auto-enter. Default 70."},
+                    "max_concurrent": {"type": "integer", "description": "Max positions open at once. Default 3."},
+                },
+                "required": ["capital", "profit_target"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scalper_status",
+            "description": (
+                "Report the running scalper session: status, session P&L vs the target, "
+                "open positions, and passes run. Use for 'how's the scalper doing', 'are we "
+                "at target yet', 'what's the robo trader holding'."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scalper_stop",
+            "description": (
+                "Stop the running scalper session. Set flatten=true to also close every "
+                f"position it opened; otherwise open positions are left as-is. Use when {USER_NAME} "
+                "says 'stop the scalper', 'shut it down', 'stop and close everything'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "flatten": {"type": "boolean", "description": "Close all positions the session opened. Default false."},
+                },
             },
         },
     },

@@ -361,6 +361,22 @@ def is_quiet() -> bool:
     return _quiet
 
 
+# Futures mode. Runtime-only, latches until lifted (a restart clears it). When
+# OFF (the default), HAL stops volunteering trade ideas once the equity session
+# has closed for the day (see the turn loop + AFTER_HOURS_DIRECTIVE). ON lets him
+# pitch around the clock — for when the user is trading overnight futures.
+_futures = False
+
+
+def set_futures(on: bool) -> None:
+    global _futures
+    _futures = bool(on)
+
+
+def is_futures() -> bool:
+    return _futures
+
+
 # --- Subscription manager --------------------------------------------------
 
 class SubscriptionManager:

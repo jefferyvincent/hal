@@ -25,6 +25,7 @@ import type {
   NewsArticle,
   NewsWatch,
   RiskStatus,
+  ScalperStatus,
   ServerEnvelope,
   Subscription,
   TelemetryEvent,
@@ -96,6 +97,8 @@ interface ConnectionState {
   positionsError: string | null;
   // In-flight committee run progress (null when idle). startedAt is client-stamped.
   committeeStatus: (CommitteeStatus & { startedAt: number }) | null;
+  // Autonomous scalper session snapshot (null when no session is running).
+  scalperStatus: ScalperStatus | null;
   // Equity-research fundamentals for the terminal's Equity/DCF tab, keyed by
   // symbol so switching tickers doesn't refetch ones we've already pulled.
   equity: Record<string, EquityFundamentals>;
@@ -145,6 +148,14 @@ interface ConnectionActions {
   placeTrade: (id: string) => void;
   setTradeMode: (mode: "confirm" | "autopilot") => void;
   resetKillSwitch: () => void;
+  startScalper: (cfg: {
+    capital: number;
+    profit_target: number;
+    loss_limit?: number;
+    period?: "day" | "week";
+  }) => void;
+  stopScalper: (flatten: boolean) => void;
+  refreshScalper: () => void;
   loadEquity: (symbol: string) => void;
   loadEquityChart: (symbol: string) => void;
 }
@@ -360,6 +371,11 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
             ? { ...cs, startedAt: s.committeeStatus?.startedAt ?? Date.now() }
             : null,
         }));
+        return;
+      }
+      if (msg.scalper_status !== undefined) {
+        // null clears the panel (no session); a snapshot updates it live.
+        set({ scalperStatus: msg.scalper_status ?? null });
         return;
       }
       if (msg.trade_idea) {
@@ -583,6 +599,7 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
       risk: null,
       positionsError: null,
       committeeStatus: null,
+      scalperStatus: null,
       equity: {},
       equityLoading: null,
       equityChart: {},
@@ -928,6 +945,15 @@ export const useConnection = create<ConnectionState & ConnectionActions>(
       },
       resetKillSwitch() {
         void getSocket().sendCommand({ command: "reset_kill_switch" });
+      },
+      startScalper(cfg) {
+        void getSocket().sendCommand({ command: "scalper_start", ...cfg });
+      },
+      stopScalper(flatten) {
+        void getSocket().sendCommand({ command: "scalper_stop", flatten });
+      },
+      refreshScalper() {
+        void getSocket().sendCommand({ command: "scalper_refresh" });
       },
       loadEquity(symbol) {
         const sym = symbol.toUpperCase().trim();

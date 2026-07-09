@@ -94,6 +94,8 @@ export interface ServerEnvelope {
   equity_chart?: ChartPayload;
   /** Market-movers board for the Heatmap tab (reply to movers_refresh). */
   movers?: MoversPayload;
+  /** Autonomous scalper session snapshot; null when no session is running. */
+  scalper_status?: ScalperStatus | null;
 }
 
 /** Company fundamentals for the terminal's Equity Research / DCF tab, built
@@ -160,6 +162,22 @@ export interface CommitteeStatus {
   fraction?: number; // 0..1 completion
   label?: string; // current stage, e.g. "Bull researcher"
   symbol?: string;
+}
+
+/** Autonomous scalper session snapshot, from cerebellum.scalper.status(). */
+export interface ScalperStatus {
+  status: string; // running|market_closed|target_hit|floor_hit|stopped|error|idle
+  realized_pnl: number;
+  unrealized_pnl: number;
+  total_pnl: number;
+  profit_target: number;
+  loss_limit: number;
+  period: string; // "day" | "week"
+  period_key: string;
+  /** symbol -> side ("buy" | "sell") for positions the session opened. */
+  open_positions: Record<string, string>;
+  passes: number;
+  note: string;
 }
 
 /** Pre-trade risk engine snapshot, from sensory.risk.status(). */
