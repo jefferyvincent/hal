@@ -84,10 +84,7 @@ try:
 except OSError:
     TRADING_RULES = ""  # a missing/unreadable vault must never block boot
 
-MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY", "")
-MASSIVE_BASE_URL = "https://api.massive.com"
-
-# --- Alpaca brokerage (order execution) -------------------------------------
+# --- Alpaca brokerage (order execution + all market data) -------------------
 # HAL places orders through Alpaca via the official alpaca-py SDK. ALPACA_PAPER
 # decides paper vs live: true (default) routes every order to the paper account
 # so nothing can touch real money until it's deliberately set false. The SDK
@@ -99,6 +96,19 @@ ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
 ALPACA_PAPER = os.environ.get("ALPACA_PAPER", "true").lower() != "false"
 ALPACA_AUTOPILOT = os.environ.get("ALPACA_AUTOPILOT", "false").lower() == "true"
 
+# The same keys serve every market-data read (bars, option chains, clock) and
+# both live streams. Feed choice is what an entitlement buys:
+#   ALPACA_STOCK_FEED  "iex" (free real-time, IEX tape only) | "sip" (paid,
+#                      full consolidated tape). Historical reads older than
+#                      ~15 minutes use SIP regardless — only the recent window
+#                      and the live stream are restricted.
+#   ALPACA_OPTION_FEED "indicative" (free; carries greeks + IV) | "opra"
+#                      (real-time OPRA NBBO — requires the paid Algo Trader Plus
+#                      plan; on Basic every request 403s "OPRA agreement is not
+#                      signed", which is a subscription gate, not a free form).
+ALPACA_STOCK_FEED = os.environ.get("ALPACA_STOCK_FEED", "iex")
+ALPACA_OPTION_FEED = os.environ.get("ALPACA_OPTION_FEED", "indicative")
+
 # --- Pre-trade risk engine (portfolio circuit breakers; see sensory.risk) ----
 # These cap the whole account over time, independent of any single trade's
 # merits — the runaway guard for autopilot. Each can be disabled by setting it
@@ -107,6 +117,13 @@ RISK_MAX_ORDERS_PER_MIN = _env_int("RISK_MAX_ORDERS_PER_MIN", 6)
 RISK_MAX_OPEN_POSITIONS = _env_int("RISK_MAX_OPEN_POSITIONS", 20)
 RISK_MAX_GROSS_EXPOSURE_PCT = float(os.environ.get("RISK_MAX_GROSS_EXPOSURE_PCT", "200"))
 RISK_DAILY_LOSS_LIMIT_PCT = float(os.environ.get("RISK_DAILY_LOSS_LIMIT_PCT", "10"))
+# Concentration ceilings. The count/gross caps above treat SPY, QQQ and IWM as
+# three independent positions; these two catch the case where they are one bet.
+# Per-underlying covers stacking strikes on a single name; per-group covers a
+# basket that moves together (see sensory.risk._CORRELATED_GROUPS). Both scale
+# down automatically when realized vol is high in its trailing-year range.
+RISK_MAX_SYMBOL_EXPOSURE_PCT = float(os.environ.get("RISK_MAX_SYMBOL_EXPOSURE_PCT", "60"))
+RISK_MAX_GROUP_EXPOSURE_PCT = float(os.environ.get("RISK_MAX_GROUP_EXPOSURE_PCT", "100"))
 
 # Scalper (autonomous profit-target auto-trader). Only the mandate — capital,
 # profit target, loss floor — is set per session; these are the engine defaults.
@@ -133,7 +150,8 @@ EARNINGS_POLL_SECONDS = float(os.environ.get("EARNINGS_POLL_SECONDS", "3600"))
 EARNINGS_LOOKAHEAD_DAYS = _env_int("EARNINGS_LOOKAHEAD_DAYS", 3)
 
 # Chart bar source: "yahoo" (free, keyless, near-real-time for US equities) or
-# "massive" (REST aggregates; freshness depends on the stock-data entitlement).
+# "alpaca" (bars from ALPACA_STOCK_FEED; the last ~15 minutes are IEX-only
+# unless the SIP entitlement is active).
 CHART_DATA_SOURCE = os.environ.get("CHART_DATA_SOURCE", "yahoo")
 
 # Reddit social-sentiment (optional). Reddit blocks keyless JSON, so HAL uses

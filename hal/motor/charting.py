@@ -1,11 +1,11 @@
 """Candlestick chart payloads for HAL's in-app chart view.
 
-Fetches OHLC aggregates from Massive's REST API and shapes them into a
+Fetches OHLC bars from Alpaca or Yahoo and shapes them into a
 JSON-serializable payload the HAL frontend renders with TradingView's
 lightweight-charts library: candles, a volume histogram, a SuperTrend
 overlay (split into up/down line segments for colouring), and Buy/Sell
 flip markers. All times are unix SECONDS (lightweight-charts wants
-seconds, Massive returns milliseconds).
+seconds; both fetchers below emit milliseconds and build_chart converts).
 
 The server pushes the returned payload to the client over the WebSocket
 as {"action": "open_view", "kind": "chart", "chart": <payload>}; the
@@ -20,17 +20,15 @@ from typing import Any, Optional
 
 import httpx
 
-
-BASE_URL: str = ""
-API_KEY: str = ""
-SOURCE: str = "massive"  # "massive" | "yahoo"
+from hal.sensory import alpaca_data
 
 
-def configure(base_url: str, api_key: str, source: str = "massive") -> None:
-    global BASE_URL, API_KEY, SOURCE
-    BASE_URL = base_url
-    API_KEY = api_key
-    SOURCE = source if source in ("massive", "yahoo") else "massive"
+SOURCE: str = "yahoo"  # "alpaca" | "yahoo"
+
+
+def configure(source: str = "yahoo") -> None:
+    global SOURCE
+    SOURCE = source if source in ("alpaca", "yahoo") else "yahoo"
 
 
 # --- timeframe parsing -----------------------------------------------------
@@ -140,12 +138,6 @@ def _supertrend(
     return line, direction
 
 
-# --- payload assembly ------------------------------------------------------
-
-def _headers() -> dict[str, str]:
-    return {"Authorization": f"Bearer {API_KEY}"}
-
-
 # --- bar sources -----------------------------------------------------------
 # Both return raw bars as [{t: ms, o, h, l, c, v}] so build_chart's loop is
 # source-agnostic.
@@ -154,8 +146,8 @@ _YAHOO_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
-# Massive (multiplier, timespan) -> Yahoo interval. Yahoo has no 4-hour bar, so
-# it degrades to hourly.
+# (multiplier, timespan) -> Yahoo interval. Yahoo has no 4-hour bar, so it
+# degrades to hourly.
 _YAHOO_INTERVALS: dict[tuple[int, str], str] = {
     (1, "minute"): "1m", (2, "minute"): "2m", (5, "minute"): "5m",
     (15, "minute"): "15m", (30, "minute"): "30m",
@@ -163,20 +155,25 @@ _YAHOO_INTERVALS: dict[tuple[int, str], str] = {
     (1, "day"): "1d", (1, "week"): "1wk",
 }
 
+# (multiplier, timespan) -> Alpaca timeframe string. Alpaca has no 2-minute bar,
+# so it degrades to 1-minute.
+_ALPACA_TIMEFRAMES: dict[tuple[int, str], str] = {
+    (1, "minute"): "1Min", (2, "minute"): "1Min", (5, "minute"): "5Min",
+    (15, "minute"): "15Min", (30, "minute"): "30Min",
+    (1, "hour"): "1Hour", (4, "hour"): "4Hour",
+    (1, "day"): "1Day", (1, "week"): "1Week",
+}
 
-async def _fetch_bars_massive(sym, mult, timespan, from_d, to_d) -> list[dict]:
-    if not API_KEY:
-        raise RuntimeError("MASSIVE_API_KEY not configured")
-    path = (
-        f"/v2/aggs/ticker/{sym}/range/{mult}/{timespan}/"
-        f"{from_d.isoformat()}/{to_d.isoformat()}"
-    )
-    params = {"adjusted": "true", "sort": "asc", "limit": 50000}
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(BASE_URL + path, headers=_headers(), params=params)
-    if r.status_code != 200:
-        raise RuntimeError(f"Massive HTTP {r.status_code}: {r.text[:300]}")
-    return (r.json() or {}).get("results") or []
+
+async def _fetch_bars_alpaca(sym, mult, timespan, from_d, to_d) -> list[dict]:
+    """OHLC from Alpaca. Real-time bars are IEX on the free tier; anything older
+    than ~15 minutes comes from the full SIP tape (alpaca_data picks the feed)."""
+    if not alpaca_data.is_configured():
+        raise RuntimeError("ALPACA_API_KEY / ALPACA_SECRET_KEY not configured")
+    tf = _ALPACA_TIMEFRAMES.get((mult, timespan), "5Min")
+    bars = await alpaca_data.stock_bars(sym, tf, start=from_d, end=to_d)
+    # alpaca_data emits unix seconds; this module's fetchers contract on ms.
+    return [{**b, "t": b["t"] * 1000} for b in bars]
 
 
 async def _fetch_bars_yahoo(sym, mult, timespan, from_d, to_d) -> list[dict]:
@@ -250,9 +247,9 @@ async def current_prices(symbols: list[str]) -> dict[str, float]:
 
 
 async def _fetch_bars(sym, mult, timespan, from_d, to_d) -> list[dict]:
-    if SOURCE == "yahoo":
-        return await _fetch_bars_yahoo(sym, mult, timespan, from_d, to_d)
-    return await _fetch_bars_massive(sym, mult, timespan, from_d, to_d)
+    if SOURCE == "alpaca":
+        return await _fetch_bars_alpaca(sym, mult, timespan, from_d, to_d)
+    return await _fetch_bars_yahoo(sym, mult, timespan, from_d, to_d)
 
 
 async def build_chart(

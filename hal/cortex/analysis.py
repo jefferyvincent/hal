@@ -1,38 +1,23 @@
 """Options-chain screening and volatility-context helpers for HAL.
 
-These wrap Massive's REST snapshot + aggregates endpoints with the
-shaping HAL actually needs to make a recommendation: flat candidate
-rows from the chain (delta/IV/spread filtered) and a realized-vs-
-implied vol summary so HAL can judge whether premiums are rich or
+These wrap Alpaca's chain snapshot + daily bars (via sensory.alpaca_data)
+with the shaping HAL actually needs to make a recommendation: flat
+candidate rows from the chain (delta/IV/spread filtered) and a realized-
+vs-implied vol summary so HAL can judge whether premiums are rich or
 cheap before picking a side.
 
 The chain snapshot endpoint returns nested JSON with greeks/quote/trade
 sub-objects per contract. Reading that inline forces HAL to navigate
-nesting in tokens, which it does poorly. screen_options flattens to
-one row per candidate and returns only what's actionable.
+nesting in tokens, which it does poorly. alpaca_data.option_chain
+flattens to one row per candidate; screen_options filters and ranks.
 """
 from __future__ import annotations
 
-import asyncio
 import math
-from datetime import date
-from typing import Any, Optional
+from datetime import date, timedelta
+from typing import Optional
 
-import httpx
-
-
-BASE_URL: str = ""
-API_KEY: str = ""
-
-
-def configure(base_url: str, api_key: str) -> None:
-    global BASE_URL, API_KEY
-    BASE_URL = base_url
-    API_KEY = api_key
-
-
-def _headers() -> dict[str, str]:
-    return {"Authorization": f"Bearer {API_KEY}"}
+from hal.sensory import alpaca_data
 
 
 def _dte(expiration: str) -> Optional[int]:
@@ -42,50 +27,6 @@ def _dte(expiration: str) -> Optional[int]:
     except Exception:
         return None
     return (exp - date.today()).days
-
-
-def _flatten_chain_row(row: dict) -> Optional[dict]:
-    details = row.get("details") or {}
-    greeks = row.get("greeks") or {}
-    quote = row.get("last_quote") or {}
-    day = row.get("day") or {}
-    underlying = row.get("underlying_asset") or {}
-    expiration = details.get("expiration_date") or ""
-    bid = quote.get("bid")
-    ask = quote.get("ask")
-    mid = None
-    spread_pct = None
-    if bid is not None and ask is not None:
-        mid = (bid + ask) / 2.0
-        if mid > 0:
-            spread_pct = (ask - bid) / mid * 100.0
-    return {
-        "ticker": details.get("ticker"),
-        "type": details.get("contract_type"),
-        "strike": details.get("strike_price"),
-        "expiration": expiration,
-        "dte": _dte(expiration),
-        "bid": bid,
-        "ask": ask,
-        "mid": round(mid, 4) if mid is not None else None,
-        "spread_pct": round(spread_pct, 2) if spread_pct is not None else None,
-        "iv": row.get("implied_volatility"),
-        "delta": greeks.get("delta"),
-        "gamma": greeks.get("gamma"),
-        "theta": greeks.get("theta"),
-        "vega": greeks.get("vega"),
-        "oi": row.get("open_interest"),
-        "day_volume": day.get("volume"),
-        "underlying_price": underlying.get("price"),
-        "underlying_ticker": underlying.get("ticker"),
-    }
-
-
-async def _get(client: httpx.AsyncClient, path: str, params: dict) -> dict:
-    url = BASE_URL + path
-    r = await client.get(url, headers=_headers(), params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
 
 
 async def screen_options(
@@ -114,47 +55,29 @@ async def screen_options(
     side = side.lower().strip()
     if side not in ("call", "put"):
         return {"error": f"side must be 'call' or 'put', got {side!r}"}
-    if not API_KEY:
-        return {"error": "MASSIVE_API_KEY not configured"}
+    if not alpaca_data.is_configured():
+        return {"error": "ALPACA_API_KEY / ALPACA_SECRET_KEY not configured"}
 
-    params: dict[str, Any] = {
-        "contract_type": side,
-        "limit": 250,
-        "order": "asc",
-        "sort": "strike_price",
-    }
-    if strike_min is not None:
-        params["strike_price.gte"] = strike_min
-    if strike_max is not None:
-        params["strike_price.lte"] = strike_max
-    # DTE bounds map cleanly to expiration_date filters
+    # DTE bounds map cleanly to expiration_date filters, so the chain is
+    # narrowed server-side; delta / OI / spread% are filtered locally below.
     today = date.today()
-    if dte_min is not None:
-        params["expiration_date.gte"] = (
-            today.replace().fromordinal(today.toordinal() + dte_min).isoformat()
+    try:
+        results = await alpaca_data.option_chain(
+            underlying,
+            side=side,
+            expiration_gte=(today + timedelta(days=dte_min)).isoformat()
+            if dte_min is not None else None,
+            expiration_lte=(today + timedelta(days=dte_max)).isoformat()
+            if dte_max is not None else None,
+            strike_gte=strike_min,
+            strike_lte=strike_max,
         )
-    if dte_max is not None:
-        params["expiration_date.lte"] = (
-            today.replace().fromordinal(today.toordinal() + dte_max).isoformat()
-        )
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
 
-    path = f"/v3/snapshot/options/{underlying}"
-    async with httpx.AsyncClient() as client:
-        try:
-            body = await _get(client, path, params)
-        except httpx.HTTPStatusError as e:
-            return {
-                "error": f"HTTP {e.response.status_code}: {e.response.text[:300]}"
-            }
-        except Exception as e:
-            return {"error": f"{type(e).__name__}: {e}"}
-
-    results = body.get("results") or []
     flat: list[dict] = []
-    for raw in results:
-        row = _flatten_chain_row(raw)
-        if row is None:
-            continue
+    for row in results:
+        row["dte"] = _dte(row.get("expiration") or "")
         if row["dte"] is None:
             continue
         d = row["delta"]
@@ -216,57 +139,35 @@ async def iv_context(underlying: str, atm_window: int = 3) -> dict:
     """
     underlying = underlying.upper().strip()
 
+    closes = await alpaca_data.daily_closes(underlying, 400)
+    if len(closes) < 20:
+        return {
+            "error": f"insufficient daily bars for {underlying} "
+            f"({len(closes)} found; need 20+)"
+        }
+
+    # ATM band is set from the last daily close; a failure fetching the chain is
+    # non-fatal (we return realized-vol context with verdict UNKNOWN).
+    underlying_price = closes[-1]
     today = date.today()
-    start = today.fromordinal(today.toordinal() - 365)
-    aggs_path = (
-        f"/v2/aggs/ticker/{underlying}/range/1/day/"
-        f"{start.isoformat()}/{today.isoformat()}"
-    )
-    snap_path = f"/v3/snapshot/options/{underlying}"
-
-    closes: list[float] = []
-    snap: dict = {}
-    async with httpx.AsyncClient() as client:
-        # Primary realized-vol source: Massive daily aggregates. Often 403s on
-        # underlying value data (not in our plan), so failures are non-fatal —
-        # we fall back to Alpaca below.
-        if API_KEY:
-            try:
-                aggs = await _get(
-                    client, aggs_path,
-                    {"adjusted": "true", "sort": "asc", "limit": 50000},
-                )
-                results = aggs.get("results") or []
-                closes = [r["c"] for r in results if r.get("c") is not None]
-            except Exception as e:
-                print(f"[iv_context] Massive aggregates unavailable for {underlying}: {e}")
-
-        # HV fallback: Alpaca daily bars (entitled with our trading keys). This is
-        # what fixes "insufficient historical volatility data" when Massive is thin.
-        if len(closes) < 20:
-            from hal.sensory import broker
-            alpaca_closes = await asyncio.to_thread(broker.daily_closes, underlying, 260)
-            if len(alpaca_closes) >= 20:
-                closes = alpaca_closes
-        if len(closes) < 20:
-            return {
-                "error": f"insufficient daily bars for {underlying} "
-                f"({len(closes)} found; need 20+) — Massive and Alpaca both thin/unavailable"
-            }
-
-        # ATM implied vol still comes from the Massive options snapshot; a failure
-        # here is non-fatal (we return realized-vol context with verdict UNKNOWN).
-        underlying_price = closes[-1]
-        if API_KEY:
-            atm_lo = underlying_price * 0.95
-            atm_hi = underlying_price * 1.05
-            try:
-                snap = await _get(
-                    client, snap_path,
-                    {"strike_price.gte": atm_lo, "strike_price.lte": atm_hi, "limit": 250},
-                )
-            except Exception as e:
-                print(f"[iv_context] Massive options snapshot unavailable for {underlying}: {e}")
+    chain: list[dict] = []
+    try:
+        chain = await alpaca_data.option_chain(
+            underlying,
+            expiration_gte=(today + timedelta(days=5)).isoformat(),
+            expiration_lte=(today + timedelta(days=60)).isoformat(),
+            strike_gte=underlying_price * 0.95,
+            strike_lte=underlying_price * 1.05,
+            with_oi=False,  # IV selection doesn't use OI; skip the second call
+        )
+    except Exception as e:
+        print(f"[iv_context] Alpaca option chain unavailable for {underlying}: {e}")
+    # The chain carries a live underlying price; prefer it over yesterday's close
+    # so ATM distance is measured against where the stock actually is.
+    for row in chain:
+        if row.get("underlying_price"):
+            underlying_price = row["underlying_price"]
+            break
 
     # Realized vol from log returns
     log_returns: list[float] = []
@@ -284,22 +185,11 @@ async def iv_context(underlying: str, atm_window: int = 3) -> dict:
 
     hv10, hv30, hv60, hv90 = _hv(10), _hv(30), _hv(60), _hv(90)
 
-    # Normalize ATM IV contracts to {strike, iv, expiration} from whichever source
-    # is available: the Massive snapshot first, else Alpaca's option chain (IV
-    # fallback). The selection below then runs identically on either source.
-    iv_rows: list[dict] = []
-    for r in (snap.get("results") or []):
-        details = r.get("details") or {}
-        strike = details.get("strike_price")
-        iv = r.get("implied_volatility")
-        if strike is not None and iv and iv > 0:
-            iv_rows.append({"strike": strike, "iv": iv,
-                            "expiration": details.get("expiration_date") or ""})
-    if not iv_rows:
-        from hal.sensory import broker
-        iv_rows = await asyncio.to_thread(
-            broker.option_iv_chain, underlying,
-            underlying_price * 0.95, underlying_price * 1.05)
+    iv_rows = [
+        {"strike": r["strike"], "iv": r["iv"], "expiration": r.get("expiration") or ""}
+        for r in chain
+        if r.get("strike") is not None and r.get("iv") and r["iv"] > 0
+    ]
 
     # Pick the N closest-to-ATM contracts with valid IV (5–60 DTE); average their IV.
     near_atm: list[tuple[float, float]] = []
@@ -417,14 +307,12 @@ def detect_regime(closes: list[float]) -> dict:
 
 
 async def price_regime(underlying: str, lookback: int = 120) -> dict:
-    """Fetch daily closes and classify the price regime. Uses Alpaca daily bars
-    (entitled with HAL's trading keys, unlike Massive underlying-value data which
-    403s). Tolerant: returns {error:...} instead of raising so the committee can
-    treat a missing read as 'no regime input' rather than failing."""
+    """Fetch daily closes and classify the price regime. Tolerant: returns
+    {error:...} instead of raising so the committee can treat a missing read as
+    'no regime input' rather than failing."""
     underlying = underlying.upper().strip()
-    from hal.sensory import broker
     try:
-        closes = await asyncio.to_thread(broker.daily_closes, underlying, lookback)
+        closes = await alpaca_data.daily_closes(underlying, lookback)
     except Exception as e:
         return {"error": f"daily bars unavailable: {e}"}
     reg = detect_regime(closes or [])

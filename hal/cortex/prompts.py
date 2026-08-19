@@ -33,15 +33,15 @@ You have these tools available:
 - run_command: executes a bash command and returns its stdout/stderr.
 - run_cmd: executes a POSIX sh command and returns its stdout/stderr.
 - run_python: executes Python code (whatever the system Python provides) and returns its stdout/stderr.
-- query_massive: GET against Massive.com's REST API for historical and snapshot options data.
-- screen_options: filtered chain candidates (flat rows with greeks/IV/OI/spread). Prefer this over query_massive when picking specific contracts.
+- query_alpaca: GET against Alpaca's REST API for stock bars, option chains/bars, contracts, screener, news and the market clock.
+- screen_options: filtered chain candidates (flat rows with greeks/IV/OI/spread). Prefer this over query_alpaca when picking specific contracts.
 - iv_context: implied-vs-realized vol verdict (RICH/FAIR/CHEAP). Call this BEFORE deciding to sell vs buy premium.
 - recommend_strategy: given a bias (bullish/bearish/neutral) and IV regime, returns the top option strategies with rationale, risk level, and concrete legs (strikes/expiries). This is the "what structure fits this view" brain (ported from {USER_NAME}'s TradeScan screener). Use it after iv_context to turn a vol/direction read into specific spreads, then pass the legs to screen_options to pick the live contracts.
 - show_chart: render an interactive candlestick chart (candles + volume + SuperTrend + Buy/Sell markers) INSIDE the HAL interface. Use this to SHOW {USER_NAME} a setup on a ticker (args: symbol, optional timeframe like 5m/1h/1d) instead of describing price action in words. After showing it, make your point about the setup — don't narrate the candles; he's looking at it.
 - open_webull: open Webull in {USER_NAME}'s browser at a specific page. Actions: positions, orders, watchlist, alerts, screener, trade, account, quote (needs ticker), option_chain (needs ticker). Use this when he wants to eyeball something in Webull's UI or place a trade there himself. For actually executing orders, prefer the Alpaca tools below — Webull is just a viewer now.
 - place_order, confirm_order, cancel_pending_order, set_trade_mode, get_account, list_positions, list_orders, cancel_order, close_position: live order execution through {USER_NAME}'s Alpaca account (equities + single-leg options). See TRADE EXECUTION below.
 - committee_review: convene the multi-agent committee (vol/setup/catalyst analysts → bull-vs-bear debate → judge → rules gate) for a "deep dive" / "full workup" / "what does the committee think" on a ticker. Slower than a quick trade idea; pins a TRADE-or-PASS verdict with full reasoning in the Trade Ideas pane and places no orders. committee_backtest: validate the committee's directional calls over a date window before trusting it.
-- subscribe_market, add_alert_rule, list_subscriptions, unsubscribe, remove_rule, list_alert_history: manage real-time WebSocket subscriptions and price/volume alert rules on Massive's options feed. Subscriptions persist across restarts. When a rule fires, an alert turn is automatically injected and you will be invoked to announce it — keep those announcements to one sentence and do NOT call further tools in alert turns.
+- subscribe_market, add_alert_rule, list_subscriptions, unsubscribe, remove_rule, list_alert_history: manage real-time WebSocket subscriptions and price/volume alert rules on Alpaca's live stock and options feeds. Subscriptions persist across restarts. When a rule fires, an alert turn is automatically injected and you will be invoked to announce it — keep those announcements to one sentence and do NOT call further tools in alert turns.
 
 MARKET WATCHES & ALERTS — when {USER_NAME} asks you to watch, monitor, track, "keep an eye on", or alert/notify him about a ticker, a price level, unusual volume, or a percentage move, you set this up EXCLUSIVELY with the built-in tools: call subscribe_market to open the feed (returns a subscription_id), then add_alert_rule on that id with the right rule_type (pct_move / price_cross / volume). That is the ONLY mechanism that actually works. NEVER improvise an alerting system with run_python, Twilio, SMS, email, cron, or a polling loop — those do not connect to the live feed and are a defect. Alerts are delivered by speaking them aloud in this HAL app the moment they fire (and any that fire while the app is closed are announced when {USER_NAME} reconnects); there is no SMS or external delivery, so do not promise one. If {USER_NAME} asks whether a watch is active or "are you connected", call list_subscriptions (it reports the live socket auth state) rather than guessing.
 
@@ -209,31 +209,39 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "query_massive",
+            "name": "query_alpaca",
             "description": (
-                "Query the Massive.com REST API for US options data (Options Advanced "
-                "plan; auth automatic; returns JSON). Key endpoints: "
-                "/v3/snapshot/options/{underlying} (full chain w/ greeks, IV, bid/ask, OI "
-                "— the most useful single call); /v3/snapshot/options/{underlying}/{contract} "
-                "(one contract); /v2/aggs/ticker/{optionsTicker}/range/{mult}/{timespan}/"
-                "{from}/{to} (OHLC bars, dates YYYY-MM-DD); /v3/reference/options/contracts "
-                "(list; filters underlying_ticker, expiration_date, contract_type, strike_price); "
-                "/v3/quotes|trades/{optionsTicker}, /v2/last/trade/{optionsTicker}; "
-                "/v1/indicators/{sma|ema|macd|rsi}/{optionsTicker}; /v1/marketstatus/now. "
-                "Options ticker: O:UNDERLYING+YYMMDD+C|P+STRIKE×1000 zero-padded to 8 digits "
-                "(SPY 2026-06-20 $500 call = O:SPY260620C00500000). For any endpoint not "
-                "listed, fetch https://massive.com/docs/llms.txt (run_python + httpx)."
+                "Query the Alpaca REST API for US market data (auth automatic; returns "
+                "JSON; the host is picked from the path). Key endpoints: "
+                "/v1beta1/options/snapshots/{underlying} (full chain w/ greeks, IV, "
+                "bid/ask — the most useful single call; filters type=call|put, "
+                "strike_price_gte/lte, expiration_date_gte/lte); "
+                "/v1beta1/options/bars?symbols=... (option OHLC, history starts "
+                "2024-01-18); /v2/stocks/bars?symbols=SPY&timeframe=1Day|5Min|1Hour "
+                "(stock OHLC; start/end are RFC3339 or YYYY-MM-DD); "
+                "/v2/stocks/snapshots?symbols=... (latest trade/quote/day bar); "
+                "/v2/options/contracts (contract list WITH open_interest; filters "
+                "underlying_symbols, type, expiration_date_gte/lte, strike_price_gte/lte, "
+                "status=active|inactive where inactive means expired); "
+                "/v1beta1/screener/stocks/movers and /most-actives; "
+                "/v1beta1/news?symbols=... ; /v1/corporate-actions; /v2/clock "
+                "(authoritative market open/closed, holidays included); /v2/calendar. "
+                "Option symbols are bare OCC — UNDERLYING+YYMMDD+C|P+STRIKE×1000 "
+                "zero-padded to 8 digits (SPY 2026-06-20 $500 call = SPY260620C00500000), "
+                "with NO 'O:' prefix. Open interest is NOT on the chain snapshot; get it "
+                "from /v2/options/contracts. Free tier: stock quotes are the IEX tape and "
+                "options use the 'indicative' feed."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "endpoint": {
                         "type": "string",
-                        "description": "Full API path starting with /, e.g. '/v3/reference/options/contracts'",
+                        "description": "Full API path starting with /, e.g. '/v2/options/contracts'",
                     },
                     "params": {
                         "type": "object",
-                        "description": "Query parameters as key-value pairs (e.g. {'underlying_ticker': 'SPY', 'limit': 50}).",
+                        "description": "Query parameters as key-value pairs (e.g. {'underlying_symbols': 'SPY', 'limit': 50}).",
                     },
                 },
                 "required": ["endpoint"],
@@ -245,27 +253,31 @@ TOOLS = [
         "function": {
             "name": "subscribe_market",
             "description": (
-                "Open a real-time WebSocket subscription to Massive's options feed "
-                "(persists across restarts). channel: T (trades) | Q (quotes, capped "
-                "~1000 contracts) | A (per-sec aggs) | AM (per-min) | FMV. symbol: '*', "
-                "'O:SPY*', or a full options ticker like O:SPY260620C00500000. Returns "
-                "subscription_id for add_alert_rule; attach a rule or nothing alerts."
+                "Open a real-time WebSocket subscription to Alpaca's live feed "
+                "(persists across restarts). Works for BOTH stocks and options — a "
+                "plain ticker streams the stock, an OCC symbol streams the contract. "
+                "channel: T (trades) | Q (quotes) | AM (per-minute bars). symbol: a "
+                "ticker like SPY, or a bare OCC symbol like SPY260620C00500000. "
+                "Wildcards are NOT supported — neither 'SPY*' nor '*' (the plan caps "
+                "concurrent symbols and rejects '*') — so name each symbol explicitly. "
+                "Returns subscription_id for add_alert_rule; attach a rule or nothing "
+                "alerts."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "channel": {
                         "type": "string",
-                        "enum": ["T", "Q", "A", "AM", "FMV"],
+                        "enum": ["T", "Q", "AM"],
                         "description": "Channel code.",
                     },
                     "symbol": {
                         "type": "string",
-                        "description": "Symbol pattern. '*', 'O:SPY*', or full options ticker.",
+                        "description": "Symbol. 'SPY', a bare OCC symbol like 'SPY260620C00500000', or '*'.",
                     },
                     "note": {
                         "type": "string",
-                        "description": "Optional reason (for audit; not sent to Massive).",
+                        "description": "Optional reason (for audit; not sent to Alpaca).",
                     },
                 },
                 "required": ["channel", "symbol"],
@@ -372,7 +384,7 @@ TOOLS = [
                 "Filtered options-chain candidates for an underlying. Returns flat "
                 "rows (strike, bid/ask/mid, IV, delta, gamma, theta, vega, OI, "
                 "volume, spread%) for contracts matching your filters. Prefer this "
-                "over query_massive when you need to pick specific contracts — it "
+                "over query_alpaca when you need to pick specific contracts — it "
                 "applies the filters server-side and locally so you don't have to "
                 "page through hundreds of rows in context.\n"
                 "delta_min/delta_max: signed deltas (calls 0..1, puts -1..0). For "

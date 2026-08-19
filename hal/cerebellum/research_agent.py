@@ -36,7 +36,7 @@ THE LOCK-BOX (why this loop needs a third data slice):
 
 Scope guarantees (mirrors optimize.ai_optimize / committee ethos):
   · Gated behind confirm_llm_usage and bounded by max_rounds (cost = at most
-    max_rounds smart-model calls; the Massive sweep cost is shared across rounds
+    max_rounds smart-model calls; the Alpaca sweep cost is shared across rounds
     via persistent caches).
   · Produces a research artifact + ONE candidate flagged for paper-forward. It
     never wires a trigger and never places a trade.
@@ -56,6 +56,7 @@ import httpx
 
 from hal.cerebellum import backtest as bt
 from hal.cerebellum import optimize as opt
+from hal.sensory import alpaca_data
 
 # --- Search-space allow-list -------------------------------------------------
 # The ONLY knobs the agent may move, with hard bounds. Anything outside this is
@@ -276,11 +277,11 @@ async def research(
         return {"gated": True, "report": (
             "The research agent runs the smart model once per round. Re-run with "
             "confirm_llm_usage=True to spend it on an autonomous parameter search.")}
-    if not bt.API_KEY:
-        raise RuntimeError("MASSIVE_API_KEY not configured")
+    if not alpaca_data.is_configured():
+        raise RuntimeError("ALPACA_API_KEY / ALPACA_SECRET_KEY not configured")
 
     holdout_iso = (date.today() - timedelta(days=int(holdout_months * 30.5))).isoformat()
-    # Shared across rounds so each unique contract is fetched from Massive once for
+    # Shared across rounds so each unique contract is fetched from Alpaca once for
     # the WHOLE search, not once per round (same efficiency optimize gives a sweep).
     contract_cache: dict = {}
     optbar_cache: dict = {}

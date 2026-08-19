@@ -3,7 +3,7 @@
 # runs the environment bootstrap (COQUI_TOS, FFmpeg DLL directory, UTF-8
 # stdout/stderr, .env loading) those libraries depend on. Keep it first.
 from hal.brainstem.config import (
-    MASSIVE_API_KEY, MASSIVE_BASE_URL, OLLAMA_URL, OLLAMA_MODEL,
+    OLLAMA_URL, OLLAMA_MODEL,
     OLLAMA_FAST_MODEL, OLLAMA_VISION_MODEL, OLLAMA_VISION_FAST_MODEL,
     HAL_REFERENCE_WAV, PIPER_VOICE_PATH,
     WHISPER_MODEL_SIZE, WHISPER_PROMPT, DEVICE, SCRATCH_DIR,
@@ -13,8 +13,10 @@ from hal.brainstem.config import (
     EARNINGS_POLL_SECONDS, EARNINGS_LOOKAHEAD_DAYS,
     HAL_PASSWORD, HAL_SECRET_KEY,
     ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER, ALPACA_AUTOPILOT,
+    ALPACA_STOCK_FEED, ALPACA_OPTION_FEED,
     RISK_MAX_ORDERS_PER_MIN, RISK_MAX_OPEN_POSITIONS,
     RISK_MAX_GROSS_EXPOSURE_PCT, RISK_DAILY_LOSS_LIMIT_PCT,
+    RISK_MAX_SYMBOL_EXPOSURE_PCT, RISK_MAX_GROUP_EXPOSURE_PCT,
     SCALPER_POLL_SECONDS, SCALPER_MAX_CONCURRENT,
     SCALPER_SCORE_THRESHOLD, SCALPER_CATASTROPHIC_STOP_PCT,
     REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET,
@@ -44,6 +46,7 @@ from fastapi.staticfiles import StaticFiles
 from faster_whisper import WhisperModel
 from piper import PiperVoice
 
+from hal.sensory import alpaca_data
 from hal.sensory import market
 from hal.sensory import news
 from hal.sensory import earnings
@@ -96,11 +99,11 @@ from hal.cortex.strategies import select_strategy as _select_strategy
 # analysis functions directly), so they don't need to ride in the model's tool
 # schema every turn — dropping them cuts ~2k prompt tokens, which lets a smaller
 # num_ctx hold real history while spilling fewer 27B layers to CPU (faster
-# replies). query_massive stays so the model can still pull any market data
+# replies). query_alpaca stays so the model can still pull any market data
 # ad-hoc. All handlers in execute_tool remain, so nothing breaks if a route adds
 # one back later.
 _MODEL_TOOL_NAMES = {
-    "run_command", "run_cmd", "run_python", "query_massive",
+    "run_command", "run_cmd", "run_python", "query_alpaca",
     "open_webull", "open_view",
     "journal_search", "vault_close_trade",
     "place_order", "confirm_order", "cancel_pending_order", "set_trade_mode",
@@ -326,19 +329,23 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    market.configure(DB_PATH, MASSIVE_API_KEY)
-    analysis.configure(MASSIVE_BASE_URL, MASSIVE_API_KEY)
-    charting.configure(MASSIVE_BASE_URL, MASSIVE_API_KEY, CHART_DATA_SOURCE)
-    backtest.configure(MASSIVE_BASE_URL, MASSIVE_API_KEY)
+    # One Alpaca credential pair now backs every market-data read (bars, chains,
+    # clock) as well as the two live streams — configure it before anything that
+    # depends on it.
+    alpaca_data.configure(
+        ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER, ALPACA_OPTION_FEED)
+    market.configure(DB_PATH, ALPACA_API_KEY, ALPACA_SECRET_KEY,
+                     ALPACA_STOCK_FEED, ALPACA_OPTION_FEED)
+    charting.configure(CHART_DATA_SOURCE)
     await market.manager.start()
     print(f"[boot] market manager: {market.manager.url}")
     await market.alert_poller.start()
     news.configure(DB_PATH, NEWS_POLL_SECONDS, NEWS_PRIMARY_FEED)
     earnings.configure(DB_PATH, EARNINGS_POLL_SECONDS, EARNINGS_LOOKAHEAD_DAYS)
-    watchlist.configure(MASSIVE_BASE_URL, MASSIVE_API_KEY)
     broker.configure(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER, ALPACA_AUTOPILOT)
     risk.configure(RISK_MAX_ORDERS_PER_MIN, RISK_MAX_OPEN_POSITIONS,
-                   RISK_MAX_GROSS_EXPOSURE_PCT, RISK_DAILY_LOSS_LIMIT_PCT)
+                   RISK_MAX_GROSS_EXPOSURE_PCT, RISK_DAILY_LOSS_LIMIT_PCT,
+                   RISK_MAX_SYMBOL_EXPOSURE_PCT, RISK_MAX_GROUP_EXPOSURE_PCT)
     print(
         f"[boot] broker: {'ready' if broker.is_ready() else 'no credentials'} "
         f"({'paper' if broker.is_paper() else 'LIVE'}, {broker.get_mode()} mode)"
@@ -786,41 +793,49 @@ async def run_python_tool(code: str, websocket: WebSocket, abort_event: asyncio.
     return result[:MAX_TOOL_OUTPUT_CHARS]
 
 
-async def run_massive_tool(
+async def run_alpaca_tool(
     endpoint: str,
     params: dict | None,
     websocket: WebSocket,
     abort_event: asyncio.Event,
 ) -> str:
+    """Raw GET against Alpaca, for anything the typed tools don't already cover.
+
+    Alpaca splits market data (data.alpaca.markets) from account/reference data
+    (the paper or live trading host), so the host is chosen from the path rather
+    than being a single base URL.
+    """
     _check_abort(abort_event)
-    if not MASSIVE_API_KEY:
-        return "Error: MASSIVE_API_KEY not configured (no .env loaded or key missing)."
+    if not alpaca_data.is_configured():
+        return "Error: ALPACA_API_KEY / ALPACA_SECRET_KEY not configured (no .env loaded or keys missing)."
     if not endpoint.startswith("/"):
         endpoint = "/" + endpoint
-    url = MASSIVE_BASE_URL + endpoint
+    # /v2/stocks/*, /v1beta1/* and /v1/corporate-actions are market data;
+    # /v2/clock, /v2/calendar, /v2/options/contracts, /v2/assets are trading.
+    is_data = endpoint.startswith(("/v1beta1/", "/v1/")) or endpoint.startswith("/v2/stocks/")
+    url = (alpaca_data.DATA_URL if is_data else alpaca_data.TRADING_URL) + endpoint
     qparams = dict(params or {})
-    headers = {"Authorization": f"Bearer {MASSIVE_API_KEY}"}
 
     preview = f"GET {endpoint}" + (f" {qparams}" if qparams else "")
-    await websocket.send_json({"state": "processing", "text": f"Massive: {preview}"})
+    await websocket.send_json({"state": "processing", "text": f"Alpaca: {preview}"})
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.get(url, headers=headers, params=qparams)
+            r = await client.get(url, headers=alpaca_data._headers(), params=qparams)
     except Exception as e:
-        result = f"Massive query failed: {e}"
-        await _emit_telemetry(websocket, "massive", preview, result, status="error")
+        result = f"Alpaca query failed: {e}"
+        await _emit_telemetry(websocket, "alpaca", preview, result, status="error")
         return result[:MAX_TOOL_OUTPUT_CHARS]
 
     if r.status_code != 200:
         result = f"HTTP {r.status_code}: {r.text[:1000]}"
-        await _emit_telemetry(websocket, "massive", preview, result, status="error")
+        await _emit_telemetry(websocket, "alpaca", preview, result, status="error")
         return result[:MAX_TOOL_OUTPUT_CHARS]
     try:
         body = json.dumps(r.json(), indent=2)
     except Exception:
         body = r.text
-    await _emit_telemetry(websocket, "massive", preview, body)
+    await _emit_telemetry(websocket, "alpaca", preview, body)
     return body[:MAX_TOOL_OUTPUT_CHARS]
 
 
@@ -1080,8 +1095,8 @@ async def execute_tool(name: str, args: dict, websocket: WebSocket, abort_event:
         return await run_cmd_tool(args.get("command", ""), websocket, abort_event)
     if name == "run_python":
         return await run_python_tool(args.get("code", ""), websocket, abort_event)
-    if name == "query_massive":
-        return await run_massive_tool(
+    if name == "query_alpaca":
+        return await run_alpaca_tool(
             args.get("endpoint", ""),
             args.get("params"),
             websocket,
@@ -1240,13 +1255,32 @@ async def open_webull(action: str, ticker: str = "") -> dict:
     return {"opened": url, "action": action, "ticker": ticker or None}
 
 
-def _broker_rules_check(spec: dict) -> dict:
-    """Backstop the model's own rule-compliance with the vault rules gate. Only
-    keyword blockers (wont_trade) can fire here — account-size caps are skipped
-    (account_size left 0) so we never false-block on a missing risk estimate."""
+async def _broker_rules_check(spec: dict) -> dict:
+    """Backstop the model's own rule-compliance with the vault rules gate.
+    Account-size caps are skipped (account_size left 0) so we never false-block
+    on a missing risk estimate.
+
+    The `wont_trade` conditions are about the world, not the order, so the facts
+    they need are fetched here and passed in: the underlying's last price and
+    how soon it reports. Either lookup failing yields None, which the gate reads
+    as "unverifiable" and skips — a keyless calendar or quote feed going down
+    must not halt trading. Both are cheap: prices are one snapshot call and the
+    earnings calendar is cached for the day.
+    """
+    root = alpaca_data.occ_root(spec["symbol"])
+    price_task = alpaca_data.latest_prices([root])
+    earnings_task = earnings.days_until_earnings(root)
+    prices, days_to_earnings = await asyncio.gather(
+        price_task, earnings_task, return_exceptions=True)
+    underlying_price = (prices or {}).get(root) if isinstance(prices, dict) else None
+    if isinstance(days_to_earnings, BaseException):
+        days_to_earnings = None
+
     strategy = f"{spec['asset_class']} {spec['symbol']}"
-    return _check_trade(symbol=spec["symbol"], strategy=strategy,
-                        side=spec["side"], reward_risk=None)
+    return _check_trade(symbol=root, strategy=strategy,
+                        side=spec["side"], reward_risk=None,
+                        underlying_price=underlying_price,
+                        days_to_earnings=days_to_earnings)
 
 
 def _is_entry(spec: dict, positions: list[dict]) -> bool:
@@ -1261,6 +1295,20 @@ def _is_entry(spec: dict, positions: list[dict]) -> bool:
     return spec["side"] == ("buy" if long else "sell")
 
 
+async def _vol_percentile(symbol: str) -> float | None:
+    """Where the underlying's realized vol sits in its own trailing-year range
+    (0..1), for the risk engine's vol-scaled exposure ceilings. None on any
+    failure — a missing vol read must leave the base limits alone, never block
+    or silently loosen an order."""
+    try:
+        root = alpaca_data.occ_root(symbol or "")
+        closes = await alpaca_data.daily_closes(root, 400)
+        return backtest.vol_regime_percentile(closes)
+    except Exception as e:
+        print(f"[risk] vol percentile unavailable for {symbol}: {type(e).__name__}: {e}")
+        return None
+
+
 async def _risk_gate(spec: dict) -> tuple[dict | None, bool]:
     """Apply the portfolio risk engine to an opening order. Returns
     (block_result_or_None, is_entry). Exits pass through ungated. Latching the
@@ -1270,9 +1318,16 @@ async def _risk_gate(spec: dict) -> tuple[dict | None, bool]:
     is_entry = _is_entry(spec, positions)
     if not is_entry:
         return None, False
-    res = risk.check_entry(spec, account, positions)
+    vol_pct = await _vol_percentile(spec.get("symbol") or "")
+    res = risk.check_entry(spec, account, positions, vol_percentile=vol_pct)
     if res["tripped_now"]:
         broker.set_mode("confirm")
+    persistence.log_decision(
+        "risk_gate", spec.get("symbol"), res["passed"],
+        "; ".join(res["failures"]),
+        {"spec": spec, "equity": account.get("equity"),
+         "open_positions": len(positions), "status": risk.status()},
+    )
     if not res["passed"]:
         return res, True
     return None, True
@@ -1318,7 +1373,7 @@ async def _gated_submit(spec: dict) -> dict:
     """Run a prepared order spec through the full gate — rules check → risk engine
     → confirm/autopilot submit. Extracted from _place_order so the scalper submits
     entries through the IDENTICAL guards rather than a parallel path."""
-    gate = _broker_rules_check(spec)
+    gate = await _broker_rules_check(spec)
     if not gate["passed"]:
         return {"blocked": True, "failures": gate["failures"],
                 "message": "Blocked by your trading rules: " + "; ".join(gate["failures"])}
@@ -1616,7 +1671,7 @@ def _scalper_period_key(period: str):
 # most-active-by-dollar-volume and Nasdaq-100 movers. Raw Gainer/Loser rows are
 # microcap-heavy (thin penny names with no option chain) that the options
 # committee can only ever PASS — so the scalper skips them and stops burning
-# committee runs (and Massive rate-limit) on names it can't trade. A liquid name
+# committee runs (and Alpaca rate-limit) on names it can't trade. A liquid name
 # that is ALSO a top gainer may be labeled "Gainer" by movers' dedup priority and
 # skipped here; that's fine — the watchlist covers the user's own names and the
 # committee stays the backstop for anything untradeable that slips through.
@@ -1925,9 +1980,10 @@ _BACKTEST_INTENT = re.compile(r"\b(back\s?test|backtesting)\b", re.IGNORECASE)
 
 # Cash-settled index option ROOTS, by trading volume. When the user names one
 # of these explicitly we backtest the actual index option (not an ETF proxy).
-# NOTE: these are index roots, not ETFs — Massive may need an 'I:' prefix for
-# the underlying spot/aggregates; verify live and adjust if a root returns no
-# data (the ETF proxy aliases below are the reliable fallback).
+# NOTE: these are index roots, not ETFs. Alpaca carries SPX and DJX options but
+# NOT NDX or RUT, and it has no spot bars for any cash-settled index — backtest
+# maps the unsupported roots to their ETF proxy and pulls the index level from
+# Yahoo (see backtest._INDEX_MINI / _INDEX_YAHOO).
 _INDEX_OPTION_ROOTS = re.compile(
     r"\b(SPX|VIX|XSP|NDX|RUT|DJX)\b", re.IGNORECASE,
 )
@@ -3934,7 +3990,7 @@ async def _place_trade_idea_inner(trade: dict) -> tuple[bool, str]:
         )
     except Exception as e:
         return False, f"I couldn't build that order, {USER_NAME}: {e}"
-    gate = await asyncio.to_thread(_broker_rules_check, spec)
+    gate = await _broker_rules_check(spec)
     if not gate["passed"]:
         return False, "That order is blocked by your trading rules: " + "; ".join(gate["failures"])
     try:

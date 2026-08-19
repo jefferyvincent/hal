@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from alpaca.trading.client import TradingClient
@@ -29,38 +28,11 @@ from alpaca.trading.requests import (
     MarketOrderRequest,
 )
 
-# Market-data SDK (historical bars + option chain) is optional — guard the
-# imports so a version mismatch can never break the critical order path below.
-# Stock and option data degrade independently.
-try:
-    from alpaca.data.historical import StockHistoricalDataClient
-    from alpaca.data.requests import StockBarsRequest
-    from alpaca.data.timeframe import TimeFrame
-    _DATA_SDK_OK = True
-except Exception as _e:  # pragma: no cover
-    StockHistoricalDataClient = None  # type: ignore
-    _DATA_SDK_OK = False
-    print(f"[broker] alpaca.data (stock) unavailable; HV fallback disabled: {_e}")
-
-try:
-    from alpaca.data.historical.option import OptionHistoricalDataClient
-    from alpaca.data.requests import OptionChainRequest
-    _OPT_SDK_OK = True
-except Exception as _e:  # pragma: no cover
-    OptionHistoricalDataClient = None  # type: ignore
-    _OPT_SDK_OK = False
-    print(f"[broker] alpaca.data (options) unavailable; IV fallback disabled: {_e}")
-
 from hal.hippocampus import persistence
 from hal.sensory import money
 
 # --- Module state -----------------------------------------------------------
 _client: Optional[TradingClient] = None
-# Market-data clients (same Alpaca keys, separate clients) — used as fallbacks
-# when the primary feed is thin: stock bars for realized vol (HV), the option
-# chain for ATM implied vol (IV).
-_data_client: Optional[StockHistoricalDataClient] = None
-_option_client: Optional[OptionHistoricalDataClient] = None
 _paper: bool = True
 _autopilot: bool = False
 
@@ -70,7 +42,7 @@ _pending: dict[str, dict[str, Any]] = {}
 
 
 def configure(api_key: str, secret_key: str, paper: bool, autopilot: bool) -> None:
-    global _client, _data_client, _option_client, _paper, _autopilot
+    global _client, _paper, _autopilot
     _paper = paper
     _autopilot = autopilot
     _client = (
@@ -78,84 +50,6 @@ def configure(api_key: str, secret_key: str, paper: bool, autopilot: bool) -> No
         if api_key and secret_key
         else None
     )
-    # Data keys are venue-agnostic (paper/live keys both work for market data).
-    _have_keys = bool(api_key and secret_key)
-    _data_client = (
-        StockHistoricalDataClient(api_key, secret_key)
-        if _DATA_SDK_OK and _have_keys else None
-    )
-    _option_client = (
-        OptionHistoricalDataClient(api_key, secret_key)
-        if _OPT_SDK_OK and _have_keys else None
-    )
-
-
-def daily_closes(symbol: str, lookback_days: int = 220) -> list[float]:
-    """Daily close prices for `symbol` from Alpaca market data, oldest→newest.
-    Returns [] if the data client isn't configured or the read fails — callers
-    use it as a fallback, so it degrades quietly. Synchronous (SDK is sync); the
-    async caller should run it via asyncio.to_thread."""
-    if _data_client is None:
-        return []
-    sym = symbol.upper().strip()
-    try:
-        start = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-        req = StockBarsRequest(symbol_or_symbols=sym, timeframe=TimeFrame.Day, start=start)
-        bars = _data_client.get_stock_bars(req)
-        data = getattr(bars, "data", {}) or {}
-        return [float(b.close) for b in data.get(sym, [])]
-    except Exception as e:
-        print(f"[broker] daily_closes({sym}) failed: {type(e).__name__}: {e}")
-        return []
-
-
-def _parse_occ(sym: str) -> tuple[Optional[float], Optional[str]]:
-    """(strike, 'YYYY-MM-DD') from an OCC option symbol like AAPL250620C00185000.
-    The last 15 chars are YYMMDD + C/P + strike*1000 (8 digits); the root is
-    variable-length. Returns (None, None) on a malformed symbol."""
-    if len(sym) < 16:
-        return None, None
-    tail = sym[-15:]
-    yymmdd, cp, strike8 = tail[0:6], tail[6], tail[7:15]
-    if not (yymmdd.isdigit() and strike8.isdigit() and cp in ("C", "P")):
-        return None, None
-    return int(strike8) / 1000.0, f"20{yymmdd[0:2]}-{yymmdd[2:4]}-{yymmdd[4:6]}"
-
-
-def option_iv_chain(underlying: str, strike_lo: float, strike_hi: float,
-                    dte_min: int = 5, dte_max: int = 60) -> list[dict]:
-    """ATM-band option implied vols from Alpaca's option-chain snapshot, as a
-    normalized [{strike, iv, expiration}]. The IV fallback for analysis.iv_context
-    when the primary options feed is unavailable. [] if not configured/entitled or
-    on any error (degrades quietly). Synchronous — call via asyncio.to_thread."""
-    if _option_client is None:
-        return []
-    sym = underlying.upper().strip()
-    try:
-        today = datetime.now(timezone.utc).date()
-        req = OptionChainRequest(
-            underlying_symbol=sym,
-            strike_price_gte=round(strike_lo, 2),
-            strike_price_lte=round(strike_hi, 2),
-            expiration_date_gte=today + timedelta(days=dte_min),
-            expiration_date_lte=today + timedelta(days=dte_max),
-        )
-        chain = _option_client.get_option_chain(req)
-    except Exception as e:
-        print(f"[broker] option_iv_chain({sym}) failed: {type(e).__name__}: {e}")
-        return []
-    out: list[dict] = []
-    for occ_sym, snap in (chain or {}).items():
-        iv = getattr(snap, "implied_volatility", None)
-        if iv is None:  # some payloads nest it under greeks
-            iv = getattr(getattr(snap, "greeks", None), "implied_volatility", None)
-        if not iv or iv <= 0:
-            continue
-        strike, expiration = _parse_occ(occ_sym)
-        if strike is None:
-            continue
-        out.append({"strike": strike, "iv": float(iv), "expiration": expiration})
-    return out
 
 
 def is_ready() -> bool:

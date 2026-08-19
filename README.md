@@ -88,8 +88,7 @@ flowchart TB
 
   subgraph EXT["External services"]
     direction LR
-    MASSIVE["Massive<br/>options data + feed"]
-    ALPACA["Alpaca<br/>broker"]
+    ALPACA["Alpaca<br/>broker · bars · chains · live feeds"]
     NASDAQ["Nasdaq<br/>earnings cal"]
     YAHOO["Yahoo<br/>index bars"]
   end
@@ -111,9 +110,9 @@ flowchart TB
   EXIT --- BRACK
   EXIT --- BT
 
-  BT --> MASSIVE
+  BT --> ALPACA
   BT --> YAHOO
-  MON --> MASSIVE
+  MON --> ALPACA
   MON --> NASDAQ
   MON -->|"proactive alert · gated by quiet mode"| CLIENT
 
@@ -450,11 +449,27 @@ main screen.
 
 `.env` keys: `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ALPACA_PAPER`, `ALPACA_AUTOPILOT`.
 
+The same key pair is also HAL's **only market-data source** — stock bars, option
+chains (with greeks and implied vol), expired-contract discovery for the
+backtester, the market clock, and both live WebSocket feeds. Two feed knobs,
+both defaulting to the free tier:
+
+| key | free default | paid alternative |
+| --- | --- | --- |
+| `ALPACA_STOCK_FEED` | `iex` — real-time IEX tape | `sip` — full consolidated tape |
+| `ALPACA_OPTION_FEED` | `indicative` — carries greeks + IV | `opra` — real-time NBBO, needs Algo Trader Plus ($99/mo) |
+
+Two limits worth knowing: historical stock bars are clamped to ~15 minutes ago
+(the free plan blocks recent SIP data, so live prices come from the snapshot
+endpoints instead), and **option history begins 2024-01-18**, which bounds how
+far back the backtester and optimizer can run. Run
+`python hal/cerebellum/probe.py` to see exactly what your keys are entitled to.
+
 ### Risk circuit breakers (portfolio-level safety)
 
 A second safety layer in front of **new entries** (exits/closes are never blocked —
 you can always de-risk). This is the runaway guard for autopilot: it caps the whole
-account over time, independent of any single trade's merits. Four checks, each
+account over time, independent of any single trade's merits. Six checks, each
 disabled by setting its `.env` value to `0`:
 
 - **Order-rate throttle** — at most N entries per rolling minute (`RISK_MAX_ORDERS_PER_MIN`).
@@ -464,13 +479,34 @@ disabled by setting its `.env` value to `0`:
   (`RISK_DAILY_LOSS_LIMIT_PCT`), it **latches**: new entries are blocked and
   autopilot drops back to confirm until you clear it. Resets automatically next
   trading day.
+- **Per-underlying cap** — exposure to any ONE underlying (`RISK_MAX_SYMBOL_EXPOSURE_PCT`),
+  so five strikes on the same name can't quietly become the whole book.
+- **Correlated-group cap** — exposure across a basket that moves together
+  (`RISK_MAX_GROUP_EXPOSURE_PCT`). SPY + QQQ + IWM is one bet wearing three
+  tickers; the count and gross checks above happily wave it through. Groups are
+  a small static map (`sensory.risk._CORRELATED_GROUPS`: broad-market ETFs,
+  semis, megacap tech) rather than a live correlation matrix — no data to fetch,
+  nothing to go stale mid-session, auditable by eye.
+
+The three exposure ceilings **scale down in a volatile tape**: HAL reads where the
+underlying's realized vol sits in its own trailing-year distribution and tightens
+the limits to x0.75 above the 60th percentile and x0.5 above the 80th. The same
+dollar exposure is a bigger bet when the tape is wild. A failed vol read leaves
+the base limits untouched rather than guessing.
 
 The HUD's **RISK** badge shows **ARMED**, and flips to a clickable **HALTED** when
 the kill switch trips (click → confirm → cleared). You can also say **"are we
 halted?"** / **"reset the kill switch."**
 
+Every gate verdict — allowed *and* blocked, from both this engine and the vault
+rules gate — is written to a **`decisions` table**, so "why didn't HAL take that
+trade?" has an answer after the fact. `broker_orders` records what was submitted;
+`decisions` records what was considered and refused.
+
 `.env` keys: `RISK_MAX_ORDERS_PER_MIN`, `RISK_MAX_OPEN_POSITIONS`,
-`RISK_MAX_GROSS_EXPOSURE_PCT`, `RISK_DAILY_LOSS_LIMIT_PCT` (see `.env.example` for defaults).
+`RISK_MAX_GROSS_EXPOSURE_PCT`, `RISK_DAILY_LOSS_LIMIT_PCT`,
+`RISK_MAX_SYMBOL_EXPOSURE_PCT`, `RISK_MAX_GROUP_EXPOSURE_PCT`
+(see `.env.example` for defaults).
 
 ### Pre-earnings IV-crush screener (automatic)
 
@@ -500,6 +536,26 @@ Direct requests still work — quiet only suppresses what HAL starts on its own.
 
 Or use the **QUIET** button in the HUD (bell-with-slash, glows amber when engaged).
 Voice and button stay in sync, so a spoken toggle updates the button and vice-versa.
+
+### `wont_trade` — conditions, not keywords
+
+The `wont_trade` list in `Rules/trading-rules.md` holds two kinds of entry:
+
+- **Conditions about the world** — `earnings-week` and `price-under-N` are
+  judged against live facts, not against the strategy's name. The order path
+  fetches the underlying's last price and how soon it reports, and passes them
+  to the gate. `earnings-week` blocks anything reporting within **7 days**
+  (deliberately wider than the 3-day IV-crush *screener*: a won't-trade rule
+  should err toward blocking, an alert toward noticing).
+- **Plain keywords** — anything else is matched against the strategy label and
+  symbol, in both hyphenated and spaced spelling.
+
+Two deliberate limits. If the calendar or the quote can't be fetched the check
+is **skipped, not failed** — Nasdaq's feed is keyless and does go down, and
+halting all trading on a fetch hiccup is the worse outcome (the skip is visible
+in the `decisions` ledger). And the condition blockers apply to **opening**
+orders only: a rule saying "don't trade earnings week" must never stop you
+closing a position during one.
 
 ### Strategy playbooks (vault `Strategy/` folder)
 
@@ -607,6 +663,28 @@ live trader uses** (`stop_loss_pct` / `take_profit_pct` in `Rules/trading-rules.
 so a backtest validates the exit policy you actually run. Edit those percentages and
 both the backtest and live brackets move together.
 
+**Fill realism.** A backtest is a hypothesis, and the fastest way to make a bad
+one look good is a generous fill. Three assumptions keep it honest:
+
+- **Slippage on both sides.** Entry pays up, exit receives less, by the vault's
+  `limit_buffer_pct` — the same distance through the market the live trader is
+  already willing to pay. Filling at the bar close with no spread is the single
+  most optimistic thing an options backtest can do; measured live spreads on
+  *liquid* SPY contracts run 0.4–5% of mid.
+- **Exits judged on the bar's high/low, not its close.** A bar that traded
+  through the stop intraday exits there. Stop is checked before take-profit —
+  when one bar's range spans both, the sequence within the day is unknowable, so
+  the loss is assumed. A bar that *opens* beyond the stop gapped through it and
+  fills at the open, not the unreachable stop price.
+- **Same liquidity floor as live.** Contract selection skips anything under
+  `MIN_CONTRACT_OI`, matching the live screener's `min_oi`. Without it the
+  backtest earns its edge on inventory the running system would refuse to buy.
+
+There is no historical option bid/ask to replay (Alpaca serves option trades and
+bars; `/v1beta1/options/quotes` does not exist), which is why slippage is
+modelled rather than reconstructed. Expect these to make results **worse** — that
+is the point.
+
 ### Strategy optimizer (parameter sweep + walk-forward)
 
 Where a backtest runs **one** fixed configuration, the optimizer **sweeps** the
@@ -636,7 +714,7 @@ repeat live:
   agent below, which is only as trustworthy as the number it maximizes.
 
 The sweep is **API-frugal**: contract discovery and option-bar fetches (the expensive
-Massive calls) are cached and shared across every combination, so a ~100-config sweep
+Alpaca calls) are cached and shared across every combination, so a ~100-config sweep
 costs roughly one backtest's worth of API, not a hundred. The winning config's equity
 curve is pushed to the **strategy backtest panel** so the leaderboard has a picture to
 go with the verdict. An optional, explicitly-gated LLM review of the tearsheet
@@ -691,7 +769,7 @@ Three things keep an LLM-driven search honest:
   overfit itself → verdict is *do not trade*.
 
 Gated behind `confirm_llm_usage` and bounded by `max_rounds` (cost = at most that many
-smart-model calls; the Massive sweep is shared across rounds via persistent caches). It
+smart-model calls; the Alpaca sweep is shared across rounds via persistent caches). It
 produces a research artifact and at most **one** candidate flagged for paper-forward —
 it never wires a trigger and never places a trade.
 

@@ -1,17 +1,32 @@
 """Real-time market data subscriptions and alert delivery for HAL.
 
-Owns a single outbound WebSocket connection to Massive's options
-feed (wss://socket.massive.com/options). Reads ws_subscriptions and
-alert_rules from the same SQLite DB the conversation history lives in
-(see server._init_db), evaluates rules in-process as ticks arrive,
-and pushes fired alerts to active voice sessions via ClientRegistry.
+Owns outbound WebSocket connections to Alpaca's streams. Reads
+ws_subscriptions and alert_rules from the same SQLite DB the conversation
+history lives in (see server._init_db), evaluates rules in-process as ticks
+arrive, and pushes fired alerts to active voice sessions via ClientRegistry.
 
-Connection model: Polygon-style — one socket, JSON action messages.
-Auth: {"action":"auth","params":"<key>"}. Subscribe params are
-comma-separated topics of form "<channel>.<symbol>" where channel is
-T (trades), Q (quotes), A (per-second aggregates), AM (per-minute
-aggregates), or FMV (fair market value), and symbol can be '*',
-'O:UNDERLYING*', or a specific 'O:SPY261219C00500000'.
+Alpaca splits stocks and options across two sockets, so the manager runs one
+_AlpacaStream per venue and routes each subscription by symbol shape (an OCC
+symbol like SPY261219C00500000 is an option, anything else is a stock). That
+is a real gain over the old options-only feed, which never ticked underlyings
+at all — price rules on a plain ticker are now driven by live trades rather
+than only by the Yahoo poller's 15-second snapshots.
+
+Wire protocol (both venues):
+  auth        {"action":"auth","key":...,"secret":...}
+  subscribe   {"action":"subscribe","trades":[...],"quotes":[...],"bars":[...]}
+  data        [{"T":"t","S":"SPY","p":...}, ...]   T=type, S=symbol
+The two venues do NOT use the same encoding: the stock stream speaks JSON text
+frames while the options stream speaks MessagePack binary frames (sending it
+JSON returns {"T":"error","msg":"invalid syntax"}). Each connection detects the
+codec from the server's greeting rather than assuming, so either venue can
+switch without breaking the other.
+
+Messages are normalized to the internal {"ev","sym",...} shape before dispatch
+so evaluate_rule, the stored alert payloads and the UI stay unchanged.
+
+Free-tier caveats: stock quotes/trades are the IEX tape (not full SIP), and
+options run on the "indicative" feed; real-time OPRA is a paid upgrade.
 """
 from __future__ import annotations
 
@@ -23,6 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
+import msgpack
 from websockets.asyncio.client import connect as ws_connect
 from websockets.exceptions import ConnectionClosed
 
@@ -30,14 +46,29 @@ from websockets.exceptions import ConnectionClosed
 # Filled by server.configure_market() at boot; avoids a circular import.
 DB_PATH: Optional[Path] = None
 API_KEY: str = ""
-FEED_HOST = "socket.massive.com"
-MARKET_PATH = "options"
+SECRET_KEY: str = ""
+STREAM_HOST = "stream.data.alpaca.markets"
+# Stock feed: "iex" is the free real-time tape; "sip" needs a paid plan.
+STOCK_PATH = "v2/iex"
+# Option feed: "indicative" is free; "opra" needs the paid Algo Trader Plus plan.
+OPTION_PATH = "v1beta1/indicative"
 
 
-def configure(db_path: Path, api_key: str) -> None:
-    global DB_PATH, API_KEY
+def configure(
+    db_path: Path,
+    api_key: str,
+    secret_key: str,
+    stock_feed: str = "iex",
+    option_feed: str = "indicative",
+) -> None:
+    global DB_PATH, API_KEY, SECRET_KEY, STOCK_PATH, OPTION_PATH
     DB_PATH = db_path
     API_KEY = api_key
+    SECRET_KEY = secret_key
+    STOCK_PATH = f"v2/{stock_feed if stock_feed in ('iex', 'sip') else 'iex'}"
+    OPTION_PATH = (
+        f"v1beta1/{option_feed if option_feed in ('indicative', 'opra') else 'indicative'}"
+    )
 
 
 # --- DB helpers ------------------------------------------------------------
@@ -182,8 +213,20 @@ def list_unspoken_alerts(limit: int = 20) -> list[dict]:
 
 # --- Rule evaluation -------------------------------------------------------
 
-VALID_CHANNELS = {"T", "Q", "A", "AM", "FMV"}
+# Channels HAL will accept for a NEW subscription. Alpaca streams trades,
+# quotes and minute bars; it has no per-second aggregate or fair-market-value
+# channel, so the old "A" and "FMV" are no longer offered. Rows already in the
+# DB using them still work — _STREAM_KEYS maps them onto minute bars rather
+# than letting them go silently dead.
+VALID_CHANNELS = {"T", "Q", "AM"}
 VALID_RULE_TYPES = {"pct_move", "price_cross", "volume"}
+
+# Internal channel -> Alpaca subscribe key.
+_STREAM_KEYS = {"T": "trades", "Q": "quotes", "AM": "bars", "A": "bars", "FMV": "bars"}
+
+# Alpaca message type -> internal channel. 'b' is a minute bar, which is what
+# both AM and the legacy A/FMV rows resolve to.
+_MSG_CHANNELS = {"t": "T", "q": "Q", "b": "AM"}
 
 
 @dataclass
@@ -215,13 +258,51 @@ def _msg_price(msg: dict) -> Optional[float]:
 
 
 def _symbol_matches(pattern: str, symbol: str) -> bool:
-    """Massive subscribe wildcards: '*' = all, 'O:SPY*' = all SPY options,
-    or exact match."""
+    """Local matching for a stored subscription pattern: '*' = all, 'SPY*' =
+    every symbol with that root, or an exact match. Patterns are normalized on
+    both sides so a legacy 'O:SPY*' row still matches Alpaca's bare symbols."""
+    pattern, symbol = _bare(pattern), _bare(symbol)
     if pattern == "*" or pattern == symbol:
         return True
     if pattern.endswith("*"):
         return symbol.startswith(pattern[:-1])
     return False
+
+
+def _bare(symbol: str) -> str:
+    """Strip the legacy Polygon/Massive 'O:' option prefix. Subscriptions
+    created before the Alpaca migration still carry it."""
+    s = (symbol or "").strip().upper()
+    return s[2:] if s.startswith("O:") else s
+
+
+def _is_option(symbol: str) -> bool:
+    """True for an OCC contract symbol (root + YYMMDD + C/P + 8-digit strike).
+    Decides which of the two Alpaca sockets a subscription belongs on."""
+    s = _bare(symbol).rstrip("*")
+    if len(s) < 16:
+        return False
+    tail = s[-15:]
+    return tail[0:6].isdigit() and tail[6] in ("C", "P") and tail[7:15].isdigit()
+
+
+def _normalize(msg: dict) -> Optional[dict]:
+    """Alpaca stream message -> the internal {"ev","sym",...} shape the rule
+    engine, stored payloads and UI already speak. None for non-data frames."""
+    ev = _MSG_CHANNELS.get(msg.get("T", ""))
+    if ev is None:
+        return None
+    out: dict[str, Any] = {"ev": ev, "sym": msg.get("S", "")}
+    if ev == "T":
+        out["p"], out["s"] = msg.get("p"), msg.get("s")
+    elif ev == "Q":
+        out["bp"], out["ap"] = msg.get("bp"), msg.get("ap")
+        out["bs"], out["as"] = msg.get("bs"), msg.get("as")
+    else:  # minute bar
+        out["o"], out["h"] = msg.get("o"), msg.get("h")
+        out["l"], out["c"] = msg.get("l"), msg.get("c")
+        out["v"] = msg.get("v")
+    return out
 
 
 def evaluate_rule(state: RuleState, msg: dict) -> Optional[str]:
@@ -379,32 +460,64 @@ def is_futures() -> bool:
 
 # --- Subscription manager --------------------------------------------------
 
-class SubscriptionManager:
-    def __init__(self) -> None:
+class _AlpacaStream:
+    """One authenticated Alpaca WebSocket, reconnecting with backoff.
+
+    Holds no rule state — it owns the socket and the set of live topics, and
+    hands every normalized data message to the manager's dispatch callback.
+    Two of these run at once (stocks and options) because Alpaca serves the
+    two venues from separate endpoints.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        path: str,
+        desired: Callable[[], dict[str, set[str]]],
+        dispatch: Callable[[dict], Awaitable[None]],
+        binary: bool = False,
+    ) -> None:
+        self._name = name
+        self._path = path
+        self._desired = desired
+        self._dispatch = dispatch
+        # Encoding this venue is expected to use; corrected from the greeting
+        # frame on every connect, so a server-side change can't strand us.
+        self._binary = binary
         self._ws: Any = None
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
-        self._sub_dirty = asyncio.Event()
-        self._live_topics: set[str] = set()
-        self._rule_states: dict[int, RuleState] = {}
-        self._authed = False
+        self._dirty = asyncio.Event()
+        self._live: dict[str, set[str]] = {}
+        self.authed = False
+
+    def _encode(self, obj: dict) -> Any:
+        return msgpack.packb(obj) if self._binary else json.dumps(obj)
+
+    def _decode(self, raw: Any) -> list[dict]:
+        """Frame -> list of messages, whichever codec the peer is using."""
+        try:
+            msgs = msgpack.unpackb(raw, raw=False) if isinstance(raw, (bytes, bytearray)) \
+                else json.loads(raw)
+        except Exception:
+            return []
+        if isinstance(msgs, dict):
+            return [msgs]
+        return [m for m in msgs if isinstance(m, dict)] if isinstance(msgs, list) else []
 
     @property
     def url(self) -> str:
-        return f"wss://{FEED_HOST}/{MARKET_PATH}"
+        return f"wss://{STREAM_HOST}/{self._path}"
 
     async def start(self) -> None:
         if self._task and not self._task.done():
             return
-        if not API_KEY:
-            print("[market] no MASSIVE_API_KEY; SubscriptionManager disabled")
-            return
         self._stop.clear()
-        self._task = asyncio.create_task(self._run(), name="market-ws")
+        self._task = asyncio.create_task(self._run(), name=f"market-ws-{self._name}")
 
     async def stop(self) -> None:
         self._stop.set()
-        self._sub_dirty.set()
+        self._dirty.set()
         if self._ws is not None:
             try:
                 await self._ws.close()
@@ -416,11 +529,192 @@ class SubscriptionManager:
             except (asyncio.TimeoutError, Exception):
                 pass
 
+    def mark_dirty(self) -> None:
+        self._dirty.set()
+
+    async def _authenticate(self, ws: Any) -> bool:
+        """Alpaca greets with [{"T":"success","msg":"connected"}], then expects
+        an auth frame and answers [{"T":"success","msg":"authenticated"}].
+        The greeting also reveals the codec: a binary frame means MessagePack,
+        and replying in the wrong one earns 'invalid syntax'."""
+        try:
+            hello = await asyncio.wait_for(ws.recv(), timeout=10)
+            self._binary = isinstance(hello, (bytes, bytearray))
+            print(f"[market:{self._name}] hello ({'msgpack' if self._binary else 'json'}): "
+                  f"{self._decode(hello)}")
+        except asyncio.TimeoutError:
+            print(f"[market:{self._name}] no hello; assuming "
+                  f"{'msgpack' if self._binary else 'json'}")
+        await ws.send(self._encode(
+            {"action": "auth", "key": API_KEY, "secret": SECRET_KEY}))
+        try:
+            resp = await asyncio.wait_for(ws.recv(), timeout=10)
+        except asyncio.TimeoutError:
+            print(f"[market:{self._name}] auth timeout")
+            return False
+        msgs = self._decode(resp)
+        print(f"[market:{self._name}] auth resp: {msgs}")
+        for m in msgs:
+            if m.get("T") == "error":
+                # A bad key or an already-connected session is permanent —
+                # reconnecting in a loop would just hammer Alpaca.
+                print(f"[market:{self._name}] auth FAILED: {m.get('msg')}")
+                self._stop.set()
+                return False
+            if m.get("T") == "success" and m.get("msg") == "authenticated":
+                return True
+        return False
+
+    async def _run(self) -> None:
+        backoff = 1.0
+        while not self._stop.is_set():
+            try:
+                async with ws_connect(self.url, max_size=8 * 1024 * 1024) as ws:
+                    self._ws = ws
+                    self.authed = False
+                    backoff = 1.0
+                    print(f"[market:{self._name}] connected {self.url}")
+                    if not await self._authenticate(ws):
+                        raise ConnectionClosed(None, None)
+                    self.authed = True
+                    self._live = {}
+                    await self._sync()
+                    while not self._stop.is_set():
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                        except asyncio.TimeoutError:
+                            if self._dirty.is_set():
+                                self._dirty.clear()
+                                await self._sync()
+                            continue
+                        for m in self._decode(raw):
+                            kind = m.get("T")
+                            if kind == "subscription":
+                                self._apply_subscription(m)
+                                continue
+                            if kind == "success":
+                                continue
+                            if kind == "error":
+                                print(f"[market:{self._name}] error: {m.get('msg')}")
+                                continue
+                            norm = _normalize(m)
+                            if norm is not None:
+                                await self._dispatch(norm)
+                        if self._dirty.is_set():
+                            self._dirty.clear()
+                            await self._sync()
+            except (ConnectionClosed, OSError) as e:
+                print(f"[market:{self._name}] connection lost: {e}; "
+                      f"reconnecting in {backoff:.1f}s")
+            except Exception as e:
+                print(f"[market:{self._name}] unexpected error: {e}; "
+                      f"reconnecting in {backoff:.1f}s")
+            finally:
+                self._ws = None
+                self.authed = False
+                self._live = {}
+            if self._stop.is_set():
+                break
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=backoff)
+            except asyncio.TimeoutError:
+                pass
+            backoff = min(backoff * 2, 30.0)
+        print(f"[market:{self._name}] stopped")
+
+    def _apply_subscription(self, msg: dict) -> None:
+        """Record what Alpaca says is actually subscribed.
+
+        The server answers every subscribe/unsubscribe with the full live set,
+        which is the ONLY trustworthy source: a request can be partly or wholly
+        rejected (the free plan caps concurrent symbols and replies "symbol
+        limit exceeded"). Trusting our own request instead would mark a symbol
+        as streaming when it isn't — and the Yahoo poller skips streaming
+        symbols, so those alerts would go quietly dead.
+        """
+        live = {k: set(msg.get(k) or []) for k in _STREAM_KEYS.values() if msg.get(k)}
+        if live != self._live:
+            print(f"[market:{self._name}] live topics now: {live or '{}'}")
+        self._live = live
+
+    async def _sync(self) -> None:
+        """Diff desired vs live topics and send one subscribe/unsubscribe frame.
+        Alpaca groups symbols by channel, so each frame carries up to three
+        lists rather than the old comma-joined 'channel.symbol' string.
+
+        `_live` is deliberately NOT updated here — it's set from the server's
+        subscription confirmation (see _apply_subscription). Re-sending an
+        already-live subscribe before the confirmation lands is harmless.
+        """
+        if self._ws is None or not self.authed:
+            return
+        desired = self._desired()
+        add = {k: sorted(v - self._live.get(k, set()))
+               for k, v in desired.items()}
+        add = {k: v for k, v in add.items() if v}
+        drop = {k: sorted(v - desired.get(k, set()))
+                for k, v in self._live.items()}
+        drop = {k: v for k, v in drop.items() if v}
+        if add:
+            print(f"[market:{self._name}] subscribe: {add}")
+            await self._ws.send(self._encode({"action": "subscribe", **add}))
+        if drop:
+            print(f"[market:{self._name}] unsubscribe: {drop}")
+            await self._ws.send(self._encode({"action": "unsubscribe", **drop}))
+
+
+class SubscriptionManager:
+    """Owns both venue streams plus the shared rule state, and evaluates every
+    incoming tick against the rules whose channel and symbol pattern match."""
+
+    def __init__(self) -> None:
+        self._rule_states: dict[int, RuleState] = {}
+        self._stocks = _AlpacaStream(
+            "stocks", STOCK_PATH, lambda: self._topics(options=False), self._dispatch,
+            binary=False)
+        self._options = _AlpacaStream(
+            "options", OPTION_PATH, lambda: self._topics(options=True), self._dispatch,
+            binary=True)
+
+    @property
+    def url(self) -> str:
+        return f"{self._stocks.url} + {self._options.url}"
+
+    @property
+    def _authed(self) -> bool:
+        """True if either venue is live — tool_list_subscriptions reports it."""
+        return self._stocks.authed or self._options.authed
+
+    def live_symbols(self) -> set[str]:
+        """Symbols currently streaming, so the Yahoo poller can skip them and
+        avoid double-firing a rule that the WS already drives."""
+        out: set[str] = set()
+        for stream in (self._stocks, self._options):
+            if stream.authed:
+                for syms in stream._live.values():
+                    out |= syms
+        return out
+
+    async def start(self) -> None:
+        if not (API_KEY and SECRET_KEY):
+            print("[market] no Alpaca keys; SubscriptionManager disabled")
+            return
+        # Paths are resolved at configure() time, after this object was built.
+        self._stocks._path, self._options._path = STOCK_PATH, OPTION_PATH
+        self._reload_rule_states()
+        await self._stocks.start()
+        await self._options.start()
+
+    async def stop(self) -> None:
+        await self._stocks.stop()
+        await self._options.stop()
+
     def request_resync(self) -> None:
         """Called by HAL tools after DB mutation; triggers diff+update on
         the next loop iteration. Also reloads in-memory rule states."""
         self._reload_rule_states()
-        self._sub_dirty.set()
+        self._stocks.mark_dirty()
+        self._options.mark_dirty()
 
     def _reload_rule_states(self) -> None:
         new_states: dict[int, RuleState] = {}
@@ -445,115 +739,38 @@ class SubscriptionManager:
                 )
         self._rule_states = new_states
 
-    def _desired_topics(self) -> set[str]:
-        return {f"{s['channel']}.{s['symbol']}" for s in list_subscriptions_db()}
+    def _topics(self, options: bool) -> dict[str, set[str]]:
+        """Subscriptions for one venue, grouped by Alpaca channel key.
 
-    async def _run(self) -> None:
-        backoff = 1.0
-        while not self._stop.is_set():
-            try:
-                async with ws_connect(self.url, max_size=8 * 1024 * 1024) as ws:
-                    self._ws = ws
-                    self._authed = False
-                    backoff = 1.0
-                    print(f"[market] connected {self.url}")
-                    try:
-                        hello = await asyncio.wait_for(ws.recv(), timeout=10)
-                        print(f"[market] hello: {hello!r}")
-                    except asyncio.TimeoutError:
-                        print("[market] no hello; continuing")
-                    await ws.send(json.dumps({"action": "auth", "params": API_KEY}))
-                    try:
-                        auth_resp = await asyncio.wait_for(ws.recv(), timeout=10)
-                    except asyncio.TimeoutError:
-                        print("[market] auth timeout")
-                        raise ConnectionClosed(None, None)
-                    print(f"[market] auth resp: {auth_resp!r}")
-                    try:
-                        parsed = json.loads(auth_resp)
-                        if isinstance(parsed, list) and parsed:
-                            status = parsed[0].get("status")
-                            if status == "auth_failed":
-                                print(
-                                    f"[market] auth FAILED: "
-                                    f"{parsed[0].get('message')}"
-                                )
-                                self._stop.set()
-                                break
-                    except json.JSONDecodeError:
-                        pass
-                    self._authed = True
-                    self._reload_rule_states()
-                    self._live_topics = set()
-                    await self._sync_subscriptions()
-                    while not self._stop.is_set():
-                        try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
-                        except asyncio.TimeoutError:
-                            if self._sub_dirty.is_set():
-                                self._sub_dirty.clear()
-                                await self._sync_subscriptions()
-                            continue
-                        try:
-                            msgs = json.loads(raw)
-                        except json.JSONDecodeError:
-                            continue
-                        if not isinstance(msgs, list):
-                            continue
-                        for m in msgs:
-                            if m.get("ev") == "status":
-                                print(f"[market] status: {m.get('message')}")
-                                continue
-                            await self._dispatch(m)
-                        if self._sub_dirty.is_set():
-                            self._sub_dirty.clear()
-                            await self._sync_subscriptions()
-            except (ConnectionClosed, OSError) as e:
-                print(
-                    f"[market] connection lost: {e}; reconnecting in {backoff:.1f}s"
-                )
-            except Exception as e:
-                print(
-                    f"[market] unexpected error: {e}; reconnecting in {backoff:.1f}s"
-                )
-            finally:
-                self._ws = None
-                self._authed = False
-                self._live_topics = set()
-            if self._stop.is_set():
-                break
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=backoff)
-            except asyncio.TimeoutError:
-                pass
-            backoff = min(backoff * 2, 30.0)
-        print("[market] manager stopped")
-
-    async def _sync_subscriptions(self) -> None:
-        if self._ws is None or not self._authed:
-            return
-        desired = self._desired_topics()
-        to_add = desired - self._live_topics
-        to_remove = self._live_topics - desired
-        if to_add:
-            params = ",".join(sorted(to_add))
-            print(f"[market] subscribe: {params}")
-            await self._ws.send(
-                json.dumps({"action": "subscribe", "params": params})
-            )
-        if to_remove:
-            params = ",".join(sorted(to_remove))
-            print(f"[market] unsubscribe: {params}")
-            await self._ws.send(
-                json.dumps({"action": "unsubscribe", "params": params})
-            )
-        self._live_topics = desired
+        Alpaca has no prefix wildcard, so a stored 'SPY*' pattern cannot be put
+        on the wire. The bare '*' exists but the free plan rejects it with
+        "symbol limit exceeded" (there is a cap on concurrent symbols), so it
+        is dropped too. Both are skipped with a warning rather than silently
+        failing — local matching in _symbol_matches still applies to whatever
+        does arrive from the explicit subscriptions.
+        """
+        topics: dict[str, set[str]] = {}
+        for sub in list_subscriptions_db():
+            symbol = _bare(sub["symbol"])
+            if _is_option(symbol) != options:
+                continue
+            key = _STREAM_KEYS.get(sub["channel"])
+            if key is None:
+                continue
+            if symbol.endswith("*"):
+                print(f"[market] '{sub['symbol']}' skipped: Alpaca has no prefix "
+                      f"wildcard and rejects '*' on this plan — name symbols explicitly")
+                continue
+            topics.setdefault(key, set()).add(symbol)
+        return topics
 
     async def _dispatch(self, msg: dict) -> None:
         ev = msg.get("ev", "")
         sym = msg.get("sym", "")
         for state in list(self._rule_states.values()):
-            if state.channel != ev:
+            # Legacy A/FMV rows resolve to minute bars on the wire, so they
+            # must match the AM messages those subscriptions now produce.
+            if _STREAM_KEYS.get(state.channel) != _STREAM_KEYS.get(ev):
                 continue
             if not _symbol_matches(state.symbol_pattern, sym):
                 continue
@@ -579,11 +796,15 @@ manager = SubscriptionManager()
 
 
 # --- Yahoo price-alert poller ----------------------------------------------
-# The live WS feed (FEED_HOST/options) only ticks options contracts, so the
-# SubscriptionManager above never fires price_cross / pct_move rules on an
-# underlying stock. This poller fills that gap: every POLL_SECONDS during
-# regular hours it pulls each rule's symbol price from Yahoo and runs the very
-# same evaluate_rule + record_alert + clients.broadcast path the WS uses.
+# A safety net beneath the WS streams: every POLL_SECONDS during regular hours
+# it pulls each rule's symbol price from Yahoo and runs the very same
+# evaluate_rule + record_alert + clients.broadcast path the WS uses.
+#
+# Alpaca's stock stream now covers underlyings directly, so this only handles
+# symbols the WS is NOT currently streaming — a symbol served by both would
+# otherwise fire the same rule twice, from two different prices. It still
+# earns its keep: it covers rules whose subscription is a wildcard pattern
+# Alpaca can't express, and keeps alerts alive if a stream is down.
 
 class YahooAlertPoller:
     def __init__(self, poll_seconds: float = 15.0) -> None:
@@ -629,6 +850,9 @@ class YahooAlertPoller:
         # Only price rules can be evaluated from a snapshot price; volume rules
         # need per-trade size, which the poll can't provide.
         rules = [r for r in rules if r["rule_type"] in ("pct_move", "price_cross")]
+        # Skip anything the WS is already ticking, or the rule fires twice.
+        streaming = manager.live_symbols()
+        rules = [r for r in rules if _bare(r["symbol"]) not in streaming]
         if not rules:
             self._states.clear()
             return
