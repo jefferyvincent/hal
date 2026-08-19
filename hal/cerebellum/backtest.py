@@ -8,7 +8,7 @@ money. Design decisions (agreed with the user):
   support/resistance level, confirmed by RSI. It decides long-call vs long-put;
   it never picks the contract.
 - The contract is picked by moneyness + DTE (ATM, ~7 DTE weekly), NOT by delta
-  (Massive's Options Advanced plan returns no historical greeks).
+  (no provider gives historical greeks on expired contracts).
 - P&L comes from the CHOSEN CONTRACT's own historical bars, so real theta decay
   and implied-vol moves over the holding period are captured faithfully.
 - Each trade is tagged with the volatility regime at entry (realized-vol
@@ -17,9 +17,10 @@ money. Design decisions (agreed with the user):
 This is a historical simulation. Commissions/slippage are explicit assumptions,
 and it is NOT a substitute for forward paper-trading.
 
-Massive endpoints used:
-- /v2/aggs/ticker/{ticker}/range/1/day/{from}/{to}   underlying + option bars
-- /v3/reference/options/contracts                     contract discovery (expired=true)
+Data comes from Alpaca (sensory.alpaca_data): stock bars for the underlying,
+the contracts endpoint (status=inactive) for expired-contract discovery, and
+option bars for each chosen contract's P&L. Alpaca's OPRA history begins
+2024-01-18, so any requested window is clamped to that floor.
 """
 from __future__ import annotations
 
@@ -33,10 +34,8 @@ import httpx
 from hal.brainstem.config import USER_NAME
 from hal.cerebellum import strategy
 from hal.cerebellum.execution import SimBroker
+from hal.sensory import alpaca_data
 
-
-BASE_URL: str = ""
-API_KEY: str = ""
 
 # Strategy constants (named, not magic — see CLAUDE.md).
 RSI_PERIOD = 14
@@ -49,6 +48,10 @@ TARGET_DTE = 7             # aim for the nearest weekly
 DTE_MIN, DTE_MAX = 3, 12   # acceptable expiry window around TARGET_DTE
 CONTRACT_MULTIPLIER = 100  # shares per option contract
 COMMISSION_PER_CONTRACT = 0.65  # assumption, per leg per side
+# Open-interest floor for a contract the backtest is allowed to trade. Mirrors
+# the liquidity filter the live screener applies (analysis.screen_options'
+# min_oi) so both sides shop from the same universe — see pick_contract.
+MIN_CONTRACT_OI = 100
 VOL_LOOKBACK = 252         # trading days for the realized-vol percentile
 
 
@@ -77,17 +80,10 @@ class StrategyParams:
 DEFAULT_PARAMS = StrategyParams()
 
 
-def configure(base_url: str, api_key: str) -> None:
-    global BASE_URL, API_KEY
-    BASE_URL = base_url
-    API_KEY = api_key
-
-
-# Cash-settled index VALUE data (I:SPX etc.) isn't in the Massive plan (403),
-# but the index OPTIONS are (Options Advanced / OPRA). So for index roots we
-# pull the underlying daily bars from Yahoo Finance's free chart API (real
-# index level, drives the signal) and still use Massive for the option chain
-# and historical option bars. Map: our root -> Yahoo symbol.
+# Cash-settled index VALUE data (SPX etc.) isn't an Alpaca equity, so for index
+# roots we pull the underlying daily bars from Yahoo Finance's free chart API
+# (real index level, drives the signal) and still use Alpaca for the option
+# contracts and their historical bars. Map: our root -> Yahoo symbol.
 _INDEX_YAHOO = {
     "SPX": "^GSPC", "XSP": "^GSPC", "OEX": "^OEX",
     "NDX": "^NDX",
@@ -98,21 +94,21 @@ _INDEX_YAHOO = {
 
 _YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/"
 
-# Full-size index options that are too capital-heavy for a normal account get
-# substituted. XSP (the 1/10 mini) is account-sized but thinly traded, so its
-# backtests have too few trades to mean much; SPY (same S&P exposure, ~1/10 the
-# index level) is the most liquid proxy and gives dense, meaningful data plus a
-# real equity curve. So SPX -> SPY for backtests. (SPY uses Massive for both
-# underlying and options — no Yahoo needed.)
-_INDEX_MINI = {"SPX": "SPY"}
+# Index roots substituted by their liquid ETF proxy, for two reasons:
+#  - Capital size. Full-size index options are ~10x too large for a normal
+#    account. XSP (the 1/10 S&P mini) is account-sized but thinly traded, so its
+#    backtests have too few trades to mean much; SPY has the same exposure at
+#    ~1/10 the index level and gives dense data plus a real equity curve.
+#  - Coverage. Alpaca does not carry NDX or RUT options at all (the contracts
+#    endpoint 422s on those roots), so a backtest on them would return nothing.
+#    QQQ and IWM track the same indices and are the most liquid proxies.
+# The proxies are ETFs, so their underlying bars come from Alpaca — no Yahoo.
+_INDEX_MINI = {"SPX": "SPY", "NDX": "QQQ", "RUT": "IWM"}
 
-# Default set for the "backtest the indexes" comparison sweep. SPX routes to
-# SPY above; NDX/RUT/DJX use their real index value from Yahoo + index options.
+# Default set for the "backtest the indexes" comparison sweep. SPX/NDX/RUT route
+# to their ETF proxies above; DJX is carried by Alpaca directly and uses its real
+# index value from Yahoo for the signal.
 INDEX_SWEEP_SET = ["SPX", "NDX", "RUT", "DJX"]
-
-
-def _headers() -> dict[str, str]:
-    return {"Authorization": f"Bearer {API_KEY}"}
 
 
 # --- indicators ------------------------------------------------------------
@@ -263,31 +259,23 @@ def generate_signals(bars: list[dict], params: StrategyParams = DEFAULT_PARAMS) 
 
 # --- data fetch ------------------------------------------------------------
 
-async def _get(client: httpx.AsyncClient, path: str, params: dict) -> dict:
-    r = await client.get(BASE_URL + path, headers=_headers(), params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-
 async def fetch_daily(client: httpx.AsyncClient, ticker: str, frm: str, to: str) -> list[dict]:
-    """Daily OHLC bars for any ticker (underlying or option). Times -> unix s."""
-    body = await _get(
-        client,
-        f"/v2/aggs/ticker/{ticker}/range/1/day/{frm}/{to}",
-        {"adjusted": "true", "sort": "asc", "limit": 50000},
-    )
-    out = []
-    for b in body.get("results") or []:
-        out.append({
-            "t": int(b["t"]) // 1000,
-            "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"], "v": b.get("v", 0),
-        })
-    return out
+    """Daily OHLC bars for a stock/ETF underlying. Times are unix seconds."""
+    return await alpaca_data.stock_bars(ticker, "1Day", start=frm, end=to, client=client)
+
+
+async def fetch_option_daily(
+    client: httpx.AsyncClient, occ_symbol: str, frm: str, to: str
+) -> list[dict]:
+    """Daily OHLC bars for ONE option contract. Separate from fetch_daily because
+    Alpaca serves stocks and options from different endpoints. Times are unix
+    seconds; a window before OPTION_HISTORY_START comes back empty."""
+    return await alpaca_data.option_bars(occ_symbol, "1Day", start=frm, end=to, client=client)
 
 
 async def fetch_yahoo_daily(client: httpx.AsyncClient, yahoo_sym: str, frm: str, to: str) -> list[dict]:
     """Daily OHLC bars for an index from Yahoo Finance's free chart API. Used
-    for index underlyings whose value feed isn't in the Massive plan. Times are
+    for index roots, whose spot level Alpaca doesn't serve as an equity. Times are
     already unix seconds. A User-Agent is required or Yahoo returns 429."""
     p1 = int(datetime.combine(date.fromisoformat(frm), datetime.min.time()).timestamp())
     p2 = int(datetime.combine(date.fromisoformat(to), datetime.min.time()).timestamp())
@@ -322,26 +310,36 @@ async def pick_contract(
 ) -> Optional[dict]:
     """Find the ATM contract nearest params.target_dte on/after `entry`.
 
-    Lists expired contracts whose expiration falls in the DTE window, then
-    picks the one with strike closest to spot and DTE closest to target_dte.
+    Lists the contracts whose expiration falls in the DTE window, then picks
+    the one with strike closest to spot and DTE closest to target_dte.
     Returns {ticker, strike, expiration, dte} or None.
+
+    Alpaca splits the contract universe by status: expired contracts are
+    'inactive'. A backtest window that runs up to today has live contracts at
+    its tail, so an empty expired result falls through to the active universe.
+
+    Contracts below MIN_CONTRACT_OI are skipped. Without that filter the
+    backtest happily trades contracts the LIVE screener would refuse
+    (analysis.screen_options filters on min_oi), which is train/serve skew: it
+    reports an edge earned on inventory the running system would never buy.
+    If the filter leaves nothing, it is relaxed rather than dropping the signal.
     """
     lo = (entry + timedelta(days=params.dte_min)).isoformat()
     hi = (entry + timedelta(days=params.dte_max)).isoformat()
-    body = await _get(client, "/v3/reference/options/contracts", {
-        "underlying_ticker": underlying,
-        "contract_type": side,
-        "expiration_date.gte": lo,
-        "expiration_date.lte": hi,
-        "expired": "true",
-        "limit": 1000,
-    })
-    rows = body.get("results") or []
+    rows = await alpaca_data.option_contracts(
+        underlying, side=side, expiration_gte=lo, expiration_lte=hi,
+        expired=True, client=client)
+    if not rows:
+        rows = await alpaca_data.option_contracts(
+            underlying, side=side, expiration_gte=lo, expiration_lte=hi,
+            expired=False, client=client)
+    liquid = [c for c in rows if (c.get("oi") or 0) >= MIN_CONTRACT_OI]
+    rows = liquid or rows
     best = None
     best_key = None
     for c in rows:
-        strike = c.get("strike_price")
-        exp = c.get("expiration_date")
+        strike = c.get("strike")
+        exp = c.get("expiration")
         tk = c.get("ticker")
         if strike is None or not exp or not tk:
             continue
@@ -367,6 +365,33 @@ def _entry_premium(bar: dict) -> Optional[float]:
     return c if c and c > 0 else None
 
 
+def slippage_pct(rules: Optional[dict] = None) -> float:
+    """Premium given up on EACH side of a round trip, as a percent.
+
+    There is no historical option bid/ask to fill against (Alpaca serves option
+    trades and bars, but /v1beta1/options/quotes does not exist), so the spread
+    has to be modelled rather than replayed. The vault's `limit_buffer_pct` is
+    the right number to model it with: it is how far through the market the LIVE
+    trader is willing to pay, so using it here makes the backtest assume the same
+    execution cost the live path actually accepts.
+
+    Filling at the bar close — with no spread at all — is the single most
+    optimistic assumption a options backtest can make. Measured live spreads on
+    liquid SPY contracts run 0.4-5% of mid, so this is not a rounding error.
+    """
+    if rules is None:
+        from hal.cortex import rules as rules_mod
+        rules = rules_mod.load_rules()
+    return float(rules.get("limit_buffer_pct", 2.0))
+
+
+def _fill(price: float, side: str, slip_pct: float) -> float:
+    """Apply slippage in the direction that HURTS: pay up to buy, receive less
+    to sell. Never returns a non-positive premium."""
+    factor = (1 + slip_pct / 100.0) if side == "buy" else (1 - slip_pct / 100.0)
+    return max(price * factor, 0.01)
+
+
 def simulate_trade(
     side: str, opt_bars: list[dict], next_opp_index_date: Optional[str],
     symbol: str = "OPT", sim: Optional[SimBroker] = None,
@@ -374,12 +399,25 @@ def simulate_trade(
 ) -> Optional[dict]:
     """Walk an option's daily bars from entry to exit.
 
-    Entry = first bar's close. Exit, in priority order each subsequent bar:
-      1) take-profit / 2) stop-loss at the vault-configured premium levels
+    Entry = first bar's close, plus slippage. Exit, in priority order each
+    subsequent bar:
+      1) stop-loss / 2) take-profit at the vault-configured premium levels
          (strategy.exit_levels — same policy the live trader runs; pass a loaded
          `rules` dict to avoid re-reading the vault per trade)
       3) opposite signal date reached (caller passes it; handled upstream)
       4) last available bar (expiry week)
+
+    Exits are judged on the bar's LOW (stop) and HIGH (take-profit), not its
+    close: a bar that traded through the stop intraday exits there, which
+    close-only checking misses entirely. Both are still decided by
+    strategy.exit_signal — called once per side, since a low can only ever
+    trigger a stop and a high can only ever trigger a take-profit — so the
+    backtest and the live bracket monitor keep sharing one exit rule.
+
+    Stop is checked before take-profit: when a single bar's range spans both
+    levels the sequence within the day is unknowable, so the loss is assumed.
+    A bar that OPENS beyond the stop gapped through it overnight and fills at
+    the open, not at the (unreachable) stop price.
 
     The entry and exit are constructed via the SAME broker.prepare_order used for
     live Alpaca orders and filled through the shared SimBroker (execution.py), so
@@ -391,21 +429,30 @@ def simulate_trade(
     bars = [b for b in opt_bars if _entry_premium(b) is not None]
     if len(bars) < 2:
         return None
-    entry = bars[0]["c"]
+    slip = slippage_pct(rules)
+    mark = bars[0]["c"]
+    entry = _fill(mark, "buy", slip)
     sl, tp = strategy.exit_levels(entry, rules)
-    exit_px = bars[-1]["c"]
+    exit_mark = bars[-1]["c"]
     exit_reason = "expiry"
     exit_t = bars[-1]["t"]
     for b in bars[1:]:
-        # Same exit rule the live bracket monitor runs (strategy.exit_signal).
-        kind = strategy.exit_signal(b["c"], sl, tp)
-        if kind == "take_profit":
-            exit_px, exit_reason, exit_t = tp, "take_profit", b["t"]
+        low = b.get("l") or b["c"]
+        high = b.get("h") or b["c"]
+        open_ = b.get("o") or b["c"]
+        # Same exit rule the live bracket monitor runs (strategy.exit_signal),
+        # asked once per side: the low can only trip the stop, the high only the
+        # take-profit. Passing 0 disables the other side.
+        if strategy.exit_signal(low, sl, 0) == "stop":
+            # Gapped through the stop overnight? Then the fill is the open.
+            exit_mark = min(open_, sl) if sl > 0 else open_
+            exit_reason, exit_t = "stop_loss", b["t"]
             break
-        if kind == "stop":
-            exit_px, exit_reason, exit_t = sl, "stop_loss", b["t"]
+        if strategy.exit_signal(high, 0, tp) == "take_profit":
+            exit_mark, exit_reason, exit_t = tp, "take_profit", b["t"]
             break
 
+    exit_px = _fill(exit_mark, "sell", slip)
     sim = sim or SimBroker(CONTRACT_MULTIPLIER, COMMISSION_PER_CONTRACT)
     realized_before = sim.realized_pnl
     # Build entry/exit via the shared OrderIntent → broker.prepare_order path,
@@ -424,6 +471,7 @@ def simulate_trade(
         "pnl": net,
         "pnl_pct": round((exit_px - entry) / entry, 4),
         "bars_held": len(bars),
+        "slippage_pct": slip,
     }
 
 
@@ -509,34 +557,39 @@ def split_by_regime(trades: list[dict]) -> dict:
 
 def _resolve_underlying(underlying: str) -> tuple[str, Optional[str], str]:
     """Map a requested root to the symbol actually traded, the Yahoo symbol for
-    its underlying value (None if Massive serves it), and a human-facing note
+    its underlying value (None if Alpaca serves it), and a human-facing note
     explaining any substitution. Pulled out of run_backtest so the optimizer
     resolves the symbol the same way."""
     underlying = underlying.upper().strip()
     note_parts: list[str] = []
-    # Account-size guard: full SPX options are ~10x too large for most accounts;
-    # substitute the 1/10-size mini (XSP) so picks aren't capital-heavy.
+    # Account-size / coverage guard: route full-size index roots to their liquid
+    # ETF proxy (see _INDEX_MINI) so picks aren't capital-heavy and the contracts
+    # actually exist on Alpaca.
     if underlying in _INDEX_MINI:
         sub = _INDEX_MINI[underlying]
         note_parts.append(f"{underlying} options are ~10x account size and thinly traded; backtested {sub} (same S&P exposure, far more liquid) instead.")
         underlying = sub
-    # Index roots: underlying value data isn't in the Massive plan (403), so
-    # pull the index level from Yahoo for the signal; option contracts still
-    # come from Massive under the bare root.
+    # Index roots: Alpaca has no equity bars for a cash-settled index level, so
+    # pull it from Yahoo for the signal; option contracts still come from Alpaca
+    # under the bare root.
     yahoo_sym = _INDEX_YAHOO.get(underlying)
     if yahoo_sym:
-        note_parts.append(f"Underlying from Yahoo ({yahoo_sym}); options from Massive.")
+        note_parts.append(f"Underlying from Yahoo ({yahoo_sym}); options from Alpaca.")
     return underlying, yahoo_sym, " ".join(note_parts)
 
 
 async def _fetch_underlying_bars(
     client: httpx.AsyncClient, underlying: str, yahoo_sym: Optional[str], months: int,
 ) -> list[dict]:
-    """Daily underlying bars for the signal — Yahoo for index values, else Massive.
+    """Daily underlying bars for the signal — Yahoo for index values, else Alpaca.
     Depends only on (symbol, months), so the optimizer fetches it ONCE and reuses
-    it across every parameter combo."""
+    it across every parameter combo. The window start is clamped to the first date
+    Alpaca has option bars for: signals before it could never be simulated, and
+    generating them would only inflate the "no contract" skip count."""
     to_d = date.today()
     frm_d = to_d - timedelta(days=int(months * 30.5))
+    if frm_d < alpaca_data.OPTION_HISTORY_START:
+        frm_d = alpaca_data.OPTION_HISTORY_START
     if yahoo_sym:
         return await fetch_yahoo_daily(client, yahoo_sym, frm_d.isoformat(), to_d.isoformat())
     return await fetch_daily(client, underlying, frm_d.isoformat(), to_d.isoformat())
@@ -585,7 +638,7 @@ async def simulate_signals(
         if optbar_cache is not None and okey in optbar_cache:
             opt_bars = optbar_cache[okey]
         else:
-            opt_bars = await fetch_daily(client, contract["ticker"], entry.isoformat(), contract["expiration"])
+            opt_bars = await fetch_option_daily(client, contract["ticker"], entry.isoformat(), contract["expiration"])
             if optbar_cache is not None:
                 optbar_cache[okey] = opt_bars
         trade = simulate_trade(sig["side"], opt_bars, None,
@@ -612,8 +665,8 @@ async def run_backtest(
     metrics. Returns a result dict (also carries an equity-curve payload for
     the UI). Raises RuntimeError on config/data problems. `params` defaults to
     the original fixed strategy; the optimizer passes swept variants."""
-    if not API_KEY:
-        raise RuntimeError("MASSIVE_API_KEY not configured")
+    if not alpaca_data.is_configured():
+        raise RuntimeError("ALPACA_API_KEY / ALPACA_SECRET_KEY not configured")
     underlying, yahoo_sym, proxy_note = _resolve_underlying(underlying)
 
     async with httpx.AsyncClient() as client:

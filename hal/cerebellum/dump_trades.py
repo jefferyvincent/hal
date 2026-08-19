@@ -7,19 +7,20 @@ import asyncio
 import sys
 
 from hal.cerebellum import backtest
+from hal.sensory import alpaca_data
 
 
-def key() -> str:
+def env(name: str) -> str:
     for line in open(".env"):
-        if line.startswith("MASSIVE_API_KEY"):
-            return line.split("=", 1)[1].strip()
+        if line.startswith(name + "="):
+            return line.split("=", 1)[1].strip().strip('"').strip("'")
     return ""
 
 
 async def main() -> None:
     ticker = sys.argv[1] if len(sys.argv) > 1 else "SPY"
     months = int(sys.argv[2]) if len(sys.argv) > 2 else 24
-    backtest.configure("https://api.massive.com", key())
+    alpaca_data.configure(env("ALPACA_API_KEY"), env("ALPACA_SECRET_KEY"))
     r = await backtest.run_backtest(ticker, months=months)
 
     trades = r["trades"]

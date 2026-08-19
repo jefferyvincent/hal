@@ -31,7 +31,7 @@ Design constraints this respects:
   · No server import (avoids the cortex<-server cycle); this module only reaches
     "down" into analysis / cerebellum / rules / rag.
   · Degrades gracefully — any analyst or the journal failing yields a neutral
-    read, never an exception, so a missing Massive key or un-ingested vault can't
+    read, never an exception, so a missing Alpaca key or un-ingested vault can't
     block the committee.
 
 This module is intentionally NOT wired into tools/UI yet — it exposes one

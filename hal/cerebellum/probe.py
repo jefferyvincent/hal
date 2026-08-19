@@ -1,82 +1,84 @@
-"""One-shot probe: does Massive serve historical bars for EXPIRED options?
+"""Probe which Alpaca market-data endpoints HAL's keys are entitled to.
 
 Run from the repo root:  python hal/cerebellum/probe.py
-Reads MASSIVE_API_KEY from .env. Prints PASS/FAIL and a sample.
-This is the make-or-break check for the singles backtester.
+
+Prints PASS/FAIL per endpoint with a short sample. Useful after changing
+plans — it answers "what can HAL actually see right now" without starting
+the server.
 """
-import datetime
+import asyncio
 import os
+import sys
+from datetime import date, timedelta
 
 import httpx
 
+BASE_DATA = "https://data.alpaca.markets"
+BASE_TRADE = "https://paper-api.alpaca.markets"
 
-def load_key() -> str:
-    # Prefer the environment; fall back to the .env file next to this script.
-    key = os.environ.get("MASSIVE_API_KEY", "")
-    if not key and os.path.exists(".env"):
+
+def env(name: str) -> str:
+    v = os.environ.get(name, "")
+    if v:
+        return v
+    try:
         for line in open(".env"):
-            if line.startswith("MASSIVE_API_KEY"):
-                key = line.split("=", 1)[1].strip()
-                break
-    return key
+            if line.startswith(name + "="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return ""
 
 
-BASE = "https://api.massive.com"
-
-
-def main() -> None:
-    key = load_key()
-    if not key:
-        print("FAIL: no MASSIVE_API_KEY found (env or .env)")
+async def probe(client: httpx.AsyncClient, label: str, url: str, params: dict) -> None:
+    try:
+        r = await client.get(url, params=params)
+    except Exception as e:
+        print(f"FAIL {label}: {type(e).__name__}: {e}")
         return
-    headers = {"Authorization": f"Bearer {key}"}
-    today = datetime.date.today()
-    past = today - datetime.timedelta(days=45)
+    status = "PASS" if r.status_code == 200 else "FAIL"
+    print(f"{status} {label}  [{r.status_code}]  {r.text[:160]}")
 
-    with httpx.Client(timeout=30, headers=headers) as c:
-        # 1) list a few SPY calls that already expired in the last ~45 days
-        r = c.get(f"{BASE}/v3/reference/options/contracts", params={
-            "underlying_ticker": "SPY",
-            "contract_type": "call",
-            "expiration_date.gte": past.isoformat(),
-            "expiration_date.lte": today.isoformat(),
-            "expired": "true",
-            "limit": 5,
-        })
-        print(f"[1] list expired contracts: HTTP {r.status_code}")
-        if r.status_code != 200:
-            print("FAIL:", r.text[:300])
-            return
-        rows = r.json().get("results") or []
-        print(f"    found {len(rows)} expired contracts")
-        if not rows:
-            print("FAIL: no expired contracts returned — cannot backtest singles this way")
-            return
-        for row in rows:
-            print("   ", row.get("ticker"), row.get("expiration_date"), "strike", row.get("strike_price"))
 
-        # 2) pull daily bars for the first one across its final month
-        tk = rows[0]["ticker"]
-        exp = rows[0]["expiration_date"]
-        frm = (datetime.date.fromisoformat(exp) - datetime.timedelta(days=30)).isoformat()
-        r2 = c.get(f"{BASE}/v2/aggs/ticker/{tk}/range/1/day/{frm}/{exp}", params={
-            "adjusted": "true", "sort": "asc", "limit": 50000,
-        })
-        print(f"[2] daily bars for {tk}: HTTP {r2.status_code}")
-        bars = (r2.json() or {}).get("results") or []
-        print(f"    {len(bars)} bars")
-        if bars:
-            f, l = bars[0], bars[-1]
-            fd = datetime.datetime.utcfromtimestamp(f["t"] / 1000).date()
-            ld = datetime.datetime.utcfromtimestamp(l["t"] / 1000).date()
-            print(f"    first {fd}: close {f['c']}  vol {f.get('v')}")
-            print(f"    last  {ld}: close {l['c']}  vol {l.get('v')}")
+async def main() -> None:
+    key, secret = env("ALPACA_API_KEY"), env("ALPACA_SECRET_KEY")
+    if not (key and secret):
+        print("FAIL: no ALPACA_API_KEY / ALPACA_SECRET_KEY (env or .env)")
+        sys.exit(1)
+    headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
+    sym = sys.argv[1].upper() if len(sys.argv) > 1 else "SPY"
+    today = date.today()
+    week_ago = (today - timedelta(days=7)).isoformat()
 
-    if bars:
-        print("\nPASS: expired-option history is available. The backtester can run.")
-    else:
-        print("\nFAIL: contract listed but no historical bars — singles backtest blocked.")
+    async with httpx.AsyncClient(headers=headers, timeout=30) as c:
+        await probe(c, "clock", f"{BASE_TRADE}/v2/clock", {})
+        await probe(c, f"stock daily bars {sym}", f"{BASE_DATA}/v2/stocks/bars",
+                    {"symbols": sym, "timeframe": "1Day", "start": week_ago, "limit": 2})
+        await probe(c, f"stock snapshot {sym}", f"{BASE_DATA}/v2/stocks/snapshots",
+                    {"symbols": sym})
+        await probe(c, f"option chain {sym} (indicative)",
+                    f"{BASE_DATA}/v1beta1/options/snapshots/{sym}",
+                    {"feed": "indicative", "limit": 1})
+        # Real-time OPRA: 403 "OPRA agreement is not signed" on the free Basic
+        # plan. That wording suggests a form, but it is a SUBSCRIPTION gate —
+        # it needs Algo Trader Plus. Expected to fail on a free account.
+        await probe(c, f"option chain {sym} (opra)",
+                    f"{BASE_DATA}/v1beta1/options/snapshots/{sym}",
+                    {"feed": "opra", "limit": 1})
+        await probe(c, f"option contracts {sym} (active)",
+                    f"{BASE_TRADE}/v2/options/contracts",
+                    {"underlying_symbols": sym, "limit": 1})
+        await probe(c, f"option contracts {sym} (expired)",
+                    f"{BASE_TRADE}/v2/options/contracts",
+                    {"underlying_symbols": sym, "status": "inactive",
+                     "expiration_date_lte": "2025-01-31", "limit": 1})
+        # SIP inside the last 15 minutes is the paid tier; IEX is the free feed.
+        await probe(c, "recent SIP quote (paid tier check)",
+                    f"{BASE_DATA}/v2/stocks/quotes/latest", {"symbols": sym, "feed": "sip"})
+        await probe(c, "screener movers", f"{BASE_DATA}/v1beta1/screener/stocks/movers",
+                    {"top": 2})
+        await probe(c, "news", f"{BASE_DATA}/v1beta1/news", {"symbols": sym, "limit": 1})
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

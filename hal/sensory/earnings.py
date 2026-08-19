@@ -181,6 +181,51 @@ async def fetch_upcoming(client: httpx.AsyncClient) -> dict[str, dict]:
     return upcoming
 
 
+# --- Pre-trade lookup ------------------------------------------------------
+# The screener above runs hourly over the watchlist; the rules gate needs a
+# different shape — "is THIS symbol reporting soon?", answered on the order path
+# where latency matters. One calendar day is fetched at a time, so a week costs
+# 8 requests; cached per (day, depth) so the cost is paid once per session and
+# the gate is free thereafter. Nasdaq is keyless and does go down: on failure
+# this returns None ("unknown"), and the gate treats unknown as "don't block".
+
+_calendar_cache: dict[int, tuple[str, dict[str, dict]]] = {}
+
+
+async def upcoming_within(days: int) -> dict[str, dict]:
+    """Earnings within `days` calendar days, keyed by symbol. Cached for the
+    current date. Returns {} if the calendar can't be reached."""
+    today = date.today().isoformat()
+    hit = _calendar_cache.get(days)
+    if hit and hit[0] == today:
+        return hit[1]
+    upcoming: dict[str, dict] = {}
+    try:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            for offset in range(max(0, days) + 1):
+                day = date.today() + timedelta(days=offset)
+                for sym, when in (await _fetch_calendar_for_date(client, day)).items():
+                    if sym not in upcoming:  # earliest date wins (offsets ascend)
+                        upcoming[sym] = {"date": day.isoformat(), "when": when,
+                                         "days_until": offset}
+    except Exception as e:
+        print(f"[earnings] calendar unavailable: {type(e).__name__}: {e}")
+        return {}
+    _calendar_cache[days] = (today, upcoming)
+    return upcoming
+
+
+async def days_until_earnings(symbol: str, within_days: int = 7) -> Optional[int]:
+    """Calendar days until `symbol` next reports, or None when it doesn't report
+    inside the window OR the calendar is unreachable. The caller cannot tell
+    those apart on purpose — both mean "no reason to block"."""
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return None
+    info = (await upcoming_within(within_days)).get(sym)
+    return info["days_until"] if info else None
+
+
 # --- Alert phrasing --------------------------------------------------------
 
 def _timing_phrase(days_until: int, when: str) -> str:

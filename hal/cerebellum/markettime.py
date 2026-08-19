@@ -100,8 +100,8 @@ def _options_date_context() -> str:
         f"Current time: {et:%A, %B %d, %Y  %I:%M %p} {abbr} (US Eastern — this IS market time)",
         f"US equity & options market right now: {session}. "
         "Regular hours are 9:30 AM-4:00 PM ET, Mon-Fri. Market holidays are not "
-        "reflected here; if it might be a holiday, confirm with query_massive "
-        "/v1/marketstatus/now before claiming the market is open.",
+        "reflected here; if it might be a holiday, confirm with query_alpaca "
+        "/v2/clock before claiming the market is open.",
         f"When {USER_NAME} asks the time or whether the market is open, answer directly "
         "from the two lines above — do NOT infer it from earlier messages or do "
         "your own clock math.",

@@ -23,7 +23,7 @@ won't repeat):
      most as a referee for any automated/LLM search on top of the sweep: the
      loop is only as trustworthy as the number it maximizes.
 
-API efficiency: contract discovery and option-bar fetches (the expensive Massive
+API efficiency: contract discovery and option-bar fetches (the expensive Alpaca
 calls) are cached and shared across the whole sweep, so each unique contract is
 fetched once regardless of how many parameter combos reference it. The underlying
 bars are fetched once. A 100-combo sweep costs roughly the API of a single
@@ -44,6 +44,7 @@ import httpx
 
 from hal.cerebellum import backtest as bt
 from hal.cerebellum.backtest import StrategyParams
+from hal.sensory import alpaca_data
 
 # Default search space. The signal dimensions (rsi_period × pivot_k × rsi_long)
 # decide which contracts get fetched; the exit dimensions (stop_pct × tp_pct) are
@@ -140,10 +141,10 @@ async def optimize(
     dropped from the sweep entirely, so a caller running this in a loop (e.g.
     research_agent) can keep a recent slice the search never influenced and test
     the chosen config on it once. contract_cache/optbar_cache may be passed in to
-    share the expensive Massive fetches across repeated calls (the same caches
+    share the expensive Alpaca fetches across repeated calls (the same caches
     optimize uses internally for a single sweep)."""
-    if not bt.API_KEY:
-        raise RuntimeError("MASSIVE_API_KEY not configured")
+    if not alpaca_data.is_configured():
+        raise RuntimeError("ALPACA_API_KEY / ALPACA_SECRET_KEY not configured")
     grid = grid or DEFAULT_GRID
     combos = _expand(grid)
     resolved, yahoo_sym, proxy_note = bt._resolve_underlying(underlying)

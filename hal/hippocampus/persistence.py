@@ -170,6 +170,23 @@ def _init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_broker_orders_submitted
                 ON broker_orders(submitted_at DESC);
+            -- Every gate decision on the order path, ALLOWED or BLOCKED.
+            -- broker_orders records what was submitted; this records what was
+            -- considered — the rejections that leave no other trace. Without it
+            -- "why didn't HAL take that trade?" is unanswerable after the fact.
+            CREATE TABLE IF NOT EXISTS decisions (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                decided_at REAL NOT NULL,
+                stage      TEXT NOT NULL,   -- 'rules_gate' | 'risk_gate' | 'committee'
+                symbol     TEXT,
+                allowed    INTEGER NOT NULL,
+                reason     TEXT,            -- human-readable; '' when allowed
+                detail     TEXT             -- JSON context
+            );
+            CREATE INDEX IF NOT EXISTS idx_decisions_at
+                ON decisions(decided_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_decisions_symbol
+                ON decisions(symbol, decided_at DESC);
             CREATE TABLE IF NOT EXISTS managed_exits (
                 symbol      TEXT PRIMARY KEY,
                 underlying  TEXT,
@@ -245,6 +262,41 @@ def log_broker_order(spec: dict, result: dict, mode: str, paper: bool) -> None:
                 json.dumps(result, default=str),
             ),
         )
+
+
+def log_decision(stage: str, symbol: str | None, allowed: bool,
+                 reason: str = "", detail: dict | None = None) -> None:
+    """Record a gate decision. Never raises: an audit write must not be able to
+    break the order path it is auditing."""
+    try:
+        with _db() as conn:
+            conn.execute(
+                "INSERT INTO decisions (decided_at, stage, symbol, allowed, reason, detail) "
+                "VALUES (?,?,?,?,?,?)",
+                (time.time(), stage, (symbol or "").upper() or None,
+                 1 if allowed else 0, reason,
+                 json.dumps(detail, default=str) if detail else None),
+            )
+    except Exception as e:  # pragma: no cover
+        print(f"[decisions] log failed ({stage}/{symbol}): {type(e).__name__}: {e}")
+
+
+def list_decisions(limit: int = 50, symbol: str | None = None,
+                   blocked_only: bool = False) -> list[dict]:
+    """Recent gate decisions, newest first — the 'why didn't HAL trade?' trail."""
+    q = "SELECT * FROM decisions"
+    where, args = [], []
+    if symbol:
+        where.append("symbol = ?")
+        args.append(symbol.upper())
+    if blocked_only:
+        where.append("allowed = 0")
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    q += " ORDER BY decided_at DESC LIMIT ?"
+    args.append(limit)
+    with _db() as conn:
+        return [dict(r) for r in conn.execute(q, args).fetchall()]
 
 
 def _new_conversation_obj(title: str = "New conversation") -> dict:
